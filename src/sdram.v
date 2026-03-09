@@ -1,19 +1,31 @@
 // SDRAM Controller for Tang Primer 25K External SDRAM Module
 //
-// The dock's SDRAM module has two MT48LC16M16A2 chips (32MB each = 64MB total)
+// The dock's SDRAM module has two W9825G6KH chips (32MB each = 64MB total)
 // sharing a 16-bit data bus. A single CS pin selects between chips:
 // CS=LOW selects chip 0, CS=HIGH selects chip 1 (module has onboard inverter).
 //
 // Per chip: 4 banks, 8192 rows (13-bit), 512 columns (9-bit), 16-bit data
-// CAS latency = 3, burst length = 4 (4 × 16-bit = 64 bits = 8 bytes per burst)
+// CAS latency = 3, burst length = 4 (4 x 16-bit = 64 bits = 8 bytes per burst)
 //
 // Memory data is stored interleaved to optimize SPI FLASH emulation:
-// Within each 8-byte burst (4 × 16-bit words):
+// Within each 8-byte burst (4 x 16-bit words):
 //   Word 0: dq[7:0] = bit 7 of each byte, dq[15:8] = bit 6 of each byte
 //   Word 1: dq[7:0] = bit 5 of each byte, dq[15:8] = bit 4 of each byte
 //   Word 2: dq[7:0] = bit 3 of each byte, dq[15:8] = bit 2 of each byte
 //   Word 3: dq[7:0] = bit 1 of each byte, dq[15:8] = bit 0 of each byte
 // This ensures the MSB of every byte is always received first from SDRAM.
+//
+// Clock and timing architecture:
+//   - SDRAM clock is a separate PLL output (CLKOUT1) with PE_COARSE=9
+//     phase shift (~3.75ns delay from logic clock). This provides setup
+//     time for commands and write data at the SDRAM pins.
+//   - IODELAY does NOT work for clock outputs on this device; PLL phase
+//     shift is used instead.
+//   - Read data is captured using aux_clk (CLKOUT2 with PE_COARSE=6,
+//     ~2.5ns phase shift) to sample DQ in the middle of the valid window.
+//   - With the ~3.75ns SDRAM clock delay and CAS=3, read data arrives
+//     ~4 logic clock cycles after the READ command. RD_PIPELINE_DELAY=0
+//     with the `readcount > tCAS` capture condition matches this timing.
 //
 // Address mapping (23-bit burst address, 8 bytes per burst = 64MB):
 //   spi_addr[22]    = chip select (0=chip0, 1=chip1)
@@ -28,17 +40,15 @@ module sdram(
     input wire aux_clk,      // Phase-shifted clock for read data capture
     input wire reset,
 
-    // SDRAM physical interface (directly to IODELAY / pins)
+    // SDRAM physical interface (directly to pins)
     output reg [1:0] ba_o,
-    output reg [12:0] a_o,       // 13-bit address for MT48LC16M16A2
+    output reg [12:0] a_o,       // 13-bit address for W9825G6KH
     output reg cs_o,             // Single CS: LOW=chip0, HIGH=chip1
     output reg ras_o,
     output reg cas_o,
     output reg we_o,
-    output reg [15:0] dq_o,
     output reg [1:0] dqm_o,
-    input wire [15:0] dq_i,
-    output reg dq_oe_o,
+    inout wire [15:0] dq_io,     // Bidirectional data bus (directly to pins)
     
     // Control signals from spi_trx (directly from SPI clock domain)
     input wire spi_inhibit_refresh,
@@ -61,7 +71,15 @@ module sdram(
     parameter CLK_FREQ_MHZ = 132;
     parameter BURST_LEN = 4;
 
-    // Timing parameters (in clock cycles at ~132MHz)
+    // Internal DQ bus handling - tristate managed in this module
+    // (Gowin requires inout and tristate to be in the same module for proper IOBUF inference)
+    reg [15:0] dq_o;
+    reg dq_oe_o;
+    wire [15:0] dq_i;
+    assign dq_io = dq_oe_o ? dq_o : 16'hZZZZ;
+    assign dq_i = dq_io;
+
+    // Timing parameters (in clock cycles)
     localparam integer tINIT        = 100 * CLK_FREQ_MHZ;   // 100us init
     localparam integer tREFRESH     = (CLK_FREQ_MHZ * 32000) / 8192;  // ~516 cycles
     localparam integer tRP          = 3;   // 18ns precharge (min 15ns)
@@ -70,10 +88,14 @@ module sdram(
     localparam integer tRCD         = 3;   // 18ns RAS to CAS delay (min 15ns)
     localparam integer tDPL         = 2;   // Write recovery
     localparam integer tRAS         = 6;   // 37ns row active time
-    localparam integer tCAS         = 3;   // CAS latency = 3 for external SDRAM
-    
+    localparam integer tCAS         = 3;   // CAS latency = 3 for W9825G6KH
+
+    // Read pipeline delay: compensates for SDRAM clock phase shift and capture pipeline.
+    // With PE_COARSE=9 on SDRAM clock and aux_clk capture, RD_PIPELINE_DELAY=0 is correct.
+    localparam integer RD_PIPELINE_DELAY = 0;
+
     // Derived timing
-    localparam integer tREAD  = tCAS + BURST_LEN + 1;
+    localparam integer tREAD  = tCAS + RD_PIPELINE_DELAY + BURST_LEN + 1;
     localparam integer tWRITE = BURST_LEN + tDPL + tRP;
 
     // State machine states
@@ -146,18 +168,12 @@ module sdram(
     reg [1:0] rdbuf_write_ptr;
     reg [2:0] wrbuf_read_ptr;
 
-    // Read data captured on aux_clk domain, then transferred
+    // Read data capture: DQ sampled on aux_clk (phase-shifted for proper timing)
+    // then used directly in the main clock domain read logic.
     reg [15:0] dq_captured;
-    reg [15:0] dq_captured_sync;
     
-    // Capture DQ on aux_clk (phase-shifted for proper sampling)
     always @(posedge aux_clk) begin
         dq_captured <= dq_i;
-    end
-    
-    // Synchronize captured data to main clock domain
-    always @(posedge clk) begin
-        dq_captured_sync <= dq_captured;
     end
 
     integer i;
@@ -210,17 +226,10 @@ module sdram(
             if (spi_cmd_read_ack && !spi_cmd_read_buf[1]) spi_cmd_read_ack <= 0;
 
             // Update busy flag
-            // Note: STA_REFRESH and STA_REFRESH2 are listed explicitly to
-            // prevent a one-cycle cmd_busy dip when cmdcount reaches
-            // cmdtarget-1 during the REFRESH->REFRESH2 handoff.  Without
-            // these terms the dispatch block could accept a serial command
-            // that is then silently overwritten by the REFRESH2 transition
-            // (Verilog last-write-wins), causing the SDRAM to not drive DQ.
-            cmd_busy <= (state <= STA_INIT_REFRESH) ||
-                        (state >= STA_INIT_CHIP2 && state <= STA_SETMODE2) ||
-                        ((state != STA_IDLE) && (cmdcount < cmdtarget-1)) ||
-                        (state == STA_REFRESH) ||
-                        (state == STA_REFRESH2) ||
+            // Busy when: any command is in progress (state != IDLE),
+            // a new command has been posted (access_cmd != 0), or a
+            // refresh is imminent and not inhibited.
+            cmd_busy <= (state != STA_IDLE) ||
                         (access_cmd != 2'b00) ||
                         ((refreshcount >= tREFRESH-1) && !do_inhibit_refresh);
 
@@ -494,6 +503,7 @@ module sdram(
                 end
                 else begin
                     state <= STA_IDLE;
+                    cmdtarget <= 1;  // Dispatch runs every cycle when idle
                     ras_o <= 1;
                     cas_o <= 1;
                     we_o <= 1;
@@ -527,13 +537,13 @@ module sdram(
             end
             
             // Read data capture (de-interleave 16-bit data to 64-bit buffer)
-            // Uses aux_clk-captured data for proper timing
-            if ((readcount > tCAS) && (readcount <= tCAS + BURST_LEN)) begin
+            // Uses aux_clk-captured data (dq_captured) for reliable sampling.
+            if ((readcount > tCAS + RD_PIPELINE_DELAY) && (readcount <= tCAS + RD_PIPELINE_DELAY + BURST_LEN)) begin
                 // Capture read data and de-interleave from 16-bit bus
                 // rdbuf_write_ptr counts 0..3 (4 words in burst)
                 for (i = 0; i < 8; i = i + 1) begin
-                    read_buffer[i*8 + 7 - rdbuf_write_ptr*2] <= dq_captured_sync[i];
-                    read_buffer[i*8 + 6 - rdbuf_write_ptr*2] <= dq_captured_sync[i+8];
+                    read_buffer[i*8 + 7 - rdbuf_write_ptr*2] <= dq_captured[i];
+                    read_buffer[i*8 + 6 - rdbuf_write_ptr*2] <= dq_captured[i+8];
                 end
                 
                 if (rdbuf_write_ptr == BURST_LEN - 1) read_busy <= 0;

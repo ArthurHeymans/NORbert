@@ -2,7 +2,7 @@
  * Tang Primer 25K SPI Flash Emulator
  * 
  * Ported from Tang Nano 20K version. Uses external SDRAM module on dock
- * with two MT48LC16M16A2 chips (64MB total) via 16-bit shared bus.
+ * with two W9825G6KH chips (64MB total) via 16-bit shared bus.
  *
  * SPI wiring on dock PMOD connector (bank 6):
  *   A11 = CS
@@ -63,7 +63,7 @@ module top #(
     // -----------------------------------------------------------
     
     wire clk_133;
-    wire clk_133_sdram;  // Pre-IODELAY clock for SDRAM output
+    wire clk_133_sdram;  // Dedicated PLL output for SDRAM clock (phase-shifted)
     wire aux_clk;        // Phase-shifted clock for SDRAM read capture
     wire pll_locked;
     
@@ -78,30 +78,23 @@ module top #(
             reset_cnt <= reset_cnt + 1;
     end
     
-    // PLL: 50MHz -> 120MHz (main) + phase-shifted (SDRAM clk) + aux (read capture)
+    // PLL: 50MHz -> 120MHz (main) + 120MHz (SDRAM clock) + 120MHz (aux/read capture)
+    // CRITICAL: SDRAM clock uses a SEPARATE PLL output with PE_COARSE=9 phase shift.
+    // IODELAY does not work for clock outputs on this device (GW5A), so all clock
+    // phase adjustment is done via PLL PE_COARSE parameters instead.
     pll pll_i(
         .clkin(clk_50mhz),
         .clkout(clk_133),
+        .clkout_sdram(clk_133_sdram),
         .clkoutp(aux_clk),
         .locked(pll_locked)
     );
     
     wire clk = clk_133;
     
-    // SDRAM clock output via IODELAY for phase adjustment
-    // The IODELAY adds a static delay (~0.8ns at C_STATIC_DLY=64) to align
-    // the SDRAM clock edge with data setup/hold requirements.
-    IODELAY sdram_clk_delay(
-        .DO(O_sdram_clk),
-        .DF(),
-        .DI(clk_133),
-        .SDTAP(1'b0),
-        .VALUE(1'b0),
-        .DLYSTEP(8'b0)
-    );
-    defparam sdram_clk_delay.C_STATIC_DLY = 64;
-    defparam sdram_clk_delay.DYN_DLY_EN = "FALSE";
-    defparam sdram_clk_delay.ADAPT_EN = "FALSE";
+    // SDRAM clock output: use PE_COARSE=9 on dedicated PLL output (no inversion)
+    // This gives ~3.75ns delay which provides SDRAM write setup time.
+    assign O_sdram_clk = clk_133_sdram;
     
     // -----------------------------------------------------------
     // SDRAM Data Bus Handling
@@ -113,9 +106,6 @@ module top #(
     
     // Internal signals for SDRAM controller
     wire [12:0] sdram_addr;
-    wire [15:0] sdram_dq_i;
-    wire [15:0] sdram_dq_o;
-    wire sdram_dq_oe;
     wire [1:0] sdram_dqm;
     wire [1:0] sdram_ba;
     wire sdram_cs_n;
@@ -131,15 +121,6 @@ module top #(
     assign O_sdram_addr = sdram_addr;
     assign O_sdram_ba = sdram_ba;
     assign O_sdram_dqm = sdram_dqm;
-    
-    // Bidirectional data bus
-    genvar gi;
-    generate
-        for (gi = 0; gi < 16; gi = gi + 1) begin : sdram_dq_gen
-            assign IO_sdram_dq[gi] = sdram_dq_oe ? sdram_dq_o[gi] : 1'bz;
-        end
-    endgenerate
-    assign sdram_dq_i = IO_sdram_dq;
     
     // -----------------------------------------------------------
     // SPI Interface
@@ -269,10 +250,8 @@ module top #(
         .ras_o(sdram_ras_n),
         .cas_o(sdram_cas_n),
         .we_o(sdram_we_n),
-        .dq_i(sdram_dq_i),
-        .dq_o(sdram_dq_o),
         .dqm_o(sdram_dqm),
-        .dq_oe_o(sdram_dq_oe),
+        .dq_io(IO_sdram_dq),
         
         // SPI fast-path control
         .spi_inhibit_refresh(spi_ram_inhibit_refresh),
