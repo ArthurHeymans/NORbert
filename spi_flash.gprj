@@ -1,0 +1,18 @@
+<?xml version="1" encoding="UTF-8"?>
+<!DOCTYPE gowin-fpga-project>
+<Project>
+    <Template>FPGA</Template>
+    <Version>5</Version>
+    <Device name="GW5A-25" pn="GW5A-LV25MG121C1/I0">gw5a25-000</Device>
+    <FileList>
+        <File path="src/top.v" type="file.verilog" enable="1"/>
+        <File path="src/spi_trx.v" type="file.verilog" enable="1"/>
+        <File path="src/sdram.v" type="file.verilog" enable="1"/>
+        <File path="src/glue.v" type="file.verilog" enable="1"/>
+        <File path="src/uart.v" type="file.verilog" enable="1"/>
+        <File path="src/fifo.v" type="file.verilog" enable="1"/>
+        <File path="src/util.v" type="file.verilog" enable="1"/>
+        <File path="src/pll.v" type="file.verilog" enable="1"/>
+        <File path="tangprimer25k.cst" type="file.cst" enable="1"/>
+    </FileList>
+</Project>

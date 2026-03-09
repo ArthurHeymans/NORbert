@@ -1,0 +1,203 @@
+// Tang Primer 25K Dock Constraints File for SPI Flash Emulator
+// Board: Sipeed Tang Primer 25K + Dock ext-board
+// FPGA: Gowin GW5A-LV25MG121NC1/I0
+//
+// SDRAM pin mappings from NESTang-25K and LicheeTang25k_SDRAM references
+// (both agree on all SDRAM pin assignments)
+//
+// The SDRAM module has TWO MT48LC16M16A2 chips with a SINGLE CS pin (K9).
+// The module PCB has an onboard inverter: CS=LOW selects chip 0,
+// CS=HIGH selects chip 1.
+
+// ============================================================
+// Clock Input (50MHz crystal oscillator)
+// ============================================================
+IO_LOC "clk_50mhz" E2;
+IO_PORT "clk_50mhz" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+
+// ============================================================
+// User LED (active low, on core board)
+// ============================================================
+IO_LOC "led" E8;
+IO_PORT "led" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8;
+
+// ============================================================
+// User Buttons (on core board)
+// ============================================================
+IO_LOC "btn_s1" H11;
+IO_LOC "btn_s2" H10;
+IO_PORT "btn_s1" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+IO_PORT "btn_s2" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+
+// ============================================================
+// UART via FTDI debugger on dock
+// ============================================================
+IO_LOC "uart_tx" C3;
+IO_LOC "uart_rx" B3;
+IO_PORT "uart_tx" IO_TYPE=LVCMOS33 DRIVE=8;
+IO_PORT "uart_rx" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+
+// ============================================================
+// SPI Flash Emulation Interface
+// Using GPIO header pins on dock (active tested, directly accessible)
+//
+// Available GPIO pins on dock header (active tested from wiki):
+//   Row A: A5, B5, A6, B6, A7, B7, A8, B8, A9, B9
+//   Row B: C5, D5, C6, D6, C7, D7, C8, D8, C9, D9
+// ============================================================
+
+// SPI Chip Select (active low)
+IO_LOC "spi_cs_pin" A5;
+IO_PORT "spi_cs_pin" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+// SPI Clock
+IO_LOC "spi_clk_pin" B5;
+IO_PORT "spi_clk_pin" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+
+// SPI MOSI (Master Out Slave In)
+IO_LOC "spi_mosi_pin" A6;
+IO_PORT "spi_mosi_pin" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+
+// SPI MISO (Master In Slave Out)
+IO_LOC "spi_miso_pin" B6;
+IO_PORT "spi_miso_pin" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// SPI Power Detection (active high when SPI master is powered)
+IO_LOC "spi_power_pin" A7;
+IO_PORT "spi_power_pin" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+
+// Debug output
+IO_LOC "spi_debug_pin" B7;
+IO_PORT "spi_debug_pin" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// ============================================================
+// External SDRAM Module (via 40-pin connector on dock)
+// Two MT48LC16M16A2 chips (32MB each = 64MB total)
+// 16-bit shared data bus, single CS with onboard inverter
+//
+// Pin assignments verified from both NESTang-25K and LicheeTang25k_SDRAM
+// Note: No CKE pin - tied high on module PCB
+// ============================================================
+
+// SDRAM Clock (routed through IODELAY in top.v for phase adjustment)
+IO_LOC "O_sdram_clk" E3;
+IO_PORT "O_sdram_clk" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// SDRAM Chip Select (single pin - module has onboard inverter for 2nd chip)
+// LOW = chip 0, HIGH = chip 1
+IO_LOC "O_sdram_cs_n" K9;
+IO_PORT "O_sdram_cs_n" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// SDRAM Row/Column Address Strobe
+IO_LOC "O_sdram_ras_n" L10;
+IO_PORT "O_sdram_ras_n" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_cas_n" K10;
+IO_PORT "O_sdram_cas_n" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// SDRAM Write Enable
+IO_LOC "O_sdram_wen_n" J7;
+IO_PORT "O_sdram_wen_n" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// SDRAM Address (13-bit for MT48LC16M16A2: 8192 rows, 9-bit column, 4 banks)
+IO_LOC "O_sdram_addr[0]" F6;
+IO_PORT "O_sdram_addr[0]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[1]" F7;
+IO_PORT "O_sdram_addr[1]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[2]" J10;
+IO_PORT "O_sdram_addr[2]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[3]" J11;
+IO_PORT "O_sdram_addr[3]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[4]" K7;
+IO_PORT "O_sdram_addr[4]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[5]" H2;
+IO_PORT "O_sdram_addr[5]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[6]" H1;
+IO_PORT "O_sdram_addr[6]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[7]" H4;
+IO_PORT "O_sdram_addr[7]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[8]" G4;
+IO_PORT "O_sdram_addr[8]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[9]" J2;
+IO_PORT "O_sdram_addr[9]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[10]" J8;
+IO_PORT "O_sdram_addr[10]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[11]" J1;
+IO_PORT "O_sdram_addr[11]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_addr[12]" D1;
+IO_PORT "O_sdram_addr[12]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// SDRAM Bank Address
+IO_LOC "O_sdram_ba[0]" L9;
+IO_PORT "O_sdram_ba[0]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_ba[1]" K8;
+IO_PORT "O_sdram_ba[1]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// SDRAM Data Mask (2-bit for 16-bit bus)
+IO_LOC "O_sdram_dqm[0]" L8;
+IO_PORT "O_sdram_dqm[0]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "O_sdram_dqm[1]" L7;
+IO_PORT "O_sdram_dqm[1]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// SDRAM Data Bus (16-bit shared between both chips)
+IO_LOC "IO_sdram_dq[0]" K2;
+IO_PORT "IO_sdram_dq[0]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[1]" K1;
+IO_PORT "IO_sdram_dq[1]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[2]" L1;
+IO_PORT "IO_sdram_dq[2]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[3]" L2;
+IO_PORT "IO_sdram_dq[3]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[4]" K4;
+IO_PORT "IO_sdram_dq[4]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[5]" J4;
+IO_PORT "IO_sdram_dq[5]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[6]" G1;
+IO_PORT "IO_sdram_dq[6]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[7]" G2;
+IO_PORT "IO_sdram_dq[7]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[8]" E1;
+IO_PORT "IO_sdram_dq[8]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[9]" A1;
+IO_PORT "IO_sdram_dq[9]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[10]" F2;
+IO_PORT "IO_sdram_dq[10]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[11]" F1;
+IO_PORT "IO_sdram_dq[11]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[12]" B2;
+IO_PORT "IO_sdram_dq[12]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[13]" C2;
+IO_PORT "IO_sdram_dq[13]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[14]" L4;
+IO_PORT "IO_sdram_dq[14]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "IO_sdram_dq[15]" L3;
+IO_PORT "IO_sdram_dq[15]" IO_TYPE=LVCMOS33 DRIVE=8;
