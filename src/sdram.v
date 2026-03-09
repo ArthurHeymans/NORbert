@@ -210,9 +210,17 @@ module sdram(
             if (spi_cmd_read_ack && !spi_cmd_read_buf[1]) spi_cmd_read_ack <= 0;
 
             // Update busy flag
+            // Note: STA_REFRESH and STA_REFRESH2 are listed explicitly to
+            // prevent a one-cycle cmd_busy dip when cmdcount reaches
+            // cmdtarget-1 during the REFRESH->REFRESH2 handoff.  Without
+            // these terms the dispatch block could accept a serial command
+            // that is then silently overwritten by the REFRESH2 transition
+            // (Verilog last-write-wins), causing the SDRAM to not drive DQ.
             cmd_busy <= (state <= STA_INIT_REFRESH) ||
                         (state >= STA_INIT_CHIP2 && state <= STA_SETMODE2) ||
                         ((state != STA_IDLE) && (cmdcount < cmdtarget-1)) ||
+                        (state == STA_REFRESH) ||
+                        (state == STA_REFRESH2) ||
                         (access_cmd != 2'b00) ||
                         ((refreshcount >= tREFRESH-1) && !do_inhibit_refresh);
 

@@ -20,6 +20,13 @@
 //   CRITICAL: DIVISOR must be divisible by 4 (uart_rx uses DIVISOR/4)
 //   Phase shift on CLKOUT1 for read data capture timing
 //
+// SDRAM read capture timing:
+//   PE_COARSE step = T_VCO/2 = 0.833ns/2 = 0.417ns (for VCO=1200MHz)
+//   PE_COARSE=6 -> 6 * 0.417ns = 2.5ns phase shift (108 degrees)
+//   This centers the DQ sampling point within the SDRAM data valid window,
+//   accounting for IODELAY (~0.8ns), round-trip PCB routing on the 40-pin
+//   connector (~3ns), and MT48LC16M16A2 tAC (max 5.4ns) / tOH (min 2.5ns).
+//
 // Uses defparam style matching Gowin IDE-generated code (gowin_pll_27.v).
 // Includes ICP_SEL, LPF_RES, LPF_CAP loop filter parameters that the
 // Gowin toolchain requires for stable PLL lock.
@@ -115,7 +122,7 @@ module pll(
     defparam pll_inst.CLK6_OUT_SEL = 1'b0;
     defparam pll_inst.CLKOUT0_PE_COARSE = 0;
     defparam pll_inst.CLKOUT0_PE_FINE = 0;
-    defparam pll_inst.CLKOUT1_PE_COARSE = 2;     // Phase shift for aux_clk (~0.21ns)
+    defparam pll_inst.CLKOUT1_PE_COARSE = 6;     // Phase shift for aux_clk (~2.5ns, centered in DQ valid window)
     defparam pll_inst.CLKOUT1_PE_FINE = 0;
     defparam pll_inst.CLKOUT2_PE_COARSE = 0;
     defparam pll_inst.CLKOUT2_PE_FINE = 0;
