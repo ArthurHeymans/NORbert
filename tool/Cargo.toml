@@ -1,0 +1,11 @@
+[package]
+name = "spi-flash-tool"
+version = "0.1.0"
+edition = "2021"
+description = "Tool for loading data into the Tang Nano 20K SPI Flash Emulator"
+
+[dependencies]
+serialport = "4.3"
+clap = { version = "4.4", features = ["derive"] }
+anyhow = "1.0"
+indicatif = "0.17"

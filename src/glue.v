@@ -59,6 +59,18 @@ module glue(
 
     reg [7:0] cmd;
     reg [3:0] in_count;
+    
+    // Idle timeout: reset serial parser if no byte received within ~137us
+    // while in middle of a multi-byte command. Handles spurious bytes
+    // from USB-UART bridge on port open/close.
+    // At 120MHz, 2^14 = 16384 cycles = ~137us
+    // This is long enough for back-to-back UART bytes within a USB
+    // transfer (~3.3us per byte at 3Mbaud) but short enough to recover
+    // quickly from spurious bytes before the tool's real command arrives
+    // via USB (~125us for high-speed, ~1ms for full-speed).
+    // The tool should combine command headers and data into single
+    // write() calls to avoid mid-command USB transfer gaps.
+    reg [14:0] serial_idle_count;
 
     reg [22:0] addr;       // 23-bit burst address
     reg [7:0] len;
@@ -117,6 +129,7 @@ module glue(
         if (reset) begin
             cmd <= CMD_NOP;
             in_count <= 0;
+            serial_idle_count <= 0;
             addr <= 0;
             len <= 0;
 
@@ -267,10 +280,24 @@ module glue(
                 end
             end
             
+            // Serial protocol idle timeout: reset parser if stuck in
+            // multi-byte command with no data for ~1ms
+            if (in_count != 0 && !rxd_strobe_buf) begin
+                serial_idle_count <= serial_idle_count + 1;
+                if (serial_idle_count[14]) begin
+                    in_count <= 0;
+                    cmd <= CMD_NOP;
+                    read_state <= 0;
+                    write_state <= 0;
+                    write_strobe <= 0;
+                end
+            end
+            
             // Serial protocol handling
             if ((spi_reset || spi_csel_buf[1]) && !spi_writing) begin
                 
                 if (rxd_strobe_buf) begin
+                    serial_idle_count <= 0;
 
                     if (in_count == 0) begin
                         if (rxd_data_buf == CMD_VERSION) begin

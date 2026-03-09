@@ -4,13 +4,13 @@
  * Ported from Tang Nano 20K version. Uses external SDRAM module on dock
  * with two MT48LC16M16A2 chips (64MB total) via 16-bit shared bus.
  *
- * SPI wiring on dock GPIO header pins:
- *   A5 = CS
- *   B5 = CLK  
- *   A6 = MOSI
- *   B6 = MISO
- *   A7 = POWER detection (active high)
- *   B7 = Debug output
+ * SPI wiring on dock PMOD connector (bank 6):
+ *   A11 = CS
+ *   E11 = CLK  
+ *   C11 = MOSI
+ *   D11 = MISO
+ *   A10 = POWER detection (active high)
+ *   E10 = Debug output
  *
  * Supported flash chips (selected via FLASH_CHIP parameter):
  *   0 = Winbond W25Q64FV (8MB, default)
@@ -78,7 +78,7 @@ module top #(
             reset_cnt <= reset_cnt + 1;
     end
     
-    // PLL: 50MHz -> ~132MHz (main) + phase-shifted (SDRAM clk) + aux (read capture)
+    // PLL: 50MHz -> 120MHz (main) + phase-shifted (SDRAM clk) + aux (read capture)
     pll pll_i(
         .clkin(clk_50mhz),
         .clkout(clk_133),
@@ -255,7 +255,7 @@ module top #(
     wire sdram_cmd_busy;
     
     sdram #(
-        .CLK_FREQ_MHZ(132),
+        .CLK_FREQ_MHZ(120),
         .BURST_LEN(4)
     ) sdram_i (
         .clk(clk),
@@ -302,9 +302,10 @@ module top #(
     wire uart_rxd_strobe;
     wire [7:0] uart_rxd;
     
-    // UART for 3 Mbaud at 132MHz: 132MHz / 3M = 44
+    // UART for 2 Mbaud at 120MHz: 120MHz / 2M = 60
+    // DIVISOR must be divisible by 4 (uart_rx uses DIVISOR/4 for 4x oversampling)
     uart #(
-        .DIVISOR(44),
+        .DIVISOR(60),
         .FIFO(256),
         .FREESPACE(16)
     ) uart_i(

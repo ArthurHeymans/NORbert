@@ -35,39 +35,41 @@ IO_PORT "btn_s2" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
 IO_LOC "uart_tx" C3;
 IO_LOC "uart_rx" B3;
 IO_PORT "uart_tx" IO_TYPE=LVCMOS33 DRIVE=8;
-IO_PORT "uart_rx" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_PORT "uart_rx" IO_TYPE=LVCMOS33 PULL_MODE=UP;
 
 // ============================================================
 // SPI Flash Emulation Interface
-// Using GPIO header pins on dock (active tested, directly accessible)
+// Using PMOD connector pins on the dock board (active tested,
+// directly accessible). Using bank 6 IOL pins (left PMOD).
 //
-// Available GPIO pins on dock header (active tested from wiki):
-//   Row A: A5, B5, A6, B6, A7, B7, A8, B8, A9, B9
-//   Row B: C5, D5, C6, D6, C7, D7, C8, D8, C9, D9
+// PMOD J5 connector (left side of dock):
+//   Top row:    A11  E11  C11  D11  (active I/O bank 6)
+//   Bottom row: A10  E10  C10  D10  (active I/O bank 6)
+//   + VCC, GND
 // ============================================================
 
 // SPI Chip Select (active low)
-IO_LOC "spi_cs_pin" A5;
+IO_LOC "spi_cs_pin" A11;
 IO_PORT "spi_cs_pin" IO_TYPE=LVCMOS33 PULL_MODE=UP;
 
-// SPI Clock
-IO_LOC "spi_clk_pin" B5;
-IO_PORT "spi_clk_pin" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+// SPI Clock (pull-down prevents floating noise when no SPI master connected)
+IO_LOC "spi_clk_pin" E11;
+IO_PORT "spi_clk_pin" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
 
 // SPI MOSI (Master Out Slave In)
-IO_LOC "spi_mosi_pin" A6;
+IO_LOC "spi_mosi_pin" C11;
 IO_PORT "spi_mosi_pin" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
 
 // SPI MISO (Master In Slave Out)
-IO_LOC "spi_miso_pin" B6;
+IO_LOC "spi_miso_pin" D11;
 IO_PORT "spi_miso_pin" IO_TYPE=LVCMOS33 DRIVE=8;
 
 // SPI Power Detection (active high when SPI master is powered)
-IO_LOC "spi_power_pin" A7;
+IO_LOC "spi_power_pin" A10;
 IO_PORT "spi_power_pin" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
 
 // Debug output
-IO_LOC "spi_debug_pin" B7;
+IO_LOC "spi_debug_pin" E10;
 IO_PORT "spi_debug_pin" IO_TYPE=LVCMOS33 DRIVE=8;
 
 // ============================================================
