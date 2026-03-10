@@ -291,16 +291,19 @@ module glue(
             end
             
             // Serial protocol idle timeout: reset parser if stuck in
-            // multi-byte command with no data for ~1ms
-            if (in_count != 0 && !rxd_strobe_buf) begin
+            // multi-byte command header with no data for ~137us.
+            // Exclude active read/write operations: during reads the
+            // host sends nothing (waiting for response data), so the
+            // idle counter would fire and kill the transfer.
+            if (in_count != 0 && !rxd_strobe_buf && !read_state && !write_state) begin
                 serial_idle_count <= serial_idle_count + 1;
                 if (serial_idle_count[14]) begin
                     in_count <= 0;
                     cmd <= CMD_NOP;
-                    read_state <= 0;
-                    write_state <= 0;
-                    write_strobe <= 0;
                 end
+            end
+            else begin
+                serial_idle_count <= 0;
             end
             
             // Serial protocol handling
