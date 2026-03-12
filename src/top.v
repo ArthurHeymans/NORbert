@@ -4,15 +4,15 @@
  * Ported from Tang Nano 20K version. Uses external SDRAM module on dock
  * with two W9825G6KH chips (64MB total) via 16-bit shared bus.
  *
- * SPI wiring on dock PMOD connector (bank 6):
- *   A11 = CS
- *   E11 = CLK  
- *   C11 = IO0 (MOSI / bidirectional in dual/quad mode)
- *   D11 = IO1 (MISO / bidirectional in dual/quad mode)
- *   B11 = IO2 (/WP / bidirectional in quad mode)
- *   C10 = IO3 (/HOLD / bidirectional in quad mode)
- *   A10 = POWER detection (active high)
- *   E10 = Debug output
+ * SPI wiring on dock PMOD J5 (all on bank 6):
+ *   A11 = CS          E11 = CLK
+ *   C11 = IO0 (MOSI)  D11 = IO1 (MISO)
+ *   G11 = IO2 (/WP)   B11 = IO3 (/HOLD)
+ *   A10 = POWER det    E10 = Debug
+ *
+ * FT245 wiring (FT2232H async FIFO, EEPROM set to "245 FIFO"):
+ *   Data D[7:0] on right PMOD J7: H5 H8 G7 F5 H7 G8 G5 F3
+ *   RXF#=D10  TXE#=G10  RD#=B10  WR#=H11
  *
  * Emulated flash chip is configured at runtime via the serial
  * CHIPCONFIG command (defaults to Winbond W25Q64FV 8MB).
@@ -25,15 +25,11 @@ module top(
     // LED
     output wire led,              // Active low LED (single LED on core board)
     
-    // User buttons
-    input wire btn_s1,
-    input wire btn_s2,
-    
     // UART via FTDI debugger on dock
     input wire uart_rx,           // FPGA receives from FTDI
     output wire uart_tx,          // FPGA transmits to FTDI
     
-    // SPI flash emulation interface (on dock GPIO header)
+    // SPI flash emulation interface (PMOD J5)
     input wire spi_cs_pin,        // Active low chip select
     input wire spi_clk_pin,       // SPI clock from master
     inout wire spi_mosi_pin,      // IO0: MOSI / bidirectional in dual/quad mode
@@ -42,6 +38,13 @@ module top(
     inout wire spi_io3_pin,       // IO3: /HOLD / bidirectional in quad mode
     input wire spi_power_pin,     // Power detection
     output wire spi_debug_pin,    // Debug output
+    
+    // FT245 asynchronous FIFO interface (FT2232H Channel A)
+    inout wire [7:0] ft_data,     // Bidirectional data bus D[7:0]
+    input wire ft_rxf_n,          // RX FIFO not empty (active low)
+    input wire ft_txe_n,          // TX FIFO not full  (active low)
+    output wire ft_rd_n,          // Read strobe  (active low)
+    output wire ft_wr_n,          // Write strobe (active low)
     
     // External SDRAM interface (via dock 40-pin connector)
     output wire        O_sdram_clk,
@@ -340,6 +343,31 @@ module top(
     );
     
     // -----------------------------------------------------------
+    // FT245 Interface (FT2232H async FIFO)
+    // -----------------------------------------------------------
+    
+    wire ft_txd_ready;
+    wire [7:0] ft_txd;
+    wire ft_txd_strobe;
+    wire ft_rxd_strobe;
+    wire [7:0] ft_rxd;
+    
+    ft245 ft245_i(
+        .clk(clk),
+        .reset(reset),
+        .ft_data(ft_data),
+        .ft_rxf_n(ft_rxf_n),
+        .ft_txe_n(ft_txe_n),
+        .ft_rd_n(ft_rd_n),
+        .ft_wr_n(ft_wr_n),
+        .rxd(ft_rxd),
+        .rxd_strobe(ft_rxd_strobe),
+        .txd(ft_txd),
+        .txd_strobe(ft_txd_strobe),
+        .txd_ready(ft_txd_ready)
+    );
+    
+    // -----------------------------------------------------------
     // Glue Logic
     // -----------------------------------------------------------
     
@@ -349,12 +377,21 @@ module top(
         .clk(clk),
         .reset(reset),
         
+        // UART byte interface
         .rxd_strobe(uart_rxd_strobe),
         .rxd_data(uart_rxd),
         
         .txd_ready(uart_txd_ready),
         .txd_strobe(uart_txd_strobe),
         .txd_data(uart_txd),
+        
+        // FT245 byte interface
+        .ft_rxd_strobe(ft_rxd_strobe),
+        .ft_rxd_data(ft_rxd),
+        
+        .ft_txd_ready(ft_txd_ready),
+        .ft_txd_strobe(ft_txd_strobe),
+        .ft_txd_data(ft_txd),
         
         .sdram_access_cmd(sdram_access_cmd),
         .sdram_access_addr(sdram_access_addr),

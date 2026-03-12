@@ -22,12 +22,8 @@ IO_LOC "led" E8;
 IO_PORT "led" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8;
 
 // ============================================================
-// User Buttons (on core board)
+// User Buttons (on core board) -- REMOVED: H11/H10 repurposed for FT245
 // ============================================================
-IO_LOC "btn_s1" H11;
-IO_LOC "btn_s2" H10;
-IO_PORT "btn_s1" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
-IO_PORT "btn_s2" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
 
 // ============================================================
 // UART via FTDI debugger on dock
@@ -39,13 +35,11 @@ IO_PORT "uart_rx" IO_TYPE=LVCMOS33 PULL_MODE=UP;
 
 // ============================================================
 // SPI Flash Emulation Interface
-// Using PMOD connector pins on the dock board (active tested,
-// directly accessible). Using bank 6 IOL pins (left PMOD).
+// All 8 signals on PMOD J5 (left top, bank 6 IOL pins).
 //
 // PMOD J5 connector (left side of dock):
-//   Top row:    A11  E11  C11  D11  (active I/O bank 6)
-//   Bottom row: A10  E10  C10  D10  (active I/O bank 6)
-//   + VCC, GND
+//   Top row:    G11  D11  C11  B11  GND  3V3
+//   Bottom row: A11  E11  E10  A10  GND  3V3
 // ============================================================
 
 // SPI Chip Select (active low)
@@ -64,8 +58,8 @@ IO_PORT "spi_mosi_pin" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
 IO_LOC "spi_miso_pin" D11;
 IO_PORT "spi_miso_pin" IO_TYPE=LVCMOS33 DRIVE=8;
 
-// SPI IO2 (/WP / bidirectional in quad mode)
-IO_LOC "spi_io2_pin" C10;
+// SPI IO2 (/WP / bidirectional in quad mode) -- moved to G11 (J5 top row)
+IO_LOC "spi_io2_pin" G11;
 IO_PORT "spi_io2_pin" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8;
 
 // SPI IO3 (/HOLD / bidirectional in quad mode)
@@ -79,6 +73,55 @@ IO_PORT "spi_power_pin" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
 // Debug output
 IO_LOC "spi_debug_pin" E10;
 IO_PORT "spi_debug_pin" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// ============================================================
+// FT245 Asynchronous FIFO Interface (FT2232H Channel A)
+// Used for high-speed SDRAM read/write (replaces UART path).
+// FT2232H EEPROM must be configured for "245 FIFO" on Channel A
+// (one-time setup via FT_PROG).  No CLKOUT or OE# in async mode.
+//
+// Data bus on right PMOD J7:
+//   Top row:    H5   H8   G7   F5   GND  3V3
+//   Bottom row: H7   G8   G5   F3   GND  3V3
+//
+// Control on left PMOD J6 top row + repurposed button pin:
+//   J6 top:     D10  G10  B10
+//   Button:     H11
+// ============================================================
+
+// FT245 bidirectional data bus D[7:0]
+IO_LOC "ft_data[0]" H5;
+IO_LOC "ft_data[1]" H8;
+IO_LOC "ft_data[2]" G7;
+IO_LOC "ft_data[3]" F5;
+IO_LOC "ft_data[4]" H7;
+IO_LOC "ft_data[5]" G8;
+IO_LOC "ft_data[6]" G5;
+IO_LOC "ft_data[7]" F3;
+IO_PORT "ft_data[0]" IO_TYPE=LVCMOS33 DRIVE=8;
+IO_PORT "ft_data[1]" IO_TYPE=LVCMOS33 DRIVE=8;
+IO_PORT "ft_data[2]" IO_TYPE=LVCMOS33 DRIVE=8;
+IO_PORT "ft_data[3]" IO_TYPE=LVCMOS33 DRIVE=8;
+IO_PORT "ft_data[4]" IO_TYPE=LVCMOS33 DRIVE=8;
+IO_PORT "ft_data[5]" IO_TYPE=LVCMOS33 DRIVE=8;
+IO_PORT "ft_data[6]" IO_TYPE=LVCMOS33 DRIVE=8;
+IO_PORT "ft_data[7]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// FT245 RXF# -- data available (active low, output from FT2232H)
+IO_LOC "ft_rxf_n" D10;
+IO_PORT "ft_rxf_n" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+// FT245 TXE# -- transmit buffer not full (active low, output from FT2232H)
+IO_LOC "ft_txe_n" G10;
+IO_PORT "ft_txe_n" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+// FT245 RD# -- read strobe (active low, output from FPGA)
+IO_LOC "ft_rd_n" B10;
+IO_PORT "ft_rd_n" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// FT245 WR# -- write strobe (active low, output from FPGA)
+IO_LOC "ft_wr_n" H11;
+IO_PORT "ft_wr_n" IO_TYPE=LVCMOS33 DRIVE=8;
 
 // ============================================================
 // External SDRAM Module (via 40-pin connector on dock)

@@ -11,6 +11,7 @@ add_file src/spi_trx.v
 add_file src/sdram.v
 add_file src/glue.v
 add_file src/uart.v
+add_file src/ft245.v
 add_file src/fifo.v
 add_file src/util.v
 add_file src/pll.v

@@ -1,11 +1,12 @@
 [package]
 name = "spi-flash-tool"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Tool for loading data into the Tang Nano 20K SPI Flash Emulator"
+description = "Tool for loading data into the Tang Primer 25K SPI Flash Emulator (UART + FT245)"
 
 [dependencies]
 serialport = "4.3"
+libftd2xx = "0.32"
 clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
 indicatif = "0.17"

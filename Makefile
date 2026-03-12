@@ -13,6 +13,7 @@ VERILOG_FILES = \
 	src/sdram.v \
 	src/glue.v \
 	src/uart.v \
+	src/ft245.v \
 	src/fifo.v \
 	src/util.v \
 	src/pll.v
