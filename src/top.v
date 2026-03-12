@@ -7,8 +7,8 @@
  * SPI wiring on dock PMOD connector (bank 6):
  *   A11 = CS
  *   E11 = CLK  
- *   C11 = MOSI
- *   D11 = MISO
+ *   C11 = IO0 (MOSI / bidirectional in dual mode)
+ *   D11 = IO1 (MISO / bidirectional in dual mode)
  *   A10 = POWER detection (active high)
  *   E10 = Debug output
  *
@@ -41,8 +41,8 @@ module top #(
     // SPI flash emulation interface (on dock GPIO header)
     input wire spi_cs_pin,        // Active low chip select
     input wire spi_clk_pin,       // SPI clock from master
-    input wire spi_mosi_pin,      // Master Out Slave In
-    output wire spi_miso_pin,     // Master In Slave Out
+    inout wire spi_mosi_pin,      // IO0: MOSI / bidirectional in dual mode
+    inout wire spi_miso_pin,      // IO1: MISO / bidirectional in dual mode
     input wire spi_power_pin,     // Power detection
     output wire spi_debug_pin,    // Debug output
     
@@ -123,22 +123,30 @@ module top #(
     assign O_sdram_dqm = sdram_dqm;
     
     // -----------------------------------------------------------
-    // SPI Interface
+    // SPI Interface (dual IO capable)
     // -----------------------------------------------------------
     
     // SPI input signals
     wire spi_cs_in = spi_cs_pin;
     wire spi_clk_in = spi_clk_pin;
-    wire spi_mosi_in = spi_mosi_pin;
     wire spi_power_in = spi_power_pin;
     
-    // SPI output signals
-    wire spi_miso_out;
-    wire spi_miso_enable;
+    // Bidirectional IO signals from spi_trx
+    wire spi_io0_out;   // IO0 output data (active in dual read)
+    wire spi_io0_oe;    // IO0 output enable
+    wire spi_io1_out;   // IO1 output data (MISO in single, IO1 in dual)
+    wire spi_io1_oe;    // IO1 output enable
     wire spi_debug_out;
     
-    // MISO output - active when enabled and selected
-    assign spi_miso_pin = (spi_miso_enable && !spi_cs_in && spi_power_in) ? spi_miso_out : 1'b0;
+    // IO0 (MOSI pin): input normally, output during dual read data phase
+    wire spi_active_out = !spi_cs_in && spi_power_in;
+    assign spi_mosi_pin = (spi_io0_oe && spi_active_out) ? spi_io0_out : 1'bz;
+    wire spi_io0_in = spi_mosi_pin;
+    
+    // IO1 (MISO pin): output during single-mode reads and dual read data phase
+    assign spi_miso_pin = (spi_io1_oe && spi_active_out) ? spi_io1_out : 1'bz;
+    wire spi_io1_in = spi_miso_pin;
+    
     assign spi_debug_pin = spi_debug_out;
     
     // SPI power detection and reset logic
@@ -197,9 +205,12 @@ module top #(
         .spi_clk(spi_clk_in),
         .spi_reset(spi_reset),
         .spi_csel(spi_cs_in),
-        .spi_mosi(spi_mosi_in),
-        .spi_miso(spi_miso_out),
-        .spi_miso_enable(spi_miso_enable),
+        .spi_io0_in(spi_io0_in),
+        .spi_io0_out(spi_io0_out),
+        .spi_io0_oe(spi_io0_oe),
+        .spi_io1_in(spi_io1_in),
+        .spi_io1_out(spi_io1_out),
+        .spi_io1_oe(spi_io1_oe),
         .spi_debug(spi_debug_out),
         
         .spi_active(spi_active),

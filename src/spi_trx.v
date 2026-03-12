@@ -18,9 +18,12 @@ module spi_trx #(
     input wire spi_clk,
     input wire spi_reset,    // Active high
     input wire spi_csel,     // Active low chip select
-    input wire spi_mosi,
-    output reg spi_miso = 0,
-    output reg spi_miso_enable = 0,
+    input wire spi_io0_in,   // IO0 input (directly from MOSI pin)
+    output reg spi_io0_out = 0,  // IO0 output (driven in dual read)
+    output wire spi_io0_oe,      // IO0 output enable (gated by reset_cs)
+    input wire spi_io1_in,   // IO1 input (directly from MISO pin, used in 1-2-2 addr)
+    output reg spi_io1_out = 0,  // IO1 output (MISO in single, IO1 in dual)
+    output wire spi_io1_oe,      // IO1 output enable (gated by reset_cs)
     output reg spi_debug = 0,
     
     output wire spi_active,
@@ -52,6 +55,15 @@ module spi_trx #(
     wire is_selected = !spi_reset && !spi_csel;
     
     assign spi_active = is_selected;
+    
+    // Internal OE registers — gated with reset_cs to prevent bus contention.
+    // When CS deasserts (reset_cs goes high asynchronously), the output enables
+    // are immediately deasserted combinationally, preventing the FPGA from
+    // driving IO0/IO1 when the master starts the next SPI transaction.
+    reg spi_io0_oe_ff = 0;
+    reg spi_io1_oe_ff = 0;
+    assign spi_io0_oe = spi_io0_oe_ff && !reset_cs && !reset_power;
+    assign spi_io1_oe = spi_io1_oe_ff && !reset_cs && !reset_power;
     
     // Reset detection using async set flip-flops
     reg reset_cs = 1;
@@ -96,11 +108,13 @@ module spi_trx #(
         CMD_FASTREAD_4B     = 8'h0C,
         CMD_READ_4B         = 8'h13,
         CMD_SECTORERASE_4K  = 8'h20,
+        CMD_DUALREAD        = 8'h3B,  // Dual Output Read (1-1-2)
         CMD_BLOCKERASE_32K  = 8'h52,
         CMD_CHIPERASE1      = 8'h60,
         CMD_READID1         = 8'h9E,
         CMD_READID2         = 8'h9F,
         CMD_4BYTEENABLE     = 8'hB7,
+        CMD_DUALIOREAD      = 8'hBB,  // Dual I/O Read (1-2-2)
         CMD_CHIPERASE2      = 8'hC7,
         CMD_BLOCKERASE_64K  = 8'hD8,
         CMD_4BYTEDISABLE    = 8'hE9,
@@ -108,27 +122,33 @@ module spi_trx #(
     
     // State machine states
     localparam
-        STA_CMD         = 0,
-        STA_READSTATUS  = 1,
-        STA_ADDR_READ   = 2,
-        STA_READ        = 3,
-        STA_READID      = 4,
-        STA_ADDR_WRITE  = 5,
-        STA_WRITE       = 6,
-        STA_ADDR_ERASE  = 7,
-        STA_ERASE       = 8,
-        STA_LOG         = 9,
-        STA_DUMMY       = 10;
+        STA_CMD             = 0,
+        STA_READSTATUS      = 1,
+        STA_ADDR_READ       = 2,
+        STA_READ            = 3,
+        STA_READID          = 4,
+        STA_ADDR_WRITE      = 5,
+        STA_WRITE           = 6,
+        STA_ADDR_ERASE      = 7,
+        STA_ERASE           = 8,
+        STA_LOG             = 9,
+        STA_DUMMY           = 10,
+        STA_ADDR_READ_DUAL  = 11,  // Dual I/O address phase (1-2-2)
+        STA_READ_DUAL       = 12,  // Dual data output phase (1-1-2 & 1-2-2)
+        STA_MODE_DUAL       = 13;  // Mode byte phase for 0xBB (acts as dummy)
     
     reg [3:0] state;
     reg [2:0] dummy_count = 0;
     reg is_fast_read = 0;
+    reg is_dual_read = 0;       // Set for both 0x3B and 0xBB
+    reg [1:0] mode_count = 0;   // Mode byte counter for 0xBB (4 dual clocks)
     
     reg [31:0] addr;
     reg [4:0] addr_count;
     reg addr_4byte;
     
     reg fresh_read = 0;
+    reg [7:0] saved_last_byte;  // Byte 7 saved before SDRAM read overwrites buffer
     
     // Status register
     reg [7:0] status_reg = 8'b00000000;
@@ -152,10 +172,11 @@ module spi_trx #(
             
             if (reset_cs || reset_power) begin
                 bit_count_in <= 6;
-                mosi_byte <= {spi_mosi, 7'b0};
+                mosi_byte <= {spi_io0_in, 7'b0};
                 miso_byte <= 0;
                 
-                spi_miso_enable <= 0;
+                spi_io0_oe_ff <= 0;
+                spi_io1_oe_ff <= 0;
                 
                 state <= STA_CMD;
                 
@@ -163,6 +184,8 @@ module spi_trx #(
                 addr_count <= 0;
                 dummy_count <= 0;
                 is_fast_read <= 0;
+                is_dual_read <= 0;
+                mode_count <= 0;
                 
                 log_strobe <= 0;
                 log_val <= 0;
@@ -188,15 +211,15 @@ module spi_trx #(
                     
                 write_buf_strobe <= 0;
                 
-                mosi_byte[bit_count_in] <= spi_mosi;
+                mosi_byte[bit_count_in] <= spi_io0_in;
 
                 if ((state == STA_CMD) && (bit_count_in == 0)) begin
                     
-                    case ({mosi_byte[7:1], spi_mosi})
+                    case ({mosi_byte[7:1], spi_io0_in})
                         
                     CMD_READSTATUS: begin
                         state <= STA_READSTATUS;
-                        spi_miso_enable <= 1;
+                        spi_io1_oe_ff <= 1;
                         miso_byte <= status_reg;
                     end
                     
@@ -240,6 +263,21 @@ module spi_trx #(
                             addr_count <= 31;
                             is_fast_read <= 1;
                         end
+                    end
+                    
+                    // Dual Output Read (1-1-2): cmd(1), addr(1), 8 dummy, data(2)
+                    CMD_DUALREAD: begin
+                        state <= STA_ADDR_READ;
+                        addr_count <= addr_4byte ? 31 : 23;
+                        is_fast_read <= 1;   // Uses same dummy phase
+                        is_dual_read <= 1;
+                    end
+                    
+                    // Dual I/O Read (1-2-2): cmd(1), addr(2), mode+dummy(2), data(2)
+                    CMD_DUALIOREAD: begin
+                        state <= STA_ADDR_READ_DUAL;
+                        addr_count <= addr_4byte ? 31 : 23;
+                        is_dual_read <= 1;
                     end
 
                     CMD_SECTORERASE_4K: begin
@@ -294,7 +332,7 @@ module spi_trx #(
                     CMD_READID1,
                     CMD_READID2: begin
                         state <= STA_READID;
-                        spi_miso_enable <= 1;
+                        spi_io1_oe_ff <= 1;
                         miso_byte <= jedec_id[7:0];
                         addr_count <= 1;
                     end
@@ -306,13 +344,13 @@ module spi_trx #(
                     endcase
                     
                     log_strobe <= 1;
-                    log_val <= {mosi_byte[7:1], spi_mosi};
+                    log_val <= {mosi_byte[7:1], spi_io0_in};
                 end
                 else if ((state == STA_READSTATUS) && (bit_count_in == 0)) begin
                     miso_byte <= status_reg;
                 end
                 else if (state == STA_ADDR_READ) begin
-                    // Receiving address bytes for read
+                    // Receiving address bytes for read (single-bit, 1 bit/clock)
                     // ram_addr is 23-bit burst address = byte_addr[25:3]
                     // addr_count counts down from 23 (or 31 for 4-byte) to 0
                     
@@ -325,7 +363,7 @@ module spi_trx #(
                     end
                     else if (addr_count == 3) begin
                         ram_read <= 1;
-                        ram_addr[3:0] <= {addr[6:4], spi_mosi};
+                        ram_addr[3:0] <= {addr[6:4], spi_io0_in};
                     end
                     else if (addr_count == 0) begin
                         ram_inhibit_refresh <= 0;
@@ -338,23 +376,30 @@ module spi_trx #(
                         end
                         else begin
                             state <= STA_READ;
-                            spi_miso_enable <= 1;
+                            spi_io1_oe_ff <= 1;
                             fresh_read <= 1;
                         end
                     end
                     
                     if (bit_count_in == 0) begin
                         log_strobe <= 1;
-                        log_val <= {mosi_byte[7:1], spi_mosi};
+                        log_val <= {mosi_byte[7:1], spi_io0_in};
                     end
                     
-                    addr[addr_count] <= spi_mosi;
+                    addr[addr_count] <= spi_io0_in;
                     addr_count <= addr_count - 1;
                 end
                 else if (state == STA_DUMMY) begin
                     if (dummy_count == 0) begin
-                        state <= STA_READ;
-                        spi_miso_enable <= 1;
+                        if (is_dual_read) begin
+                            state <= STA_READ_DUAL;
+                            spi_io0_oe_ff <= 1;
+                            spi_io1_oe_ff <= 1;
+                        end
+                        else begin
+                            state <= STA_READ;
+                            spi_io1_oe_ff <= 1;
+                        end
                         fresh_read <= 1;
                     end
                     else begin
@@ -423,12 +468,12 @@ module spi_trx #(
                         status_reg[0] <= 1;
                     end
                     
-                    addr[addr_count] <= spi_mosi;
+                    addr[addr_count] <= spi_io0_in;
                     addr_count <= addr_count - 1;
                     
                     if (bit_count_in == 0) begin
                         log_strobe <= 1;
-                        log_val <= {mosi_byte[7:1], spi_mosi};
+                        log_val <= {mosi_byte[7:1], spi_io0_in};
                     end
                 end
                 else if (state == STA_ADDR_WRITE) begin
@@ -445,39 +490,202 @@ module spi_trx #(
                         status_reg[0] <= 1;
                     end
                     
-                    addr[addr_count] <= spi_mosi;
+                    addr[addr_count] <= spi_io0_in;
                     addr_count <= addr_count - 1;
                     
                     if (bit_count_in == 0) begin
                         log_strobe <= 1;
-                        log_val <= {mosi_byte[7:1], spi_mosi};
+                        log_val <= {mosi_byte[7:1], spi_io0_in};
                     end
                 end
                 else if ((state == STA_WRITE) && (bit_count_in == 0)) begin
                     write_buf_strobe <= 1;
                     write_buf_offset <= addr[7:0];
-                    write_buf_val <= {mosi_byte[7:1], spi_mosi};
+                    write_buf_val <= {mosi_byte[7:1], spi_io0_in};
                     
                     addr[7:0] <= addr[7:0] + 1;
                 end
                 else if (state == STA_LOG) begin
                     if (bit_count_in == 0) begin
                         log_strobe <= 1;
-                        log_val <= {mosi_byte[7:1], spi_mosi};
+                        log_val <= {mosi_byte[7:1], spi_io0_in};
                     end
                 end
+                // ---------------------------------------------------------
+                // Dual I/O address phase (1-2-2 mode, CMD 0xBB)
+                // 2 address bits per clock: IO1=high bit, IO0=low bit
+                // ---------------------------------------------------------
+                else if (state == STA_ADDR_READ_DUAL) begin
+                    
+                    // SDRAM pipeline during last address clocks
+                    if (addr_count == 7) begin
+                        ram_inhibit_refresh <= 1;
+                    end
+                    else if (addr_count == 3) begin
+                        ram_activate <= 1;
+                        ram_addr[22:4] <= addr[25:7];
+                    end
+                    else if (addr_count == 1) begin
+                        ram_read <= 1;
+                        // addr[6:3] all received by prior clocks
+                        ram_addr[3:0] <= addr[6:3];
+                    end
+                    
+                    // Receive 2 address bits per clock
+                    addr[addr_count]     <= spi_io1_in;   // High bit
+                    addr[addr_count - 1] <= spi_io0_in;   // Low bit
+                    addr_count <= addr_count - 2;
+                    
+                    // Transition when last 2 bits received (addr_count was 1)
+                    if (addr_count == 1) begin
+                        // Enter mode byte phase (4 dual clocks = 8 bits)
+                        // The mode byte acts as dummy; we don't enter continuous
+                        // read mode. SDRAM signals stay asserted during mode phase.
+                        state <= STA_MODE_DUAL;
+                        mode_count <= 3;
+                    end
+                end
+                // ---------------------------------------------------------
+                // Mode byte phase for 0xBB (1-2-2)
+                // 4 dual clocks consuming mode byte M[7:0].
+                // SDRAM read signals remain asserted; deassert at end.
+                // ---------------------------------------------------------
+                else if (state == STA_MODE_DUAL) begin
+                    if (mode_count == 0) begin
+                        ram_inhibit_refresh <= 0;
+                        ram_activate <= 0;
+                        ram_read <= 0;
+                        
+                        state <= STA_READ_DUAL;
+                        spi_io0_oe_ff <= 1;
+                        spi_io1_oe_ff <= 1;
+                        fresh_read <= 1;
+                    end
+                    else begin
+                        mode_count <= mode_count - 1;
+                    end
+                end
+                // ---------------------------------------------------------
+                // Dual data output phase (1-1-2 and 1-2-2)
+                // 2 data bits per clock on IO0+IO1, 4 clocks per byte.
+                // bit_count_in cycles 3->2->1->0->3->... in this state.
+                //
+                // SDRAM pipeline timing (dual, 4 clocks/byte):
+                //   Byte 5, bit 3: inhibit_refresh + save byte 7
+                //   Byte 6, bit 3: activate + ram_read + new ram_addr
+                //   Byte 7, bit 0: deassert all + fresh_read
+                //
+                // ram_read is asserted at byte 6 (with activate) to give 8
+                // SPI clocks (~32 sys clocks @120MHz) before fresh_read.
+                // The SDRAM controller dispatches ACTIVATE first (priority),
+                // waits tRCD, then READ — total ~14 sys clocks, leaving
+                // ~18 sys clocks of margin.
+                //
+                // Byte 7 is saved at byte 5 because ram_read_buffer is a
+                // live register: the SDRAM read completes within ~14 sys
+                // clocks, overwriting the buffer before byte 7 can be
+                // loaded into miso_byte at byte 6 bit 0.
+                // ---------------------------------------------------------
+                else if (state == STA_READ_DUAL) begin
+                    
+                    // Pipeline phase 1: inhibit refresh + save byte 7
+                    // Save byte 7 from ram_read_buffer BEFORE the SDRAM read
+                    // (phase 2) overwrites it with the next burst's data.
+                    // ram_read_buffer is a live register updated by the SDRAM
+                    // controller; the read completes within ~14 sys clocks,
+                    // which is faster than the 3 SPI clocks between phase 2
+                    // and the byte 7 preload at byte 6 bit 0.
+                    if (addr[2:0] == 5 && bit_count_in == 3) begin
+                        ram_inhibit_refresh <= 1;
+                        saved_last_byte <= ram_read_buffer[7*8 +: 8];
+                    end
+                    
+                    // Pipeline phase 2: activate + read 1 byte early
+                    // Both signals are asserted simultaneously. The SDRAM
+                    // controller's priority dispatch processes ACTIVATE first,
+                    // waits tRCD, then dispatches READ. This gives 8 SPI
+                    // clocks (~32 sys clocks) of margin before fresh_read,
+                    // vs the ~14 sys clocks the SDRAM path needs.
+                    if (addr[2:0] == 6 && bit_count_in == 3) begin
+                        ram_inhibit_refresh <= 1;  // Also here for short first bursts
+                        ram_activate <= 1;
+                        ram_read <= 1;
+                        ram_addr <= ram_addr + 1;
+                    end
+                    
+                    // Pipeline phase 3: deassert during last byte
+                    if (addr[2:0] == 7) begin
+                        if (bit_count_in == 3 && !ram_activate) begin
+                            // Fallback for very short first bursts (addr starts at 7)
+                            // Only fires if byte 6 activate didn't happen
+                            ram_inhibit_refresh <= 1;
+                            ram_activate <= 1;
+                            ram_read <= 1;
+                            ram_addr <= ram_addr + 1;
+                            saved_last_byte <= ram_read_buffer[7*8 +: 8];
+                        end
+                        else if (bit_count_in == 0) begin
+                            ram_inhibit_refresh <= 0;
+                            ram_activate <= 0;
+                            ram_read <= 0;
+                            
+                            fresh_read <= 1;
+                        end
+                    end
+                    
+                    // Byte advance every 4 clocks
+                    // Use saved_last_byte for byte 7 since ram_read_buffer
+                    // may already contain the next burst's data by this point.
+                    if (bit_count_in == 0) begin
+                        if (addr[2:0] == 6)
+                            miso_byte <= saved_last_byte;
+                        else
+                            miso_byte <= ram_read_buffer[(addr[2:0]+1)*8 +: 8];
+                        addr <= addr + 1;
+                    end
+                    
+                    if (fresh_read)
+                        miso_byte <= ram_read_buffer[addr[2:0]*8 +: 8];
+                end
                 
-                bit_count_in <= bit_count_in - 1;
+                // ---------------------------------------------------------
+                // bit_count_in management
+                // Single mode: cycles 7->0 (8 clocks/byte), wraps naturally
+                // Dual read:   cycles 3->0 (4 clocks/byte), override wrap
+                // ---------------------------------------------------------
+                if (state == STA_READ_DUAL && bit_count_in == 0)
+                    bit_count_in <= 3;
+                else if (state == STA_DUMMY && dummy_count == 0 && is_dual_read)
+                    bit_count_in <= 3;   // Entry into STA_READ_DUAL
+                else if (state == STA_MODE_DUAL && mode_count == 0)
+                    bit_count_in <= 3;   // Entry into STA_READ_DUAL
+                else
+                    bit_count_in <= bit_count_in - 1;
             end
         end
     end
     
-    // MISO output on falling edge of SPI clock
+    // Data output on falling edge of SPI clock
     always @(negedge spi_clk) begin
-        if (fresh_read)
-            spi_miso <= ram_read_buffer[addr[2:0]*8 + 7];
-        else
-            spi_miso <= miso_byte[bit_count_in];
+        if (state == STA_READ_DUAL) begin
+            // Dual output: 2 bits per clock
+            // IO1 = high bit of pair, IO0 = low bit of pair
+            if (fresh_read) begin
+                spi_io1_out <= ram_read_buffer[addr[2:0]*8 + 7];
+                spi_io0_out <= ram_read_buffer[addr[2:0]*8 + 6];
+            end
+            else begin
+                spi_io1_out <= miso_byte[{bit_count_in[1:0], 1'b1}];
+                spi_io0_out <= miso_byte[{bit_count_in[1:0], 1'b0}];
+            end
+        end
+        else begin
+            // Single output on IO1 (MISO)
+            if (fresh_read)
+                spi_io1_out <= ram_read_buffer[addr[2:0]*8 + 7];
+            else
+                spi_io1_out <= miso_byte[bit_count_in];
+        end
     end
 
 endmodule

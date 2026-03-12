@@ -141,6 +141,12 @@ module sdram(
     reg spi_cmd_activate_ack;
     reg spi_cmd_read_ack;
     
+    // Track whether ACTIVATE has been dispatched for the current SPI burst.
+    // READ must not dispatch until this is set, preventing a race where
+    // independent 2-FF synchronizers cause read_buf[1] to appear before
+    // activate_buf[1] (Bug #3 fix).
+    reg spi_activate_done;
+    
     wire do_inhibit_refresh = (spi_inhibit_refresh_buf[1] || inhibit_refresh);
     
     // Address decoding for MT48LC16M16A2 (2 × 32MB = 64MB)
@@ -213,6 +219,7 @@ module sdram(
             
             spi_cmd_activate_ack <= 0;
             spi_cmd_read_ack <= 0;
+            spi_activate_done <= 0;
         end
         else begin
             refreshcount <= refreshcount + 1;
@@ -222,7 +229,10 @@ module sdram(
             spi_cmd_activate_buf <= {spi_cmd_activate_buf[0], spi_cmd_activate};
             spi_cmd_read_buf <= {spi_cmd_read_buf[0], spi_cmd_read};
             
-            if (spi_cmd_activate_ack && !spi_cmd_activate_buf[1]) spi_cmd_activate_ack <= 0;
+            if (spi_cmd_activate_ack && !spi_cmd_activate_buf[1]) begin
+                spi_cmd_activate_ack <= 0;
+                spi_activate_done <= 0;
+            end
             if (spi_cmd_read_ack && !spi_cmd_read_buf[1]) spi_cmd_read_ack <= 0;
 
             // Update busy flag
@@ -403,6 +413,7 @@ module sdram(
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
                     spi_cmd_activate_ack <= 1;
+                    spi_activate_done <= 1;
 
                     // ACTIVATE command
                     cs_o <= spi_chip_sel;
@@ -413,7 +424,7 @@ module sdram(
                     ba_o <= spi_bank;
                     a_o <= spi_row;
                 end
-                else if (spi_cmd_read_buf[1] && !spi_cmd_read_ack) begin
+                else if (spi_cmd_read_buf[1] && !spi_cmd_read_ack && spi_activate_done) begin
                     // SPI fast-path read
                     state <= STA_READ;
                     cmdtarget <= tREAD;
