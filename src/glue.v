@@ -3,6 +3,10 @@
 //
 // Ported for Tang Primer 25K with 64MB external SDRAM (23-bit burst addresses)
 // Serial path uses 25-bit access_addr = {chip, row[12:0], bank[1:0], col[8:0]}
+//
+// Accepts bytes from EITHER UART or FT245.  When idle (no active command),
+// whichever port delivers a byte first becomes the "active port" for that
+// entire command.  Responses are routed back to the same port.
 
 `default_nettype none
 
@@ -10,12 +14,21 @@ module glue(
     input wire clk,
     input wire reset,
 
+    // UART byte interface
     input wire rxd_strobe,
     input wire [7:0] rxd_data,
 
     input wire txd_ready,
     output reg txd_strobe,
     output reg [7:0] txd_data,
+
+    // FT245 byte interface (accent identical to UART)
+    input wire ft_rxd_strobe,
+    input wire [7:0] ft_rxd_data,
+
+    input wire ft_txd_ready,
+    output reg ft_txd_strobe,
+    output reg [7:0] ft_txd_data,
 
     // SDRAM control signals
     output reg [1:0] sdram_access_cmd, // 00=nop 01=read 10=write 11=activate
@@ -108,6 +121,15 @@ module glue(
     
     reg [1:0] spi_csel_buf;
     
+    // Active port selection: 0 = UART, 1 = FT245
+    // Latched when a command byte arrives while idle.
+    reg active_port;
+
+    // Muxed RX/TX signals based on active port
+    wire mux_rxd_strobe = active_port ? ft_rxd_strobe : rxd_strobe;
+    wire [7:0] mux_rxd_data = active_port ? ft_rxd_data : rxd_data;
+    wire mux_txd_ready = active_port ? ft_txd_ready : txd_ready;
+
     // Heartbeat counter
     reg [25:0] heartbeat;
     
@@ -168,6 +190,10 @@ module glue(
             rxd_strobe_buf <= 0;
             rxd_data_buf <= 0;
             
+            active_port <= 0;
+            ft_txd_strobe <= 0;
+            ft_txd_data <= 0;
+            
             led <= 0;
             log_ack <= 0;
             
@@ -200,11 +226,21 @@ module glue(
         end
         else begin
             txd_strobe_buf <= 0;
-            txd_strobe <= txd_strobe_buf;
-            txd_data <= txd_data_buf;
-            
-            rxd_strobe_buf <= rxd_strobe;
-            rxd_data_buf <= rxd_data;
+
+            // Route TX to the active port
+            if (active_port) begin
+                ft_txd_strobe <= txd_strobe_buf;
+                ft_txd_data   <= txd_data_buf;
+                txd_strobe    <= 0;
+            end else begin
+                txd_strobe    <= txd_strobe_buf;
+                txd_data      <= txd_data_buf;
+                ft_txd_strobe <= 0;
+            end
+
+            // Mux RX from the active port (or either when idle)
+            rxd_strobe_buf <= mux_rxd_strobe;
+            rxd_data_buf   <= mux_rxd_data;
             
             sdram_access_addr <= addr_to_access;
             sdram_write_buffer <= write_buffer;
@@ -333,6 +369,15 @@ module glue(
                 serial_idle_count <= 0;
             end
             
+            // Port selection: when idle, latch which port delivered
+            // the first byte of a new command.
+            if (cmd == CMD_NOP && in_count == 0 && !read_state && !write_state) begin
+                if (ft_rxd_strobe)
+                    active_port <= 1;
+                else if (rxd_strobe)
+                    active_port <= 0;
+            end
+
             // Serial protocol handling
             if ((spi_reset || spi_csel_buf[1]) && !spi_writing) begin
                 
@@ -464,7 +509,7 @@ module glue(
                             sdram_access_cmd <= 2'b01;
                             read_state <= 3;
                         end
-                        else if ((read_state == 3) && !sdram_busy && txd_ready) begin
+                        else if ((read_state == 3) && !sdram_busy && mux_txd_ready) begin
                             txd_strobe_buf <= 1;
                             txd_data_buf <= sdram_read_buffer[read_pos*8 +: 8];
 
@@ -499,7 +544,7 @@ module glue(
                         end
                         else if ((write_state == 3) && !sdram_busy) begin
                             if (len == 1) begin
-                                if (txd_ready) begin
+                                if (mux_txd_ready) begin
                                     txd_strobe_buf <= 1;
                                     txd_data_buf <= 8'h01;
                                     write_state <= 0;
