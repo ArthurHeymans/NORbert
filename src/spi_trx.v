@@ -24,6 +24,12 @@ module spi_trx #(
     input wire spi_io1_in,   // IO1 input (directly from MISO pin, used in 1-2-2 addr)
     output reg spi_io1_out = 0,  // IO1 output (MISO in single, IO1 in dual)
     output wire spi_io1_oe,      // IO1 output enable (gated by reset_cs)
+    input wire spi_io2_in,   // IO2 input (/WP pin, used in 1-4-4 addr)
+    output reg spi_io2_out = 0,  // IO2 output (driven in quad read)
+    output wire spi_io2_oe,      // IO2 output enable (gated by reset_cs)
+    input wire spi_io3_in,   // IO3 input (/HOLD pin, used in 1-4-4 addr)
+    output reg spi_io3_out = 0,  // IO3 output (driven in quad read)
+    output wire spi_io3_oe,      // IO3 output enable (gated by reset_cs)
     output reg spi_debug = 0,
     
     output wire spi_active,
@@ -62,8 +68,12 @@ module spi_trx #(
     // driving IO0/IO1 when the master starts the next SPI transaction.
     reg spi_io0_oe_ff = 0;
     reg spi_io1_oe_ff = 0;
+    reg spi_io2_oe_ff = 0;
+    reg spi_io3_oe_ff = 0;
     assign spi_io0_oe = spi_io0_oe_ff && !reset_cs && !reset_power;
     assign spi_io1_oe = spi_io1_oe_ff && !reset_cs && !reset_power;
+    assign spi_io2_oe = spi_io2_oe_ff && !reset_cs && !reset_power;
+    assign spi_io3_oe = spi_io3_oe_ff && !reset_cs && !reset_power;
     
     // Reset detection using async set flip-flops
     reg reset_cs = 1;
@@ -99,6 +109,7 @@ module spi_trx #(
     
     // SPI Flash command definitions
     localparam
+        CMD_WRITESTATUS     = 8'h01,  // Write Status Register (1-2 data bytes)
         CMD_PAGEPROGRAM     = 8'h02,
         CMD_READ            = 8'h03,
         CMD_WRITEDISABLE    = 8'h04,
@@ -108,9 +119,11 @@ module spi_trx #(
         CMD_FASTREAD_4B     = 8'h0C,
         CMD_READ_4B         = 8'h13,
         CMD_SECTORERASE_4K  = 8'h20,
+        CMD_READSTATUS2     = 8'h35,  // Read Status Register 2
         CMD_DUALREAD        = 8'h3B,  // Dual Output Read (1-1-2)
         CMD_BLOCKERASE_32K  = 8'h52,
         CMD_CHIPERASE1      = 8'h60,
+        CMD_QUADREAD        = 8'h6B,  // Quad Output Read (1-1-4)
         CMD_READID1         = 8'h9E,
         CMD_READID2         = 8'h9F,
         CMD_4BYTEENABLE     = 8'hB7,
@@ -118,6 +131,7 @@ module spi_trx #(
         CMD_CHIPERASE2      = 8'hC7,
         CMD_BLOCKERASE_64K  = 8'hD8,
         CMD_4BYTEDISABLE    = 8'hE9,
+        CMD_QUADIOREAD      = 8'hEB,  // Quad I/O Read (1-4-4)
         CMD_LOG             = 8'hF2;
     
     // State machine states
@@ -135,13 +149,17 @@ module spi_trx #(
         STA_DUMMY           = 10,
         STA_ADDR_READ_DUAL  = 11,  // Dual I/O address phase (1-2-2)
         STA_READ_DUAL       = 12,  // Dual data output phase (1-1-2 & 1-2-2)
-        STA_MODE_DUAL       = 13;  // Mode byte phase for 0xBB (acts as dummy)
+        STA_MODE_MULTI      = 13,  // Mode+dummy phase for 0xBB/0xEB
+        STA_ADDR_READ_QUAD  = 14,  // Quad I/O address phase (1-4-4)
+        STA_READ_QUAD       = 15,  // Quad data output phase (1-1-4 & 1-4-4)
+        STA_WRITESTATUS     = 16;  // Receive status register write data
     
-    reg [3:0] state;
+    reg [4:0] state;
     reg [2:0] dummy_count = 0;
     reg is_fast_read = 0;
     reg is_dual_read = 0;       // Set for both 0x3B and 0xBB
-    reg [1:0] mode_count = 0;   // Mode byte counter for 0xBB (4 dual clocks)
+    reg is_quad_read = 0;       // Set for both 0x6B and 0xEB
+    reg [2:0] mode_count = 0;   // Mode+dummy counter (4 for dual, 6 for quad)
     
     reg [31:0] addr;
     reg [4:0] addr_count;
@@ -150,8 +168,9 @@ module spi_trx #(
     reg fresh_read = 0;
     reg [7:0] saved_last_byte;  // Byte 7 saved before SDRAM read overwrites buffer
     
-    // Status register
+    // Status registers
     reg [7:0] status_reg = 8'b00000000;
+    reg [7:0] status_reg2 = 8'h02;     // QE bit (bit 1) default enabled
     
     // Synchronize write_done from system clock domain
     reg [2:0] write_done_sync;
@@ -177,6 +196,8 @@ module spi_trx #(
                 
                 spi_io0_oe_ff <= 0;
                 spi_io1_oe_ff <= 0;
+                spi_io2_oe_ff <= 0;
+                spi_io3_oe_ff <= 0;
                 
                 state <= STA_CMD;
                 
@@ -185,6 +206,7 @@ module spi_trx #(
                 dummy_count <= 0;
                 is_fast_read <= 0;
                 is_dual_read <= 0;
+                is_quad_read <= 0;
                 mode_count <= 0;
                 
                 log_strobe <= 0;
@@ -221,6 +243,19 @@ module spi_trx #(
                         state <= STA_READSTATUS;
                         spi_io1_oe_ff <= 1;
                         miso_byte <= status_reg;
+                    end
+                    
+                    CMD_READSTATUS2: begin
+                        state <= STA_READSTATUS;
+                        spi_io1_oe_ff <= 1;
+                        miso_byte <= status_reg2;
+                    end
+                    
+                    CMD_WRITESTATUS: begin
+                        if (status_reg[1]) begin
+                            state <= STA_WRITESTATUS;
+                            addr_count <= 0;
+                        end
                     end
                     
                     CMD_WRITEDISABLE: begin
@@ -278,6 +313,25 @@ module spi_trx #(
                         state <= STA_ADDR_READ_DUAL;
                         addr_count <= addr_4byte ? 31 : 23;
                         is_dual_read <= 1;
+                    end
+                    
+                    // Quad Output Read (1-1-4): cmd(1), addr(1), 8 dummy, data(4)
+                    CMD_QUADREAD: begin
+                        if (status_reg2[1]) begin  // QE required
+                            state <= STA_ADDR_READ;
+                            addr_count <= addr_4byte ? 31 : 23;
+                            is_fast_read <= 1;   // Uses same dummy phase
+                            is_quad_read <= 1;
+                        end
+                    end
+                    
+                    // Quad I/O Read (1-4-4): cmd(1), addr(4), mode+dummy(4), data(4)
+                    CMD_QUADIOREAD: begin
+                        if (status_reg2[1]) begin  // QE required
+                            state <= STA_ADDR_READ_QUAD;
+                            addr_count <= addr_4byte ? 31 : 23;
+                            is_quad_read <= 1;
+                        end
                     end
 
                     CMD_SECTORERASE_4K: begin
@@ -391,7 +445,14 @@ module spi_trx #(
                 end
                 else if (state == STA_DUMMY) begin
                     if (dummy_count == 0) begin
-                        if (is_dual_read) begin
+                        if (is_quad_read) begin
+                            state <= STA_READ_QUAD;
+                            spi_io0_oe_ff <= 1;
+                            spi_io1_oe_ff <= 1;
+                            spi_io2_oe_ff <= 1;
+                            spi_io3_oe_ff <= 1;
+                        end
+                        else if (is_dual_read) begin
                             state <= STA_READ_DUAL;
                             spi_io0_oe_ff <= 1;
                             spi_io1_oe_ff <= 1;
@@ -538,27 +599,35 @@ module spi_trx #(
                     
                     // Transition when last 2 bits received (addr_count was 1)
                     if (addr_count == 1) begin
-                        // Enter mode byte phase (4 dual clocks = 8 bits)
-                        // The mode byte acts as dummy; we don't enter continuous
-                        // read mode. SDRAM signals stay asserted during mode phase.
-                        state <= STA_MODE_DUAL;
+                        // Enter mode+dummy phase (4 dual clocks for 0xBB)
+                        state <= STA_MODE_MULTI;
                         mode_count <= 3;
                     end
                 end
                 // ---------------------------------------------------------
-                // Mode byte phase for 0xBB (1-2-2)
-                // 4 dual clocks consuming mode byte M[7:0].
+                // Mode+dummy phase for multi-IO reads (0xBB and 0xEB)
+                // Dual 0xBB: 4 clocks (mode byte M[7:0])
+                // Quad 0xEB: 6 clocks (2 mode + 4 dummy)
                 // SDRAM read signals remain asserted; deassert at end.
                 // ---------------------------------------------------------
-                else if (state == STA_MODE_DUAL) begin
+                else if (state == STA_MODE_MULTI) begin
                     if (mode_count == 0) begin
                         ram_inhibit_refresh <= 0;
                         ram_activate <= 0;
                         ram_read <= 0;
                         
-                        state <= STA_READ_DUAL;
-                        spi_io0_oe_ff <= 1;
-                        spi_io1_oe_ff <= 1;
+                        if (is_quad_read) begin
+                            state <= STA_READ_QUAD;
+                            spi_io0_oe_ff <= 1;
+                            spi_io1_oe_ff <= 1;
+                            spi_io2_oe_ff <= 1;
+                            spi_io3_oe_ff <= 1;
+                        end
+                        else begin
+                            state <= STA_READ_DUAL;
+                            spi_io0_oe_ff <= 1;
+                            spi_io1_oe_ff <= 1;
+                        end
                         fresh_read <= 1;
                     end
                     else begin
@@ -647,17 +716,135 @@ module spi_trx #(
                     if (fresh_read)
                         miso_byte <= ram_read_buffer[addr[2:0]*8 +: 8];
                 end
+                // ---------------------------------------------------------
+                // Quad I/O address phase (1-4-4 mode, CMD 0xEB)
+                // 4 address bits per clock: IO3=MSB, IO0=LSB
+                // ---------------------------------------------------------
+                else if (state == STA_ADDR_READ_QUAD) begin
+                    
+                    // SDRAM pipeline during last address clocks
+                    if (addr_count == 11) begin
+                        ram_inhibit_refresh <= 1;
+                    end
+                    else if (addr_count == 7) begin
+                        // addr[25:8] available from prior clocks; addr[7] = IO3 now
+                        ram_addr[22:4] <= {addr[25:8], spi_io3_in};
+                    end
+                    else if (addr_count == 3) begin
+                        ram_activate <= 1;
+                        ram_read <= 1;
+                        // addr[6:4] available from prior clock; addr[3] = IO3 now
+                        ram_addr[3:0] <= {addr[6:4], spi_io3_in};
+                    end
+                    
+                    // Receive 4 address bits per clock
+                    addr[addr_count]     <= spi_io3_in;   // MSB
+                    addr[addr_count - 1] <= spi_io2_in;
+                    addr[addr_count - 2] <= spi_io1_in;
+                    addr[addr_count - 3] <= spi_io0_in;   // LSB
+                    addr_count <= addr_count - 4;
+                    
+                    // Transition when last 4 bits received (addr_count was 3)
+                    if (addr_count == 3) begin
+                        // Enter mode+dummy phase (6 quad clocks: 2 mode + 4 dummy)
+                        state <= STA_MODE_MULTI;
+                        mode_count <= 5;
+                    end
+                end
+                // ---------------------------------------------------------
+                // Quad data output phase (1-1-4 and 1-4-4)
+                // 4 data bits per clock on IO[3:0], 2 clocks per byte.
+                // bit_count_in cycles 1->0->1->0->... in this state.
+                //
+                // SDRAM pipeline timing (quad, 2 clocks/byte):
+                //   Byte 5, bit 1: inhibit_refresh + save byte 7
+                //   Byte 6, bit 1: activate + ram_read + new ram_addr
+                //   Byte 7, bit 0: deassert all + fresh_read
+                //
+                // From activate to fresh_read: 4 SPI clocks = 48 sys clocks
+                // SDRAM path needs ~14 sys clocks, leaving ~34 of margin.
+                // ---------------------------------------------------------
+                else if (state == STA_READ_QUAD) begin
+                    
+                    // Pipeline phase 1: inhibit refresh + save byte 7
+                    if (addr[2:0] == 5 && bit_count_in == 1) begin
+                        ram_inhibit_refresh <= 1;
+                        saved_last_byte <= ram_read_buffer[7*8 +: 8];
+                    end
+                    
+                    // Pipeline phase 2: activate + read
+                    if (addr[2:0] == 6 && bit_count_in == 1) begin
+                        ram_inhibit_refresh <= 1;
+                        ram_activate <= 1;
+                        ram_read <= 1;
+                        ram_addr <= ram_addr + 1;
+                    end
+                    
+                    // Pipeline phase 3: deassert during last byte
+                    if (addr[2:0] == 7) begin
+                        if (bit_count_in == 1 && !ram_activate) begin
+                            // Fallback for very short first bursts (addr starts at 7)
+                            ram_inhibit_refresh <= 1;
+                            ram_activate <= 1;
+                            ram_read <= 1;
+                            ram_addr <= ram_addr + 1;
+                            saved_last_byte <= ram_read_buffer[7*8 +: 8];
+                        end
+                        else if (bit_count_in == 0) begin
+                            ram_inhibit_refresh <= 0;
+                            ram_activate <= 0;
+                            ram_read <= 0;
+                            
+                            fresh_read <= 1;
+                        end
+                    end
+                    
+                    // Byte advance every 2 clocks
+                    if (bit_count_in == 0) begin
+                        if (addr[2:0] == 6)
+                            miso_byte <= saved_last_byte;
+                        else
+                            miso_byte <= ram_read_buffer[(addr[2:0]+1)*8 +: 8];
+                        addr <= addr + 1;
+                    end
+                    
+                    if (fresh_read)
+                        miso_byte <= ram_read_buffer[addr[2:0]*8 +: 8];
+                end
+                // ---------------------------------------------------------
+                // Write Status Register data reception (CMD 0x01)
+                // Receives 1 byte (SR1) or 2 bytes (SR1 + SR2).
+                // ---------------------------------------------------------
+                else if (state == STA_WRITESTATUS && bit_count_in == 0) begin
+                    if (addr_count == 0) begin
+                        // First byte: SR1 (preserve WEL/BUSY)
+                        status_reg[7:2] <= mosi_byte[7:2];
+                        status_reg[1] <= 0;  // Clear WEL after write
+                        addr_count <= 1;
+                    end
+                    else if (addr_count == 1) begin
+                        // Second byte: SR2
+                        status_reg2 <= {mosi_byte[7:1], spi_io0_in};
+                        addr_count <= 2;
+                    end
+                end
                 
                 // ---------------------------------------------------------
                 // bit_count_in management
                 // Single mode: cycles 7->0 (8 clocks/byte), wraps naturally
                 // Dual read:   cycles 3->0 (4 clocks/byte), override wrap
                 // ---------------------------------------------------------
-                if (state == STA_READ_DUAL && bit_count_in == 0)
+                if (state == STA_READ_QUAD && bit_count_in == 0)
+                    bit_count_in <= 1;
+                else if (state == STA_READ_DUAL && bit_count_in == 0)
                     bit_count_in <= 3;
+                else if (state == STA_DUMMY && dummy_count == 0 && is_quad_read)
+                    bit_count_in <= 1;   // Entry into STA_READ_QUAD
                 else if (state == STA_DUMMY && dummy_count == 0 && is_dual_read)
                     bit_count_in <= 3;   // Entry into STA_READ_DUAL
-                else if (state == STA_MODE_DUAL && mode_count == 0)
+                else if (state == STA_MODE_MULTI && mode_count == 0 && is_quad_read)
+                    bit_count_in <= 1;   // Entry into STA_READ_QUAD
+                else if (state == STA_MODE_MULTI && mode_count == 0)
                     bit_count_in <= 3;   // Entry into STA_READ_DUAL
                 else
                     bit_count_in <= bit_count_in - 1;
@@ -667,7 +854,24 @@ module spi_trx #(
     
     // Data output on falling edge of SPI clock
     always @(negedge spi_clk) begin
-        if (state == STA_READ_DUAL) begin
+        if (state == STA_READ_QUAD) begin
+            // Quad output: 4 bits per clock (2 clocks per byte)
+            // IO3 = MSB of nibble, IO0 = LSB of nibble
+            // bit_count_in=1: high nibble [7:4], bit_count_in=0: low nibble [3:0]
+            if (fresh_read) begin
+                spi_io3_out <= ram_read_buffer[addr[2:0]*8 + 7];
+                spi_io2_out <= ram_read_buffer[addr[2:0]*8 + 6];
+                spi_io1_out <= ram_read_buffer[addr[2:0]*8 + 5];
+                spi_io0_out <= ram_read_buffer[addr[2:0]*8 + 4];
+            end
+            else begin
+                spi_io3_out <= miso_byte[{bit_count_in[0], 2'b11}];
+                spi_io2_out <= miso_byte[{bit_count_in[0], 2'b10}];
+                spi_io1_out <= miso_byte[{bit_count_in[0], 2'b01}];
+                spi_io0_out <= miso_byte[{bit_count_in[0], 2'b00}];
+            end
+        end
+        else if (state == STA_READ_DUAL) begin
             // Dual output: 2 bits per clock
             // IO1 = high bit of pair, IO0 = low bit of pair
             if (fresh_read) begin

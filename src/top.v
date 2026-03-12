@@ -7,8 +7,10 @@
  * SPI wiring on dock PMOD connector (bank 6):
  *   A11 = CS
  *   E11 = CLK  
- *   C11 = IO0 (MOSI / bidirectional in dual mode)
- *   D11 = IO1 (MISO / bidirectional in dual mode)
+ *   C11 = IO0 (MOSI / bidirectional in dual/quad mode)
+ *   D11 = IO1 (MISO / bidirectional in dual/quad mode)
+ *   B11 = IO2 (/WP / bidirectional in quad mode)
+ *   C10 = IO3 (/HOLD / bidirectional in quad mode)
  *   A10 = POWER detection (active high)
  *   E10 = Debug output
  *
@@ -41,8 +43,10 @@ module top #(
     // SPI flash emulation interface (on dock GPIO header)
     input wire spi_cs_pin,        // Active low chip select
     input wire spi_clk_pin,       // SPI clock from master
-    inout wire spi_mosi_pin,      // IO0: MOSI / bidirectional in dual mode
-    inout wire spi_miso_pin,      // IO1: MISO / bidirectional in dual mode
+    inout wire spi_mosi_pin,      // IO0: MOSI / bidirectional in dual/quad mode
+    inout wire spi_miso_pin,      // IO1: MISO / bidirectional in dual/quad mode
+    inout wire spi_io2_pin,       // IO2: /WP / bidirectional in quad mode
+    inout wire spi_io3_pin,       // IO3: /HOLD / bidirectional in quad mode
     input wire spi_power_pin,     // Power detection
     output wire spi_debug_pin,    // Debug output
     
@@ -132,20 +136,32 @@ module top #(
     wire spi_power_in = spi_power_pin;
     
     // Bidirectional IO signals from spi_trx
-    wire spi_io0_out;   // IO0 output data (active in dual read)
+    wire spi_io0_out;   // IO0 output data (active in dual/quad read)
     wire spi_io0_oe;    // IO0 output enable
-    wire spi_io1_out;   // IO1 output data (MISO in single, IO1 in dual)
+    wire spi_io1_out;   // IO1 output data (MISO in single, IO1 in dual/quad)
     wire spi_io1_oe;    // IO1 output enable
+    wire spi_io2_out;   // IO2 output data (active in quad read)
+    wire spi_io2_oe;    // IO2 output enable
+    wire spi_io3_out;   // IO3 output data (active in quad read)
+    wire spi_io3_oe;    // IO3 output enable
     wire spi_debug_out;
     
-    // IO0 (MOSI pin): input normally, output during dual read data phase
+    // IO0 (MOSI pin): input normally, output during dual/quad read data phase
     wire spi_active_out = !spi_cs_in && spi_power_in;
     assign spi_mosi_pin = (spi_io0_oe && spi_active_out) ? spi_io0_out : 1'bz;
     wire spi_io0_in = spi_mosi_pin;
     
-    // IO1 (MISO pin): output during single-mode reads and dual read data phase
+    // IO1 (MISO pin): output during single-mode reads and dual/quad read data phase
     assign spi_miso_pin = (spi_io1_oe && spi_active_out) ? spi_io1_out : 1'bz;
     wire spi_io1_in = spi_miso_pin;
+    
+    // IO2 (/WP pin): input normally, output during quad read data phase
+    assign spi_io2_pin = (spi_io2_oe && spi_active_out) ? spi_io2_out : 1'bz;
+    wire spi_io2_in = spi_io2_pin;
+    
+    // IO3 (/HOLD pin): input normally, output during quad read data phase
+    assign spi_io3_pin = (spi_io3_oe && spi_active_out) ? spi_io3_out : 1'bz;
+    wire spi_io3_in = spi_io3_pin;
     
     assign spi_debug_pin = spi_debug_out;
     
@@ -211,6 +227,12 @@ module top #(
         .spi_io1_in(spi_io1_in),
         .spi_io1_out(spi_io1_out),
         .spi_io1_oe(spi_io1_oe),
+        .spi_io2_in(spi_io2_in),
+        .spi_io2_out(spi_io2_out),
+        .spi_io2_oe(spi_io2_oe),
+        .spi_io3_in(spi_io3_in),
+        .spi_io3_out(spi_io3_out),
+        .spi_io3_oe(spi_io3_oe),
         .spi_debug(spi_debug_out),
         
         .spi_active(spi_active),
