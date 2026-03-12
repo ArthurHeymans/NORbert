@@ -6,14 +6,12 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 
 ## Features
 
-- **SPI NOR flash emulation** with full command support: read, fast read, page program, sector/block/chip erase, JEDEC ID, status registers
+- **SPI NOR flash emulation** with full command support: read, fast read, page program, sector/block/chip erase, JEDEC ID, status registers, SFDP
+- **Configurable chip identity** at runtime -- load any chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database to set JEDEC ID, size, and SFDP parameters (defaults to Winbond W25Q64FV)
 - **Multi-I/O modes**: 1-1-1, 1-1-2, 1-2-2, 1-1-4, and 1-4-4 SPI read modes
 - **64MB backing store** using two SDRAM chips with bit-interleaved storage for zero-overhead serial output
 - **Pipelined prefetch**: SDRAM reads are issued during SPI address/dummy phases so data is ready on the first clock edge
 - **2 Mbaud UART** interface for loading and dumping images from a host PC
-- **Two emulated flash identities** (compile-time selectable):
-  - Winbond W25Q64FV (8MB, 3-byte addressing)
-  - Micron N25Q256A (32MB, 3/4-byte addressing)
 
 ## Hardware
 
@@ -47,12 +45,6 @@ make prog                   # program FPGA (volatile, lost on power cycle)
 make flash                  # program to flash (persistent)
 ```
 
-To target the Micron N25Q256A instead of the default Winbond W25Q64FV:
-
-```
-make build FLASH_CHIP=1
-```
-
 ### Host tool
 
 ```
@@ -81,9 +73,14 @@ spi-flash-tool dump output.bin --length 0x100000
 # Read a range (hex dump)
 spi-flash-tool read 0x0 0x100
 
+# Configure chip identity (uses rflasher chip database)
+spi-flash-tool configure W25Q128JV --chips-dir ~/src/rflasher/chips/vendors
+
 # List available serial ports
 spi-flash-tool ports
 ```
+
+The `configure` command loads a chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database and sends the JEDEC ID, size, and a generated SFDP table to the FPGA. The chip name is matched by substring, so `W25Q128` is enough if it's unambiguous. Without configuration, NORbert defaults to Winbond W25Q64FV.
 
 Use `-p /dev/ttyUSBx` if your device isn't on the default `/dev/ttyUSB0`.
 
@@ -101,4 +98,6 @@ src/
   pll.v        PLL: 50MHz -> 120MHz with phase-shifted outputs
 tool/
   src/main.rs  Host-side CLI (Rust) for loading/dumping over UART
+  src/chip.rs  Chip definition loading from rflasher RON database
+  src/sfdp.rs  SFDP/BFPT table generation from chip definitions
 ```

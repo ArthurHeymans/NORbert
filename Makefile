@@ -6,11 +6,6 @@
 DEVICE = GW5A-LV25MG121NC1/I0
 FAMILY = GW5A-25B
 
-# Flash chip selection:
-#   0 = Winbond W25Q64FV (8MB, default)
-#   1 = Micron N25Q256A (32MB)
-FLASH_CHIP ?= 0
-
 # Source files
 VERILOG_FILES = \
 	src/top.v \
@@ -40,7 +35,7 @@ $(BITSTREAM): $(VERILOG_FILES) $(CST_FILE) build.tcl
 
 # Lint with yosys (quick syntax/logic check)
 lint:
-	yosys -p "read_verilog -DFLASH_CHIP=$(FLASH_CHIP) $(VERILOG_FILES); synth_gowin -top top -noflatten"
+	yosys -p "read_verilog $(VERILOG_FILES); synth_gowin -top top -noflatten"
 
 # Program the device (volatile - lost on power cycle)
 prog: $(BITSTREAM)

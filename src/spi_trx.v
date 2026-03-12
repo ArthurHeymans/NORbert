@@ -1,18 +1,13 @@
 // SPI Flash Transceiver Module
-// Emulates SPI Flash chips:
-//   - Winbond W25Q64FV (8MB, default)
-//   - Micron N25Q256A (32MB, requires 4-byte addressing)
+// Emulates a configurable SPI NOR flash chip.
+// Chip identity (JEDEC ID, size, SFDP) is configured at runtime
+// via the serial CHIPCONFIG command through glue.v.
 //
 // Ported for Tang Primer 25K with 64MB SDRAM (23-bit burst addresses)
 
 `default_nettype none
 
-module spi_trx #(
-    // Flash chip selection:
-    //   0 = Winbond W25Q64FV (8MB, 3-byte address only)
-    //   1 = Micron N25Q256A (32MB, supports 4-byte address)
-    parameter FLASH_CHIP = 0
-)(
+module spi_trx(
     input wire clk,
 
     input wire spi_clk,
@@ -47,12 +42,22 @@ module spi_trx #(
     output reg write_cmd,
     output reg write_type,  // 0=page program, 1=erase (sector/block/chip)
     output reg [22:0] write_addr,     // 23-bit burst address
-    output reg [19:0] write_len,
+    output reg [22:0] write_len,
     input wire write_done,
     
     output reg write_buf_strobe,
     output reg [7:0] write_buf_offset,
     output reg [7:0] write_buf_val,
+    
+    // Configuration inputs (from glue, updated via serial CHIPCONFIG command).
+    // These are stable during SPI transactions (config only applied when CS high).
+    input wire [23:0] cfg_jedec_id,
+    input wire cfg_4byte,
+    input wire [22:0] cfg_chip_erase_bursts,
+    
+    // SFDP table read interface (memory in glue.v)
+    output reg [6:0] sfdp_raddr,
+    input wire [7:0] sfdp_rdata,
     
     output reg log_strobe = 0,
     output reg [7:0] log_val = 0
@@ -99,13 +104,8 @@ module spi_trx #(
     reg [7:0] mosi_byte;
     reg [7:0] miso_byte;
     
-    // JEDEC ID configuration
-    localparam [23:0] JEDEC_WINBOND = {8'h17, 8'h40, 8'hEF};
-    localparam [23:0] JEDEC_MICRON  = {8'h19, 8'hBA, 8'h20};
-    
-    wire [23:0] jedec_id = (FLASH_CHIP == 0) ? JEDEC_WINBOND : JEDEC_MICRON;
-    
-    wire supports_4byte = (FLASH_CHIP == 1);
+    // JEDEC ID and 4-byte addressing are driven by cfg_jedec_id and cfg_4byte
+    // from glue.v (configured at runtime via serial CHIPCONFIG command).
     
     // SPI Flash command definitions
     localparam
@@ -125,6 +125,7 @@ module spi_trx #(
         CMD_CHIPERASE1      = 8'h60,
         CMD_QUADREAD        = 8'h6B,  // Quad Output Read (1-1-4)
         CMD_READID1         = 8'h9E,
+        CMD_READSFDP        = 8'h5A,  // Read SFDP table
         CMD_READID2         = 8'h9F,
         CMD_4BYTEENABLE     = 8'hB7,
         CMD_DUALIOREAD      = 8'hBB,  // Dual I/O Read (1-2-2)
@@ -152,13 +153,15 @@ module spi_trx #(
         STA_MODE_MULTI      = 13,  // Mode+dummy phase for 0xBB/0xEB
         STA_ADDR_READ_QUAD  = 14,  // Quad I/O address phase (1-4-4)
         STA_READ_QUAD       = 15,  // Quad data output phase (1-1-4 & 1-4-4)
-        STA_WRITESTATUS     = 16;  // Receive status register write data
+        STA_WRITESTATUS     = 16,  // Receive status register write data
+        STA_READSFDP        = 17;  // SFDP data output phase
     
     reg [4:0] state;
     reg [2:0] dummy_count = 0;
     reg is_fast_read = 0;
     reg is_dual_read = 0;       // Set for both 0x3B and 0xBB
     reg is_quad_read = 0;       // Set for both 0x6B and 0xEB
+    reg is_sfdp_read = 0;       // Set for CMD 0x5A (Read SFDP)
     reg [2:0] mode_count = 0;   // Mode+dummy counter (4 for dual, 6 for quad)
     
     reg [31:0] addr;
@@ -207,6 +210,7 @@ module spi_trx #(
                 is_fast_read <= 0;
                 is_dual_read <= 0;
                 is_quad_read <= 0;
+                is_sfdp_read <= 0;
                 mode_count <= 0;
                 
                 log_strobe <= 0;
@@ -267,11 +271,11 @@ module spi_trx #(
                     end
                     
                     CMD_4BYTEENABLE: begin
-                        if (status_reg[1] && supports_4byte) addr_4byte <= 1;
+                        if (status_reg[1] && cfg_4byte) addr_4byte <= 1;
                     end
                     
                     CMD_4BYTEDISABLE: begin
-                        if (status_reg[1] && supports_4byte) addr_4byte <= 0;
+                        if (status_reg[1] && cfg_4byte) addr_4byte <= 0;
                     end
                         
                     CMD_READ: begin
@@ -280,7 +284,7 @@ module spi_trx #(
                     end
                     
                     CMD_READ_4B: begin
-                        if (supports_4byte) begin
+                        if (cfg_4byte) begin
                             state <= STA_ADDR_READ;
                             addr_count <= 31;
                         end
@@ -293,7 +297,7 @@ module spi_trx #(
                     end
                     
                     CMD_FASTREAD_4B: begin
-                        if (supports_4byte) begin
+                        if (cfg_4byte) begin
                             state <= STA_ADDR_READ;
                             addr_count <= 31;
                             is_fast_read <= 1;
@@ -338,7 +342,7 @@ module spi_trx #(
                         if (status_reg[1]) begin
                             state <= STA_ADDR_ERASE;
                             addr_count <= addr_4byte ? 31 : 23;
-                            write_len <= 20'h001FF; // 4KB = 512 × 8-byte bursts - 1
+                            write_len <= 23'h001FF; // 4KB = 512 × 8-byte bursts - 1
                         end
                     end
                     
@@ -346,7 +350,7 @@ module spi_trx #(
                         if (status_reg[1]) begin
                             state <= STA_ADDR_ERASE;
                             addr_count <= addr_4byte ? 31 : 23;
-                            write_len <= 20'h00FFF; // 32KB = 4096 × 8-byte bursts - 1
+                            write_len <= 23'h00FFF; // 32KB = 4096 × 8-byte bursts - 1
                         end
                     end
                     
@@ -354,7 +358,7 @@ module spi_trx #(
                         if (status_reg[1]) begin
                             state <= STA_ADDR_ERASE;
                             addr_count <= addr_4byte ? 31 : 23;
-                            write_len <= 20'h01FFF; // 64KB = 8192 × 8-byte bursts - 1
+                            write_len <= 23'h01FFF; // 64KB = 8192 × 8-byte bursts - 1
                         end
                     end
                     
@@ -365,11 +369,7 @@ module spi_trx #(
                             write_cmd <= 1;
                             write_type <= 1'd1;
                             write_addr <= 23'b0;
-                            // Chip erase: write_len is 20 bits, max 1M bursts = 8MB.
-                            // W25Q64FV (8MB) fits exactly. N25Q256A (32MB) would need
-                            // a wider counter; for now erase only covers first 8MB.
-                            // TODO: extend write_len to 23 bits for full 64MB support.
-                            write_len <= 20'hFFFFF;
+                            write_len <= cfg_chip_erase_bursts;
                             status_reg[1] <= 0;
                             status_reg[0] <= 1;
                         end
@@ -379,15 +379,22 @@ module spi_trx #(
                         if (status_reg[1]) begin
                             state <= STA_ADDR_WRITE;
                             addr_count <= addr_4byte ? 31 : 23;
-                            write_len <= 20'h0001F; // 256 byte page = 32 × 8-byte bursts - 1
+                            write_len <= 23'h0001F; // 256 byte page = 32 × 8-byte bursts - 1
                         end
+                    end
+                    
+                    CMD_READSFDP: begin
+                        state <= STA_ADDR_READ;
+                        addr_count <= 23;        // Always 3-byte address for SFDP
+                        is_fast_read <= 1;       // 8 dummy clocks after address
+                        is_sfdp_read <= 1;
                     end
                     
                     CMD_READID1,
                     CMD_READID2: begin
                         state <= STA_READID;
                         spi_io1_oe_ff <= 1;
-                        miso_byte <= jedec_id[7:0];
+                        miso_byte <= cfg_jedec_id[7:0];
                         addr_count <= 1;
                     end
                     
@@ -408,21 +415,27 @@ module spi_trx #(
                     // ram_addr is 23-bit burst address = byte_addr[25:3]
                     // addr_count counts down from 23 (or 31 for 4-byte) to 0
                     
-                    if (addr_count == 7) begin
-                        ram_inhibit_refresh <= 1;
+                    // SDRAM pipeline (skipped for SFDP reads which use internal table)
+                    if (!is_sfdp_read) begin
+                        if (addr_count == 7) begin
+                            ram_inhibit_refresh <= 1;
+                        end
+                        else if (addr_count == 4) begin
+                            ram_activate <= 1;
+                            ram_addr[22:4] <= addr[25:7];
+                        end
+                        else if (addr_count == 3) begin
+                            ram_read <= 1;
+                            ram_addr[3:0] <= {addr[6:4], spi_io0_in};
+                        end
                     end
-                    else if (addr_count == 4) begin
-                        ram_activate <= 1;
-                        ram_addr[22:4] <= addr[25:7];
-                    end
-                    else if (addr_count == 3) begin
-                        ram_read <= 1;
-                        ram_addr[3:0] <= {addr[6:4], spi_io0_in};
-                    end
-                    else if (addr_count == 0) begin
-                        ram_inhibit_refresh <= 0;
-                        ram_activate <= 0;
-                        ram_read <= 0;
+                    
+                    if (addr_count == 0) begin
+                        if (!is_sfdp_read) begin
+                            ram_inhibit_refresh <= 0;
+                            ram_activate <= 0;
+                            ram_read <= 0;
+                        end
 
                         if (is_fast_read) begin
                             state <= STA_DUMMY;
@@ -445,26 +458,40 @@ module spi_trx #(
                 end
                 else if (state == STA_DUMMY) begin
                     if (dummy_count == 0) begin
-                        if (is_quad_read) begin
+                        if (is_sfdp_read) begin
+                            // SFDP read: output from internal SFDP table.
+                            // sfdp_raddr was preloaded at dummy_count==1,
+                            // so sfdp_rdata is valid now.
+                            state <= STA_READSFDP;
+                            spi_io1_oe_ff <= 1;
+                            miso_byte <= sfdp_rdata;
+                        end
+                        else if (is_quad_read) begin
                             state <= STA_READ_QUAD;
                             spi_io0_oe_ff <= 1;
                             spi_io1_oe_ff <= 1;
                             spi_io2_oe_ff <= 1;
                             spi_io3_oe_ff <= 1;
+                            fresh_read <= 1;
                         end
                         else if (is_dual_read) begin
                             state <= STA_READ_DUAL;
                             spi_io0_oe_ff <= 1;
                             spi_io1_oe_ff <= 1;
+                            fresh_read <= 1;
                         end
                         else begin
                             state <= STA_READ;
                             spi_io1_oe_ff <= 1;
+                            fresh_read <= 1;
                         end
-                        fresh_read <= 1;
                     end
                     else begin
                         dummy_count <= dummy_count - 1;
+                        // Preload SFDP address one cycle before transition
+                        // so sfdp_rdata is valid when we enter STA_READSFDP.
+                        if (dummy_count == 1 && is_sfdp_read)
+                            sfdp_raddr <= addr[6:0];
                     end
                 end
                 else if (state == STA_READ) begin
@@ -503,7 +530,7 @@ module spi_trx #(
                 else if (state == STA_READID) begin
                     if (bit_count_in == 0) begin
                         if (addr_count < 3) begin
-                            miso_byte <= jedec_id[addr_count*8 +: 8];
+                            miso_byte <= cfg_jedec_id[addr_count*8 +: 8];
                             addr_count <= addr_count + 1;
                         end
                         else
@@ -815,6 +842,22 @@ module spi_trx #(
                 // Write Status Register data reception (CMD 0x01)
                 // Receives 1 byte (SR1) or 2 bytes (SR1 + SR2).
                 // ---------------------------------------------------------
+                // ---------------------------------------------------------
+                // SFDP data output phase (CMD 0x5A)
+                // One byte per 8 SPI clocks, like normal single read.
+                // Data comes from SFDP table in glue.v via sfdp_rdata.
+                // Address preloaded 1 cycle ahead via sfdp_raddr.
+                // ---------------------------------------------------------
+                else if (state == STA_READSFDP) begin
+                    if (bit_count_in == 1) begin
+                        // Preload next byte address for sfdp_rdata
+                        sfdp_raddr <= addr[6:0] + 1;
+                    end
+                    else if (bit_count_in == 0) begin
+                        miso_byte <= sfdp_rdata;
+                        addr <= addr + 1;
+                    end
+                end
                 else if (state == STA_WRITESTATUS && bit_count_in == 0) begin
                     if (addr_count == 0) begin
                         // First byte: SR1 (preserve WEL/BUSY)

@@ -1,3 +1,6 @@
+mod chip;
+mod sfdp;
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -16,6 +19,7 @@ const PROTOCOL_VERSION: u8 = 2;
 const CMD_VERSION: u8 = 0x30;
 const CMD_READ: u8 = 0x31;
 const CMD_WRITE: u8 = 0x32;
+const CMD_CHIPCONFIG: u8 = 0x33;
 
 #[derive(Parser)]
 #[command(name = "spi-flash-tool")]
@@ -85,6 +89,17 @@ enum Commands {
         /// Number of bytes to dump
         #[arg(short, long, value_parser = parse_address)]
         length: u32,
+    },
+
+    /// Configure the emulated flash chip identity
+    Configure {
+        /// Path to rflasher chip database directory (containing .ron files)
+        #[arg(long, default_value = "~/src/rflasher/chips/vendors")]
+        chip_db: String,
+
+        /// Chip name to emulate (substring match, e.g. "W25Q128.V")
+        #[arg(short, long)]
+        chip: String,
     },
 
     /// List available serial ports
@@ -233,6 +248,53 @@ impl FlashDevice {
         }
 
         Ok(result)
+    }
+
+    /// Send chip configuration to the FPGA.
+    ///
+    /// Protocol (CMD_CHIPCONFIG = 0x33):
+    ///   Byte 0:    0x33
+    ///   Byte 1:    JEDEC manufacturer ID
+    ///   Byte 2:    JEDEC device ID high byte
+    ///   Byte 3:    JEDEC device ID low byte
+    ///   Byte 4:    Flags (bit 0 = supports 4-byte addressing)
+    ///   Byte 5-7:  Chip erase burst count (23-bit, MSB first)
+    ///              = (total_size / 8) - 1
+    ///   Byte 8:    SFDP table length (0-128)
+    ///   Byte 9+:   SFDP table data
+    ///
+    /// Response: 0x01 on success.
+    fn send_chip_config(&mut self, chip: &chip::FlashChip, sfdp_table: &[u8]) -> Result<()> {
+        let jedec = chip.jedec_id_bytes();
+        let erase_bursts = chip.chip_erase_bursts();
+        let flags: u8 = if chip.supports_4byte { 0x01 } else { 0x00 };
+
+        let sfdp_len = sfdp_table.len();
+        if sfdp_len > 128 {
+            bail!("SFDP table too large: {} bytes (max 128)", sfdp_len);
+        }
+
+        // Build the full command in one buffer to avoid USB transfer gaps
+        let mut buf = Vec::with_capacity(9 + sfdp_len);
+        buf.push(CMD_CHIPCONFIG);
+        buf.push(jedec[0]); // manufacturer
+        buf.push(jedec[1]); // device high
+        buf.push(jedec[2]); // device low
+        buf.push(flags);
+        buf.push(((erase_bursts >> 16) & 0x7F) as u8);
+        buf.push(((erase_bursts >> 8) & 0xFF) as u8);
+        buf.push((erase_bursts & 0xFF) as u8);
+        buf.push(sfdp_len as u8);
+        buf.extend_from_slice(sfdp_table);
+        self.port.write_all(&buf)?;
+
+        // Wait for ack
+        let mut resp = [0u8; 1];
+        self.port.read_exact(&mut resp)?;
+        if resp[0] != 0x01 {
+            bail!("Chip config failed: unexpected response 0x{:02x}", resp[0]);
+        }
+        Ok(())
     }
 
     fn write(&mut self, address: u32, data: &[u8]) -> Result<()> {
@@ -473,6 +535,59 @@ fn cmd_dump(port: &str, file: &PathBuf, address: u32, length: u32) -> Result<()>
     cmd_read(port, address, length, Some(file.clone()))
 }
 
+fn cmd_configure(port: &str, chip_db_path: &str, chip_name: &str) -> Result<()> {
+    // Expand ~ in path
+    let expanded = if chip_db_path.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        format!("{}/{}", home, &chip_db_path[2..])
+    } else {
+        chip_db_path.to_string()
+    };
+    let db_path = std::path::Path::new(&expanded);
+
+    // Load chip database
+    eprintln!("Loading chip database from {}...", db_path.display());
+    let chips = chip::load_chip_db(db_path)?;
+    eprintln!("Loaded {} chip definitions", chips.len());
+
+    // Find requested chip
+    let chip = chip::find_chip_by_name(&chips, chip_name)?;
+
+    eprintln!(
+        "Selected: {} {} (JEDEC {:02X} {:04X})",
+        chip.vendor, chip.name, chip.jedec_manufacturer, chip.jedec_device,
+    );
+    eprintln!(
+        "  Size:       {} KB ({} MB)",
+        chip.total_size / 1024,
+        chip.total_size / (1024 * 1024),
+    );
+    eprintln!("  Page size:  {} bytes", chip.page_size);
+    eprintln!("  4-byte addr: {}", chip.supports_4byte);
+    eprintln!("  Dual I/O:   {}", chip.supports_dual);
+    eprintln!("  Quad I/O:   {}", chip.supports_quad);
+
+    let erase_ops = chip.sector_erase_ops();
+    for op in &erase_ops {
+        eprintln!(
+            "  Erase:      0x{:02X} ({} KB)",
+            op.opcode,
+            op.block_size / 1024
+        );
+    }
+
+    // Generate SFDP table
+    let sfdp_table = sfdp::generate_sfdp(chip);
+    eprintln!("  SFDP table: {} bytes", sfdp_table.len());
+
+    // Send to FPGA
+    let mut device = FlashDevice::open(port)?;
+    device.send_chip_config(chip, &sfdp_table)?;
+
+    eprintln!("Configuration applied successfully.");
+    Ok(())
+}
+
 fn cmd_ports() -> Result<()> {
     let ports = serialport::available_ports()?;
     if ports.is_empty() {
@@ -521,6 +636,7 @@ fn main() -> Result<()> {
             address,
             length,
         } => cmd_dump(&cli.port, &file, address, length),
+        Commands::Configure { chip_db, chip } => cmd_configure(&cli.port, &chip_db, &chip),
         Commands::Ports => cmd_ports(),
     }
 }

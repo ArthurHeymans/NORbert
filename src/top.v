@@ -14,19 +14,12 @@
  *   A10 = POWER detection (active high)
  *   E10 = Debug output
  *
- * Supported flash chips (selected via FLASH_CHIP parameter):
- *   0 = Winbond W25Q64FV (8MB, default)
- *   1 = Micron N25Q256A (32MB)
+ * Emulated flash chip is configured at runtime via the serial
+ * CHIPCONFIG command (defaults to Winbond W25Q64FV 8MB).
  */
 `default_nettype none
 
-`ifndef FLASH_CHIP
-`define FLASH_CHIP 0
-`endif
-
-module top #(
-    parameter FLASH_CHIP = `FLASH_CHIP
-)(
+module top(
     input wire clk_50mhz,         // 50MHz crystal oscillator
     
     // LED
@@ -203,7 +196,7 @@ module top #(
     wire spi_write_cmd;
     wire spi_write_type;  // 0=page program, 1=erase (sector/block/chip)
     wire [22:0] spi_write_addr;  // 23-bit
-    wire [19:0] spi_write_len;
+    wire [22:0] spi_write_len;
     wire spi_write_done;
     
     wire spi_write_buf_strobe;
@@ -213,9 +206,16 @@ module top #(
     wire log_strobe;
     wire [7:0] log_val;
     
-    spi_trx #(
-        .FLASH_CHIP(FLASH_CHIP)
-    ) spi_trx_i (
+    // Chip configuration wires (glue -> spi_trx)
+    wire [23:0] cfg_jedec_id;
+    wire cfg_4byte;
+    wire [22:0] cfg_chip_erase_bursts;
+    
+    // SFDP table read interface (spi_trx -> glue -> spi_trx)
+    wire [6:0] sfdp_raddr;
+    wire [7:0] sfdp_rdata;
+    
+    spi_trx spi_trx_i (
         .clk(clk),
         
         .spi_clk(spi_clk_in),
@@ -254,6 +254,13 @@ module top #(
         .write_buf_strobe(spi_write_buf_strobe),
         .write_buf_offset(spi_write_buf_offset),
         .write_buf_val(spi_write_buf_val),
+        
+        .cfg_jedec_id(cfg_jedec_id),
+        .cfg_4byte(cfg_4byte),
+        .cfg_chip_erase_bursts(cfg_chip_erase_bursts),
+        
+        .sfdp_raddr(sfdp_raddr),
+        .sfdp_rdata(sfdp_rdata),
         
         .log_strobe(log_strobe),
         .log_val(log_val)
@@ -374,6 +381,13 @@ module top #(
         
         .log_strobe(log_strobe),
         .log_val(log_val),
+        
+        .cfg_jedec_id(cfg_jedec_id),
+        .cfg_4byte(cfg_4byte),
+        .cfg_chip_erase_bursts(cfg_chip_erase_bursts),
+        
+        .sfdp_raddr(sfdp_raddr),
+        .sfdp_rdata(sfdp_rdata),
         
         .led(led_out)
     );

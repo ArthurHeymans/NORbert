@@ -35,7 +35,7 @@ module glue(
     input wire spi_cmd_write,
     input wire spi_write_type,  // 0=page program, 1=erase (sector/block/chip)
     input wire [22:0] spi_write_addr,   // 23-bit burst address
-    input wire [19:0] spi_write_len,
+    input wire [22:0] spi_write_len,
     output reg spi_write_done,
     
     input wire spi_write_buf_strobe,
@@ -45,6 +45,15 @@ module glue(
     input wire log_strobe,
     input wire [7:0] log_val,
     
+    // Chip configuration outputs (from CHIPCONFIG command)
+    output reg [23:0] cfg_jedec_id,
+    output reg cfg_4byte,
+    output reg [22:0] cfg_chip_erase_bursts,
+    
+    // SFDP table read interface (for spi_trx)
+    input wire [6:0] sfdp_raddr,
+    output wire [7:0] sfdp_rdata,
+    
     output reg [7:0] led
 );
 
@@ -53,12 +62,13 @@ module glue(
         CMD_NOP          = 8'h00,
         CMD_VERSION      = 8'h30,
         CMD_RAMREAD      = 8'h31,
-        CMD_RAMWRITE     = 8'h32;
+        CMD_RAMWRITE     = 8'h32,
+        CMD_CHIPCONFIG   = 8'h33;
 
     localparam VERSION = 8'h02;  // Version 2 for Tang Primer 25K port
 
     reg [7:0] cmd;
-    reg [3:0] in_count;
+    reg [7:0] in_count;
     
     // Idle timeout: reset serial parser if no byte received within ~137us
     // while in middle of a multi-byte command. Handles spurious bytes
@@ -107,7 +117,7 @@ module glue(
     
     reg i_spi_write_type;
     reg [3:0] i_spi_write_state;
-    reg [19:0] i_spi_len;
+    reg [22:0] i_spi_len;
     
     // Page program buffer (256 bytes + write flags)
     reg [8:0] i_spi_write_data [0:255];
@@ -117,6 +127,14 @@ module glue(
     reg [7:0] spi_write_buf_offset_reg;
     reg [7:0] spi_write_buf_val_reg;
 
+    // SFDP table storage (128 bytes, written by CHIPCONFIG, read by spi_trx)
+    reg [7:0] sfdp_mem [0:127];
+    assign sfdp_rdata = sfdp_mem[sfdp_raddr];
+    
+    // CHIPCONFIG state
+    reg [6:0] sfdp_wr_pos;
+    reg [6:0] cfg_sfdp_remaining;
+    
     // Convert 23-bit burst address to 25-bit access_addr for SDRAM controller
     // Burst address: [22]=chip, [21:9]=row, [8:7]=bank, [6:0]=col_burst
     // Access addr:   [24]=chip, [23:11]=row, [10:9]=bank, [8:0]=col
@@ -167,9 +185,18 @@ module glue(
             spi_write_buf_val_reg <= 0;
             
             write_buffer <= 0;
+            
+            cfg_jedec_id <= {8'h17, 8'h40, 8'hEF};  // Default: W25Q64FV (EF 40 17)
+            cfg_4byte <= 0;
+            cfg_chip_erase_bursts <= 23'h0FFFFF;     // 8MB = 1M bursts - 1
+            sfdp_wr_pos <= 0;
+            cfg_sfdp_remaining <= 0;
 
             for (i = 0; i < 256; i = i + 1)
                 i_spi_write_data[i][8] <= 0;
+            
+            for (i = 0; i < 128; i = i + 1)
+                sfdp_mem[i] <= 8'hFF;
         end
         else begin
             txd_strobe_buf <= 0;
@@ -329,8 +356,74 @@ module glue(
                             write_state <= 0;
                             write_pos <= 0;
                         end
+                        else if (rxd_data_buf == CMD_CHIPCONFIG) begin
+                            cmd <= CMD_CHIPCONFIG;
+                            in_count <= 1;
+                        end
+                    end
+                    else if (cmd == CMD_CHIPCONFIG) begin
+                        // -----------------------------------------------
+                        // CHIPCONFIG protocol:
+                        //   Byte 1:   JEDEC manufacturer ID
+                        //   Byte 2:   JEDEC device ID high
+                        //   Byte 3:   JEDEC device ID low
+                        //   Byte 4:   Flags (bit 0 = 4-byte addr support)
+                        //   Byte 5-7: Chip erase burst count (23-bit MSB)
+                        //   Byte 8:   SFDP table length (0-128)
+                        //   Byte 9+:  SFDP table data
+                        // Response: 0x01
+                        // -----------------------------------------------
+                        
+                        // Store header bytes into config registers.
+                        // JEDEC ID is packed as {device_lo, device_hi, manufacturer}
+                        // so that READID outputs [7:0]=manufacturer first, matching
+                        // the SPI RDID response order (manufacturer, type, capacity).
+                        if (in_count == 8'd1)
+                            cfg_jedec_id[7:0] <= rxd_data_buf;   // manufacturer
+                        else if (in_count == 8'd2)
+                            cfg_jedec_id[15:8] <= rxd_data_buf;  // device high (type)
+                        else if (in_count == 8'd3)
+                            cfg_jedec_id[23:16] <= rxd_data_buf; // device low (capacity)
+                        else if (in_count == 8'd4)
+                            cfg_4byte <= rxd_data_buf[0];
+                        else if (in_count == 8'd5)
+                            cfg_chip_erase_bursts[22:16] <= rxd_data_buf[6:0];
+                        else if (in_count == 8'd6)
+                            cfg_chip_erase_bursts[15:8] <= rxd_data_buf;
+                        else if (in_count == 8'd7)
+                            cfg_chip_erase_bursts[7:0] <= rxd_data_buf;
+                        else if (in_count == 8'd8) begin
+                            cfg_sfdp_remaining <= rxd_data_buf[6:0];
+                            sfdp_wr_pos <= 0;
+                        end
+                        // SFDP data bytes
+                        else begin
+                            sfdp_mem[sfdp_wr_pos] <= rxd_data_buf;
+                            sfdp_wr_pos <= sfdp_wr_pos + 1;
+                            cfg_sfdp_remaining <= cfg_sfdp_remaining - 1;
+                        end
+                        
+                        // Advance or finish
+                        if (in_count == 8'd8 && rxd_data_buf[6:0] == 0) begin
+                            // No SFDP data, done immediately
+                            txd_strobe_buf <= 1;
+                            txd_data_buf <= 8'h01;
+                            in_count <= 0;
+                            cmd <= CMD_NOP;
+                        end
+                        else if (in_count > 8'd8 && cfg_sfdp_remaining == 7'd1) begin
+                            // Last SFDP byte received, done
+                            txd_strobe_buf <= 1;
+                            txd_data_buf <= 8'h01;
+                            in_count <= 0;
+                            cmd <= CMD_NOP;
+                        end
+                        else begin
+                            in_count <= in_count + 1;
+                        end
                     end
                     else begin
+                        // RAMREAD / RAMWRITE handling
                         // Address bytes: 3 bytes for 23-bit burst address
                         // (shifted in MSB first)
                         if (in_count <= 3)
