@@ -79,7 +79,7 @@ module glue(
         CMD_RAMWRITE     = 8'h32,
         CMD_CHIPCONFIG   = 8'h33;
 
-    localparam VERSION = 8'h02;  // Version 2 for Tang Primer 25K port
+    localparam VERSION = 8'h03;  // Version 3: 16-bit burst length
 
     reg [7:0] cmd;
     reg [7:0] in_count;
@@ -91,7 +91,7 @@ module glue(
     reg [16:0] serial_idle_count;
 
     reg [22:0] addr;       // 23-bit burst address
-    reg [7:0] len;
+    reg [15:0] len;        // 16-bit burst count (v3: 2 header bytes)
 
     reg [2:0] read_state;
     reg [2:0] read_pos;
@@ -522,18 +522,19 @@ module glue(
                         end
                     end
                     else begin
-                        // RAMREAD / RAMWRITE handling
-                        // Address bytes: 3 bytes for 23-bit burst address
-                        // (shifted in MSB first)
+                        // RAMREAD / RAMWRITE handling (v3: 6-byte header)
+                        // Header: cmd, addr[2], addr[1], addr[0], len_hi, len_lo
                         if (in_count <= 3)
                             addr <= {addr[14:0], rxd_data_buf};
                         else if (in_count == 4)
-                            len <= rxd_data_buf;
+                            len[15:8] <= rxd_data_buf;
+                        else if (in_count == 5)
+                            len[7:0] <= rxd_data_buf;
 
-                        if (cmd == CMD_RAMREAD && in_count == 4) begin
+                        if (cmd == CMD_RAMREAD && in_count == 5) begin
                             read_state <= 1;
                         end
-                        if (cmd == CMD_RAMWRITE && in_count > 4) begin
+                        if (cmd == CMD_RAMWRITE && in_count > 5) begin
                             write_buffer[write_pos*8 +: 8] <= rxd_data_buf;
                             
                             if (write_pos == 7) begin
@@ -542,7 +543,7 @@ module glue(
                             write_pos <= write_pos + 1;
                         end
 
-                        if (in_count <= 4)
+                        if (in_count <= 5)
                             in_count <= in_count + 1;
                     end
 

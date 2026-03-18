@@ -14,8 +14,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 const BAUD_RATE: u32 = 2_000_000;
-const BLOCK_SIZE: usize = 2048; // 256 bursts * 8 bytes
-const PROTOCOL_VERSION: u8 = 2;
+// Max bursts per command: 16-bit len field (v3), 8 bytes per burst.
+// Tuned to balance throughput against FT2232H internal FIFO depth.
+const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
+const PROTOCOL_VERSION: u8 = 3;
 
 // Protocol commands (shared between UART and FT245 transports)
 const CMD_VERSION: u8 = 0x30;
@@ -114,15 +116,19 @@ impl Ft245Transport {
         ft.set_usb_parameters(65536)
             .context("Failed to set USB parameters")?;
 
-        // Low latency for responsive transfers
-        ft.set_latency_timer(Duration::from_millis(2))
+        // Minimum latency timer -- each ACK/response byte sits in the
+        // FT2232H TX FIFO until either a full USB packet fills or this
+        // timer fires.  1ms is the FT2232H minimum.
+        ft.set_latency_timer(Duration::from_millis(1))
             .context("Failed to set latency timer")?;
 
         // D2XX read/write timeouts (prevents infinite blocking)
         ft.set_timeouts(Duration::from_secs(5), Duration::from_secs(5))
             .context("Failed to set timeouts")?;
 
-        // Drain any stale data in the receive buffer
+        // Wait for the FPGA's idle timeout (~546µs) then drain.
+        thread::sleep(Duration::from_millis(2));
+
         let mut trash = [0u8; 4096];
         loop {
             let n = ft.queue_status().context("Failed to query queue status")?;
@@ -193,12 +199,14 @@ impl Ft245Transport {
                 .context("No FT2232H found")?
         };
 
-        // Reset and flush
+        // Reset the FT2232H's internal FIFOs and state.
         dev.usb_reset().context("FT2232H reset failed")?;
         dev.flush_all().context("FT2232H flush failed")?;
 
-        // Low latency for responsive transfers
-        dev.set_latency_timer(2)
+        // Minimum latency timer -- each ACK/response byte sits in the
+        // FT2232H TX FIFO until either a full USB packet fills or this
+        // timer fires.  1ms is the FT2232H minimum.
+        dev.set_latency_timer(1)
             .context("Failed to set latency timer")?;
 
         // Configure timeouts
@@ -209,7 +217,11 @@ impl Ft245Transport {
         dev.set_read_chunksize(65536);
         dev.set_write_chunksize(65536);
 
-        // Drain stale data from the read buffer
+        // Wait for the FPGA's idle timeout (~546µs at 120MHz) to reset
+        // its protocol parser in case the USB reset glitched the data
+        // bus and injected garbage bytes.  Then drain residual data.
+        thread::sleep(Duration::from_millis(2));
+
         let mut trash = [0u8; 4096];
         loop {
             match dev.read_data(&mut trash) {
@@ -293,12 +305,14 @@ impl FlashDevice {
         let addr_units = address / 8;
         let len_units = length / 8;
 
+        // v3 header: cmd + 3 addr bytes + 2 len bytes (big-endian)
         let cmd = [
             CMD_READ,
             ((addr_units >> 16) & 0xFF) as u8,
             ((addr_units >> 8) & 0xFF) as u8,
             (addr_units & 0xFF) as u8,
-            len_units as u8,
+            ((len_units >> 8) & 0xFF) as u8,
+            (len_units & 0xFF) as u8,
         ];
 
         self.transport.write_all(&cmd)?;
@@ -323,14 +337,16 @@ impl FlashDevice {
         let len_units = data.len() / 8;
 
         // Combine header and data into a single write to avoid
-        // transfer gaps that could trigger the FPGA's idle timeout
-        let mut buf = Vec::with_capacity(5 + data.len());
+        // transfer gaps that could trigger the FPGA's idle timeout.
+        // v3 header: cmd + 3 addr bytes + 2 len bytes (big-endian)
+        let mut buf = Vec::with_capacity(6 + data.len());
         buf.extend_from_slice(&[
             CMD_WRITE,
             ((addr_units >> 16) & 0xFF) as u8,
             ((addr_units >> 8) & 0xFF) as u8,
             (addr_units & 0xFF) as u8,
-            len_units as u8,
+            ((len_units >> 8) & 0xFF) as u8,
+            (len_units & 0xFF) as u8,
         ]);
         buf.extend_from_slice(data);
         self.transport.write_all(&buf)?;
