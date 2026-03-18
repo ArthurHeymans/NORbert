@@ -22,9 +22,10 @@ module glue(
     output reg txd_strobe,
     output reg [7:0] txd_data,
 
-    // FT245 byte interface (accent identical to UART)
-    input wire ft_rxd_strobe,
-    input wire [7:0] ft_rxd_data,
+    // FT245 byte interface (pull-based via RX FIFO)
+    input wire ft_rx_data_available,
+    input wire [7:0] ft_rx_data,
+    output reg ft_rx_pop,
 
     input wire ft_txd_ready,
     output reg ft_txd_strobe,
@@ -83,17 +84,11 @@ module glue(
     reg [7:0] cmd;
     reg [7:0] in_count;
     
-    // Idle timeout: reset serial parser if no byte received within ~137us
-    // while in middle of a multi-byte command. Handles spurious bytes
+    // Idle timeout: reset serial parser if no byte received within ~546us
+    // while in middle of a multi-byte command.  Handles spurious bytes
     // from USB-UART bridge on port open/close.
-    // At 120MHz, 2^14 = 16384 cycles = ~137us
-    // This is long enough for back-to-back UART bytes within a USB
-    // transfer (~3.3us per byte at 3Mbaud) but short enough to recover
-    // quickly from spurious bytes before the tool's real command arrives
-    // via USB (~125us for high-speed, ~1ms for full-speed).
-    // The tool should combine command headers and data into single
-    // write() calls to avoid mid-command USB transfer gaps.
-    reg [14:0] serial_idle_count;
+    // At 120MHz, 2^16 = 65536 cycles = ~546us
+    reg [16:0] serial_idle_count;
 
     reg [22:0] addr;       // 23-bit burst address
     reg [7:0] len;
@@ -110,10 +105,11 @@ module glue(
     reg rxd_strobe_buf;
     reg [7:0] rxd_data_buf;
 
-    wire sdram_busy = (sdram_access_cmd != 0) || sdram_cmd_busy;
+    wire sdram_busy = (sdram_access_cmd != 0) || sdram_cmd_busy || sdram_read_busy;
     
     reg [63:0] write_buffer;
     reg write_strobe;
+    reg write_strobe_r;  // delayed copy for rising-edge detection
     
     reg [1:0] log_strobe_buf;
     always @(posedge clk) log_strobe_buf <= {log_strobe_buf[0], log_strobe};
@@ -125,10 +121,32 @@ module glue(
     // Latched when a command byte arrives while idle.
     reg active_port;
 
-    // Muxed RX/TX signals based on active port
-    wire mux_rxd_strobe = active_port ? ft_rxd_strobe : rxd_strobe;
-    wire [7:0] mux_rxd_data = active_port ? ft_rxd_data : rxd_data;
+    wire cmd_idle = (cmd == CMD_NOP) && (in_count == 0) && !read_state && !write_state;
     wire mux_txd_ready = active_port ? ft_txd_ready : txd_ready;
+
+    // Serial handler gate: only consume FIFO bytes when SPI is inactive.
+    // This prevents popping bytes that the serial handler would ignore,
+    // which is the root cause of the ACK corruption (0x00 instead of 0x01).
+    wire serial_gate = (spi_reset || spi_csel_buf[1]) && !spi_writing;
+
+    // Hold flag: prevent double-consume from FIFO.  Set for 1 cycle
+    // after popping a byte, cleared the next cycle.  Gives a 2-cycle
+    // cadence (consume, process, consume, ...) which is well within
+    // the FT245's ~12-cycle byte delivery rate.
+    reg ft_rx_hold;
+
+    // Pipeline-aware TX flow control.
+    // After txd_strobe_buf fires, it takes 2 cycles for ft245 to latch
+    // tx_pending and for ft_txd_ready to go low.  During those 2 cycles
+    // mux_txd_ready is stale (still high), so glue would over-send.
+    // tx_wait counts down to block sends until back-pressure propagates.
+    // The !txd_strobe_buf term blocks the cycle immediately after the
+    // send (when txd_strobe_buf is visible but tx_wait hasn't loaded yet).
+    // UART is unaffected: its 256-byte FIFO keeps txd_ready high, so the
+    // only overhead is a 2-cycle gap between bytes (~17ns, negligible at
+    // 2 Mbaud = ~5µs/byte).
+    reg [1:0] tx_wait;
+    wire can_send = mux_txd_ready && (tx_wait == 0) && !txd_strobe_buf;
 
     // Heartbeat counter
     reg [25:0] heartbeat;
@@ -183,6 +201,7 @@ module glue(
             sdram_inhibit_refresh <= 0;
 
             write_strobe <= 0;
+            write_strobe_r <= 0;
 
             txd_strobe_buf <= 0;
             txd_data_buf <= 0;
@@ -191,6 +210,8 @@ module glue(
             rxd_data_buf <= 0;
             
             active_port <= 0;
+            ft_rx_pop <= 0;
+            ft_rx_hold <= 0;
             ft_txd_strobe <= 0;
             ft_txd_data <= 0;
             
@@ -221,11 +242,19 @@ module glue(
             for (i = 0; i < 256; i = i + 1)
                 i_spi_write_data[i][8] <= 0;
             
+            tx_wait <= 0;
+
             for (i = 0; i < 128; i = i + 1)
                 sfdp_mem[i] <= 8'hFF;
         end
         else begin
             txd_strobe_buf <= 0;
+
+            // TX pipeline cooldown
+            if (txd_strobe_buf)
+                tx_wait <= 2'd2;
+            else if (tx_wait != 0)
+                tx_wait <= tx_wait - 1;
 
             // Route TX to the active port
             if (active_port) begin
@@ -238,12 +267,44 @@ module glue(
                 ft_txd_strobe <= 0;
             end
 
-            // Mux RX from the active port (or either when idle)
-            rxd_strobe_buf <= mux_rxd_strobe;
-            rxd_data_buf   <= mux_rxd_data;
+            // Pull-based RX mux: FT245 FIFO has priority over UART.
+            // Only pop from FIFO when the serial handler gate is open,
+            // preventing byte loss during SPI CS noise or spi_writing.
+            ft_rx_pop <= 0;
+            if (ft_rx_data_available && !ft_rx_hold && serial_gate) begin
+                rxd_strobe_buf <= 1;
+                rxd_data_buf <= ft_rx_data;
+                ft_rx_pop <= 1;
+                ft_rx_hold <= 1;
+                if (cmd_idle) active_port <= 1;
+            end else if (rxd_strobe) begin
+                rxd_strobe_buf <= 1;
+                rxd_data_buf <= rxd_data;
+                if (cmd_idle) active_port <= 0;
+            end else begin
+                rxd_strobe_buf <= 0;
+                if (ft_rx_hold) ft_rx_hold <= 0;
+            end
             
             sdram_access_addr <= addr_to_access;
-            sdram_write_buffer <= write_buffer;
+            // Snapshot write_buffer into sdram_write_buffer.
+            //
+            // Problem: FT245 delivers bytes ~12 cycles apart.  After byte 7
+            // sets write_strobe, byte 0 of the NEXT burst can arrive and
+            // overwrite write_buffer[0] before the SDRAM controller reads
+            // sdram_write_buffer.  Continuous mirroring would propagate the
+            // corruption.
+            //
+            // Solution: detect the rising edge of write_strobe (one cycle
+            // after byte 7 arrives, so write_buffer has all 8 bytes) and
+            // do one final mirror.  After that, freeze until both
+            // write_strobe and write_state are clear (write complete).
+            // SPI writes don't use write_strobe/write_state, so they
+            // get continuous mirroring as before.
+            write_strobe_r <= write_strobe;
+            if ((write_strobe && !write_strobe_r) ||
+                (!write_strobe && !write_state))
+                sdram_write_buffer <= write_buffer;
             
             // Inhibit SDRAM refresh while a serial-path operation is active.
             // We inhibit for ANY non-zero read/write state (not just 1-2)
@@ -269,8 +330,10 @@ module glue(
             led[3] <= !spi_csel_buf[1];
             led[0] <= heartbeat[25];                    // Heartbeat ~2Hz at 132MHz
             
-            // Log strobe handling
-            if (log_strobe_buf[1] && !log_ack) begin
+            // Log strobe handling -- only forward to UART (active_port=0).
+            // SPI noise can trigger spurious log bytes; sending them on
+            // FT245 would corrupt the binary command stream.
+            if (log_strobe_buf[1] && !log_ack && !active_port) begin
                 txd_strobe_buf <= 1;
                 txd_data_buf <= log_val;
                 log_ack <= 1;
@@ -360,7 +423,7 @@ module glue(
             // idle counter would fire and kill the transfer.
             if (in_count != 0 && !rxd_strobe_buf && !read_state && !write_state) begin
                 serial_idle_count <= serial_idle_count + 1;
-                if (serial_idle_count[14]) begin
+                if (serial_idle_count[16]) begin
                     in_count <= 0;
                     cmd <= CMD_NOP;
                 end
@@ -369,15 +432,6 @@ module glue(
                 serial_idle_count <= 0;
             end
             
-            // Port selection: when idle, latch which port delivered
-            // the first byte of a new command.
-            if (cmd == CMD_NOP && in_count == 0 && !read_state && !write_state) begin
-                if (ft_rxd_strobe)
-                    active_port <= 1;
-                else if (rxd_strobe)
-                    active_port <= 0;
-            end
-
             // Serial protocol handling
             if ((spi_reset || spi_csel_buf[1]) && !spi_writing) begin
                 
@@ -509,7 +563,7 @@ module glue(
                             sdram_access_cmd <= 2'b01;
                             read_state <= 3;
                         end
-                        else if ((read_state == 3) && !sdram_busy && mux_txd_ready) begin
+                        else if ((read_state == 3) && !sdram_busy && can_send) begin
                             txd_strobe_buf <= 1;
                             txd_data_buf <= sdram_read_buffer[read_pos*8 +: 8];
 
@@ -544,7 +598,7 @@ module glue(
                         end
                         else if ((write_state == 3) && !sdram_busy) begin
                             if (len == 1) begin
-                                if (mux_txd_ready) begin
+                                if (can_send) begin
                                     txd_strobe_buf <= 1;
                                     txd_data_buf <= 8'h01;
                                     write_state <= 0;
