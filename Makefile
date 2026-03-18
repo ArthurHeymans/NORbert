@@ -24,7 +24,7 @@ CST_FILE = tangprimer25k.cst
 # Gowin IDE output
 BITSTREAM = impl/pnr/spi_flash.fs
 
-.PHONY: all build lint prog flash clean tool ftdi-setup help
+.PHONY: all build lint prog flash clean tool tool-d2xx ftdi-setup help
 
 all: build
 
@@ -55,10 +55,15 @@ ftdi-setup:
 	@echo ""
 	@echo "EEPROM programmed. Unplug and replug the FT2232H now."
 
-# Build the spi-flash-tool
+# Build the spi-flash-tool (default: rs-ftdi backend, pure Rust)
 tool:
 	cargo build --release --manifest-path tool/Cargo.toml
 	@echo "Tool built: tool/target/release/spi-flash-tool"
+
+# Build with D2XX backend (requires ftdi_sio unbind, proprietary C library)
+tool-d2xx:
+	cargo build --release --manifest-path tool/Cargo.toml --no-default-features --features d2xx
+	@echo "Tool built (D2XX backend): tool/target/release/spi-flash-tool"
 
 help:
 	@echo "Tang Primer 25K SPI Flash Emulator"
@@ -67,6 +72,7 @@ help:
 	@echo "  make prog    - Program FPGA (volatile)"
 	@echo "  make flash   - Program to flash (persistent)"
 	@echo "  make lint    - Lint Verilog with yosys"
-	@echo "  make tool    - Build spi-flash-tool"
+	@echo "  make tool    - Build spi-flash-tool (rs-ftdi backend, default)"
+	@echo "  make tool-d2xx - Build spi-flash-tool (D2XX backend)"
 	@echo "  make ftdi-setup - Program FT2232H EEPROM for 245 FIFO"
 	@echo "  make clean   - Clean build artifacts"
