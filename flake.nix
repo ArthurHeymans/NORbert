@@ -138,6 +138,9 @@
             # Build tools
             gnumake
 
+            # FTDI EEPROM programming (FT2232H async 245 setup)
+            libftdi1
+
             # Rust toolchain for spi-flash-tool
             cargo
             rustc
@@ -155,6 +158,7 @@
             echo "  openFPGALoader   - FPGA programming"
             echo "  verilator        - Verilog simulation"
             echo "  gtkwave          - Waveform viewer"
+            echo "  ftdi_eeprom      - FT2232H EEPROM programmer"
             echo "  cargo            - Rust build tool"
             echo ""
             echo "Build commands:"

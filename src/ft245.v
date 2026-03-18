@@ -48,7 +48,7 @@ module ft245(
     // -----------------------------------------------------------------
     localparam [3:0]
         DELAY_RD_DATA  = 4'd7,  // RD# active to data valid (~58ns, min 50ns)
-        DELAY_RD_RECOV = 4'd5,  // RD# recovery + sync pipeline (~42ns)
+        DELAY_RD_RECOV = 4'd10, // RD# recovery + sync pipeline (~83ns, extra margin)
         DELAY_WR_PULSE = 4'd7,  // WR# active pulse width (~58ns, min 50ns)
         DELAY_WR_RECOV = 4'd5;  // WR# recovery + sync pipeline (~42ns)
 
@@ -92,8 +92,9 @@ module ft245(
         ST_RD_STROBE  = 3'd1,   // RD# asserted, waiting for data valid
         ST_RD_SAMPLE  = 3'd2,   // Sample data, deassert RD#
         ST_RD_RECOVER = 3'd3,   // RD# recovery, check for more data
-        ST_WR_DRIVE   = 3'd4,   // Data driven, WR# asserted
-        ST_WR_RECOVER = 3'd5;   // WR# deasserted, recovery
+        ST_WR_SETUP   = 3'd4,   // Data driven, WR# not yet asserted (t8 setup)
+        ST_WR_DRIVE   = 3'd5,   // Data driven, WR# asserted
+        ST_WR_RECOVER = 3'd6;   // WR# deasserted, recovery
 
     reg [2:0] state;
 
@@ -131,12 +132,11 @@ module ft245(
                         state     <= ST_RD_STROBE;
                     end
                     else if (tx_pending && txe_low) begin
-                        // Start write: drive data + assert WR#
+                        // Start write: drive data FIRST, WR# stays high
+                        // (satisfies t8: data setup before WR# active)
                         data_out  <= tx_byte;
                         data_oe   <= 1;
-                        ft_wr_n   <= 0;
-                        delay_cnt <= DELAY_WR_PULSE - 1;
-                        state     <= ST_WR_DRIVE;
+                        state     <= ST_WR_SETUP;
                     end
                 end
 
@@ -179,8 +179,17 @@ module ft245(
                 end
 
                 // ---------------------------------------------------
-                // WRITE path: drive data + WR# -> latch -> release
+                // WRITE path: setup -> WR# pulse -> release
                 // ---------------------------------------------------
+
+                // Data is being driven on bus, now assert WR#.
+                // One cycle of data setup (~8.3ns at 120MHz) satisfies
+                // FT2232H t8 requirement (5ns data setup before WR#).
+                ST_WR_SETUP: begin
+                    ft_wr_n   <= 0;
+                    delay_cnt <= DELAY_WR_PULSE - 1;
+                    state     <= ST_WR_DRIVE;
+                end
 
                 // WR# asserted with data, holding for pulse width
                 ST_WR_DRIVE: begin

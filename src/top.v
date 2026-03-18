@@ -349,8 +349,8 @@ module top(
     wire ft_txd_ready;
     wire [7:0] ft_txd;
     wire ft_txd_strobe;
-    wire ft_rxd_strobe;
-    wire [7:0] ft_rxd;
+    wire ft_rxd_strobe_raw;
+    wire [7:0] ft_rxd_raw;
     
     ft245 ft245_i(
         .clk(clk),
@@ -360,11 +360,43 @@ module top(
         .ft_txe_n(ft_txe_n),
         .ft_rd_n(ft_rd_n),
         .ft_wr_n(ft_wr_n),
-        .rxd(ft_rxd),
-        .rxd_strobe(ft_rxd_strobe),
+        .rxd(ft_rxd_raw),
+        .rxd_strobe(ft_rxd_strobe_raw),
         .txd(ft_txd),
         .txd_strobe(ft_txd_strobe),
         .txd_ready(ft_txd_ready)
+    );
+    
+    // -----------------------------------------------------------
+    // FT245 RX FIFO: decouple ft245 byte delivery from glue
+    //
+    // Without this FIFO, glue.v must consume each byte in the
+    // exact cycle ft245 asserts rxd_strobe.  A single missed
+    // cycle (due to timing, routing delay, or synthesis artefacts)
+    // drops a byte and hangs the protocol.  The FIFO lets ft245
+    // write at its own pace and glue read when ready.
+    //
+    // Pull-based design: glue sees data_available + read_data from
+    // the FWFT FIFO, and asserts ft_rx_pop only after it has
+    // actually consumed the byte.  This prevents byte loss when
+    // the serial handler gate is momentarily closed (e.g. SPI CS
+    // noise setting spi_csel_buf low, or spi_writing being set).
+    // -----------------------------------------------------------
+    
+    wire ft_rxfifo_data_available;
+    wire [7:0] ft_rxfifo_data;
+    wire ft_rx_pop;
+    
+    fifo #(.WIDTH(8), .NUM(16), .FREESPACE(1)) ft_rx_fifo(
+        .clk(clk),
+        .reset(reset),
+        .write_data(ft_rxd_raw),
+        .write_strobe(ft_rxd_strobe_raw),
+        .space_available(),      // ft245 never overflows 16-deep FIFO
+        .data_available(ft_rxfifo_data_available),
+        .more_available(),
+        .read_data(ft_rxfifo_data),
+        .read_strobe(ft_rx_pop)
     );
     
     // -----------------------------------------------------------
@@ -385,9 +417,10 @@ module top(
         .txd_strobe(uart_txd_strobe),
         .txd_data(uart_txd),
         
-        // FT245 byte interface
-        .ft_rxd_strobe(ft_rxd_strobe),
-        .ft_rxd_data(ft_rxd),
+        // FT245 byte interface (pull-based via RX FIFO)
+        .ft_rx_data_available(ft_rxfifo_data_available),
+        .ft_rx_data(ft_rxfifo_data),
+        .ft_rx_pop(ft_rx_pop),
         
         .ft_txd_ready(ft_txd_ready),
         .ft_txd_strobe(ft_txd_strobe),
@@ -430,7 +463,6 @@ module top(
     );
     
     // Single LED on Tang Primer 25K (active low)
-    // Use heartbeat (bit 0) as primary indicator
     assign led = ~led_out[0];
 
 endmodule

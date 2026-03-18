@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const BAUD_RATE: u32 = 2_000_000;
-const BLOCK_SIZE: usize = 2048; // Max transfer size (256 * 8 bytes)
+const BLOCK_SIZE: usize = 2048; // 256 bursts * 8 bytes
 const PROTOCOL_VERSION: u8 = 2;
 
 // Protocol commands (shared between UART and FT245 transports)
@@ -97,8 +97,8 @@ impl Ft245Transport {
             // Default: open Channel A by its standard description.
             // If EEPROM was reprogrammed with a custom description,
             // use --ft-serial to select by serial number instead.
-            libftd2xx::Ft2232h::with_description("Dual RS232-HS A")
-                .context("No FT2232H found (looking for 'Dual RS232-HS A')")?
+            libftd2xx::Ft2232h::with_description("NORbert FT245 A")
+                .context("No FT2232H found (looking for 'NORbert FT245 A')")?
         };
 
         ft.reset().context("FT2232H reset failed")?;
@@ -111,6 +111,10 @@ impl Ft245Transport {
         // Low latency for responsive transfers
         ft.set_latency_timer(Duration::from_millis(2))
             .context("Failed to set latency timer")?;
+
+        // D2XX read/write timeouts (prevents infinite blocking)
+        ft.set_timeouts(Duration::from_secs(5), Duration::from_secs(5))
+            .context("Failed to set timeouts")?;
 
         // Drain any stale data in the receive buffer
         let mut trash = [0u8; 4096];
@@ -236,11 +240,28 @@ impl FlashDevice {
         buf.extend_from_slice(data);
         self.transport.write_all(&buf)?;
 
-        // Wait for completion byte
+        // Wait for completion byte.
+        // The FT2232H in 245 FIFO mode occasionally leaks modem status
+        // bytes (0x00) through D2XX into the data stream.  Skip any
+        // leading 0x00 bytes before the real ACK.
         let mut resp = [0u8; 1];
-        self.transport.read_exact(&mut resp)?;
+        let mut skipped = 0u32;
+        loop {
+            self.transport.read_exact(&mut resp)?;
+            if resp[0] != 0x00 {
+                break;
+            }
+            skipped += 1;
+            if skipped > 8 {
+                bail!("Too many 0x00 bytes before ACK");
+            }
+        }
         if resp[0] != 0x01 {
-            bail!("Unexpected response: 0x{:02x}", resp[0]);
+            bail!(
+                "Unexpected ACK: 0x{:02x} (expected 0x01, data[0..4]={:02x?})",
+                resp[0],
+                &data[..std::cmp::min(4, data.len())]
+            );
         }
         Ok(())
     }
@@ -315,9 +336,14 @@ impl FlashDevice {
         buf.extend_from_slice(sfdp_table);
         self.transport.write_all(&buf)?;
 
-        // Wait for ack
+        // Wait for ack (skip modem status bytes, see write_block)
         let mut resp = [0u8; 1];
-        self.transport.read_exact(&mut resp)?;
+        loop {
+            self.transport.read_exact(&mut resp)?;
+            if resp[0] != 0x00 {
+                break;
+            }
+        }
         if resp[0] != 0x01 {
             bail!("Chip config failed: unexpected response 0x{:02x}", resp[0]);
         }
@@ -337,11 +363,20 @@ impl FlashDevice {
         let mut addr = address;
         let mut offset = 0;
 
+        let total_blocks = (padded.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let mut block_num = 0;
         while offset < padded.len() {
             let chunk_len = std::cmp::min(BLOCK_SIZE, padded.len() - offset);
-            self.write_block(addr, &padded[offset..offset + chunk_len])?;
+            self.write_block(addr, &padded[offset..offset + chunk_len])
+                .with_context(|| {
+                    format!(
+                        "Block {}/{} at addr 0x{:06x}",
+                        block_num, total_blocks, addr
+                    )
+                })?;
             addr += chunk_len as u32;
             offset += chunk_len;
+            block_num += 1;
         }
 
         Ok(())
@@ -446,6 +481,9 @@ enum Commands {
 
     /// List connected FT2232H devices
     FtList,
+
+    /// Diagnostic: send test bytes and report what comes back
+    Probe,
 }
 
 fn parse_address(s: &str) -> Result<u32, String> {
@@ -463,7 +501,7 @@ fn parse_address(s: &str) -> Result<u32, String> {
 
 fn open_device(cli: &Cli) -> Result<FlashDevice> {
     if cli.ft245 {
-        eprintln!("Opening FT2232H in sync FIFO mode...");
+        eprintln!("Opening FT2232H in async FIFO mode...");
         FlashDevice::open_ft245(cli.ft_serial.as_deref())
     } else {
         FlashDevice::open_serial(&cli.port)
@@ -611,17 +649,27 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
 
     let mut addr = address;
     let mut offset = 0;
+    let total_blocks = (padded.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let mut block_num = 0;
 
     while offset < padded.len() {
         let chunk_len = std::cmp::min(BLOCK_SIZE, padded.len() - offset);
-        device.write_block(addr, &padded[offset..offset + chunk_len])?;
+        device
+            .write_block(addr, &padded[offset..offset + chunk_len])
+            .with_context(|| {
+                format!(
+                    "Block {}/{} at addr 0x{:06x}",
+                    block_num, total_blocks, addr
+                )
+            })?;
         addr += chunk_len as u32;
         offset += chunk_len;
+        block_num += 1;
         pb.inc(chunk_len as u64);
     }
 
     pb.finish_with_message("done");
-    println!("Loaded {} bytes", padded.len());
+    println!("Loaded {} bytes ({} blocks)", padded.len(), block_num);
 
     if verify {
         println!("Verifying...");
@@ -733,6 +781,153 @@ fn cmd_configure(cli: &Cli, chip_db_path: &str, chip_name: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_probe(cli: &Cli) -> Result<()> {
+    use libftd2xx::FtdiCommon;
+
+    // We need raw access to the FT2232H, not the Transport abstraction,
+    // because we want short timeouts per-probe and queue_status checks.
+    eprintln!("Opening FT2232H for probe...");
+    let serial = cli.ft_serial.as_deref();
+    let mut ft = if let Some(sn) = serial {
+        libftd2xx::Ft2232h::with_serial_number(sn)
+            .with_context(|| format!("No FT2232H with serial '{}'", sn))?
+    } else {
+        libftd2xx::Ft2232h::with_description("NORbert FT245 A")
+            .context("No FT2232H found (looking for 'NORbert FT245 A')")?
+    };
+
+    ft.reset().context("FT2232H reset failed")?;
+    ft.purge_all().context("FT2232H purge failed")?;
+    ft.set_usb_parameters(65536)?;
+    ft.set_latency_timer(Duration::from_millis(2))?;
+    ft.set_timeouts(Duration::from_millis(500), Duration::from_secs(5))?;
+
+    // Drain stale data
+    let mut trash = [0u8; 4096];
+    loop {
+        let n = ft.queue_status()?;
+        if n == 0 {
+            break;
+        }
+        let to_read = std::cmp::min(n, trash.len());
+        let _ = ft.read(&mut trash[..to_read]);
+    }
+
+    // Test bytes: mix of valid commands, diagnostics, and non-commands
+    let probes: Vec<(u8, &str, Option<u8>)> = vec![
+        (0x30, "CMD_VERSION", Some(0x02)),
+        (0x00, "NOP / zero", None),
+        (0x55, "non-command 0x55", None),
+        (0xAA, "non-command 0xAA", None),
+        (0xFF, "non-command 0xFF", None),
+    ];
+
+    println!("FT245 probe: send 1 byte, wait 200ms, read back\n");
+    println!(
+        "{:<30} {:>4}   {:>8}  {}",
+        "Test", "Sent", "Expected", "Response"
+    );
+    println!("{}", "-".repeat(70));
+
+    for (byte, label, expected) in &probes {
+        // Purge before each probe
+        ft.purge_all()?;
+        thread::sleep(Duration::from_millis(50));
+
+        // Drain anything residual
+        loop {
+            let n = ft.queue_status()?;
+            if n == 0 {
+                break;
+            }
+            let to_read = std::cmp::min(n, trash.len());
+            let _ = ft.read(&mut trash[..to_read]);
+        }
+
+        // Send the byte
+        ft.write_all(&[*byte])?;
+
+        // Wait for response
+        thread::sleep(Duration::from_millis(200));
+
+        // Check what came back
+        let n = ft.queue_status()?;
+        let exp_str = match expected {
+            Some(v) => format!("0x{:02X}", v),
+            None => "none".to_string(),
+        };
+        if n == 0 {
+            let status = if expected.is_none() {
+                "OK"
+            } else {
+                "FAIL(none)"
+            };
+            println!(
+                "{:<30} 0x{:02X}   {:>8}  (no response) {}",
+                label, byte, exp_str, status
+            );
+        } else {
+            let to_read = std::cmp::min(n, 32);
+            let mut buf = vec![0u8; to_read];
+            let got = ft.read(&mut buf)?;
+            buf.truncate(got);
+            let hex_str: Vec<String> = buf.iter().map(|b| format!("0x{:02X}", b)).collect();
+            let status = match expected {
+                Some(v) if got == 1 && buf[0] == *v => "OK",
+                Some(_) if got == 1 && buf[0] == *byte => "FAIL(echo)",
+                _ => "FAIL",
+            };
+            println!(
+                "{:<30} 0x{:02X}   {:>8}  {} bytes: [{}] {}",
+                label,
+                byte,
+                exp_str,
+                got,
+                hex_str.join(", "),
+                status,
+            );
+        }
+    }
+
+    // Bonus: send multiple bytes at once and see what comes back
+    println!("\n--- Multi-byte test ---");
+    ft.purge_all()?;
+    thread::sleep(Duration::from_millis(50));
+    loop {
+        let n = ft.queue_status()?;
+        if n == 0 {
+            break;
+        }
+        let to_read = std::cmp::min(n, trash.len());
+        let _ = ft.read(&mut trash[..to_read]);
+    }
+
+    let multi = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+    ft.write_all(&multi)?;
+    thread::sleep(Duration::from_millis(200));
+    let n = ft.queue_status()?;
+    if n == 0 {
+        println!("Sent {:?}: (no response)", multi);
+    } else {
+        let to_read = std::cmp::min(n, 64);
+        let mut buf = vec![0u8; to_read];
+        let got = ft.read(&mut buf)?;
+        buf.truncate(got);
+        let hex_str: Vec<String> = buf.iter().map(|b| format!("0x{:02X}", b)).collect();
+        let is_echo = buf == multi[..got];
+        println!(
+            "Sent {} bytes: {:02X?}\nGot  {} bytes: [{}]{}",
+            multi.len(),
+            multi,
+            got,
+            hex_str.join(", "),
+            if is_echo { " << EXACT ECHO" } else { "" },
+        );
+    }
+
+    Ok(())
+}
+
 fn cmd_ports() -> Result<()> {
     let ports = serialport::available_ports()?;
     if ports.is_empty() {
@@ -810,6 +1005,7 @@ fn main() -> Result<()> {
         Commands::Configure { chip_db, chip } => cmd_configure(&cli, chip_db, chip),
         Commands::Ports => cmd_ports(),
         Commands::FtList => cmd_ft_list(),
+        Commands::Probe => cmd_probe(&cli),
     }
 }
 

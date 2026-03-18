@@ -24,7 +24,7 @@ CST_FILE = tangprimer25k.cst
 # Gowin IDE output
 BITSTREAM = impl/pnr/spi_flash.fs
 
-.PHONY: all build lint prog flash clean tool help
+.PHONY: all build lint prog flash clean tool ftdi-setup help
 
 all: build
 
@@ -49,6 +49,12 @@ flash: $(BITSTREAM)
 clean:
 	rm -rf impl
 
+# Program FT2232H EEPROM for async 245 FIFO mode on Channel A
+ftdi-setup:
+	ftdi_eeprom --flash-eeprom ft2232h.conf
+	@echo ""
+	@echo "EEPROM programmed. Unplug and replug the FT2232H now."
+
 # Build the spi-flash-tool
 tool:
 	cargo build --release --manifest-path tool/Cargo.toml
@@ -62,4 +68,5 @@ help:
 	@echo "  make flash   - Program to flash (persistent)"
 	@echo "  make lint    - Lint Verilog with yosys"
 	@echo "  make tool    - Build spi-flash-tool"
+	@echo "  make ftdi-setup - Program FT2232H EEPROM for 245 FIFO"
 	@echo "  make clean   - Clean build artifacts"
