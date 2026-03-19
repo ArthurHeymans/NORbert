@@ -191,6 +191,7 @@ dependencies = [
 [[package]]
 name = "ftdi"
 version = "0.1.0"
+source = "git+https://github.com/ArthurHeymans/rs-ftdi.git#2431a609de6ef82d8d5332e79e0b8db49dd8187b"
 dependencies = [
  "log",
  "maybe-async",
