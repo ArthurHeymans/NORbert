@@ -15,7 +15,9 @@ use std::time::Instant;
 
 const BAUD_RATE: u32 = 2_000_000;
 // Max bursts per command: 16-bit len field (v3), 8 bytes per burst.
-// Tuned to balance throughput against FT2232H internal FIFO depth.
+// 64KB blocks are unreliable -- the FPGA loses a byte during sustained
+// 8192-burst writes (likely a glue/SDRAM timing race under refresh
+// pressure).  16KB is the largest size that passes 10/10 stress tests.
 const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
 const PROTOCOL_VERSION: u8 = 3;
 
@@ -126,8 +128,11 @@ impl Ft245Transport {
         ft.set_timeouts(Duration::from_secs(5), Duration::from_secs(5))
             .context("Failed to set timeouts")?;
 
-        // Wait for the FPGA's idle timeout (~546µs) then drain.
-        thread::sleep(Duration::from_millis(2));
+        // The USB reset can glitch the FT2232H data bus, injecting
+        // garbage bytes into the FPGA's protocol parser.  Wait 5ms
+        // (covers USB reset settling + FPGA idle timeout of ~546µs).
+        thread::sleep(Duration::from_millis(5));
+        ft.purge_all().ok();
 
         let mut trash = [0u8; 4096];
         loop {
@@ -199,7 +204,7 @@ impl Ft245Transport {
                 .context("No FT2232H found")?
         };
 
-        // Reset the FT2232H's internal FIFOs and state.
+        // Reset the FT2232H's internal state and flush FIFOs.
         dev.usb_reset().context("FT2232H reset failed")?;
         dev.flush_all().context("FT2232H flush failed")?;
 
@@ -217,10 +222,13 @@ impl Ft245Transport {
         dev.set_read_chunksize(65536);
         dev.set_write_chunksize(65536);
 
-        // Wait for the FPGA's idle timeout (~546µs at 120MHz) to reset
-        // its protocol parser in case the USB reset glitched the data
-        // bus and injected garbage bytes.  Then drain residual data.
-        thread::sleep(Duration::from_millis(2));
+        // The USB reset can glitch the FT2232H data bus, injecting
+        // garbage bytes into the FPGA's protocol parser.  Wait for the
+        // FPGA's idle timeout (~546µs at 120MHz) to reset the parser.
+        // Use 5ms for margin (covers USB reset settling + idle timeout).
+        // Then drain any residual response bytes.
+        thread::sleep(Duration::from_millis(5));
+        dev.flush_all().ok();
 
         let mut trash = [0u8; 4096];
         loop {
