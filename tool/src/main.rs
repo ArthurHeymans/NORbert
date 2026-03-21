@@ -19,6 +19,15 @@ const BAUD_RATE: u32 = 2_000_000;
 // 8192-burst writes (likely a glue/SDRAM timing race under refresh
 // pressure).  16KB is the largest size that passes 10/10 stress tests.
 const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
+
+// UART read block size: must be smaller than BLOCK_SIZE because the
+// glue module inhibits SDRAM refresh for the entire serial-path read
+// duration.  At 2Mbaud (~200KB/s), a 16KB read takes ~82ms -- exceeding
+// the SDRAM's 64ms refresh window and risking data loss.  4KB takes
+// ~20ms, well within budget.  Writes are unaffected (data flows
+// host-to-FPGA, SDRAM writes complete in microseconds).
+const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
+
 const PROTOCOL_VERSION: u8 = 3;
 
 // Protocol commands (shared between UART and FT245 transports)
@@ -276,12 +285,14 @@ impl Transport for Ft245Transport {
 
 struct FlashDevice {
     transport: Box<dyn Transport>,
+    read_block_size: usize,
 }
 
 impl FlashDevice {
     fn open_serial(port_name: &str) -> Result<Self> {
         Ok(Self {
             transport: Box::new(SerialTransport::open(port_name)?),
+            read_block_size: UART_READ_BLOCK_SIZE,
         })
     }
 
@@ -289,6 +300,7 @@ impl FlashDevice {
     fn open_ft245(serial: Option<&str>) -> Result<Self> {
         Ok(Self {
             transport: Box::new(Ft245Transport::open(serial)?),
+            read_block_size: BLOCK_SIZE,
         })
     }
 
@@ -387,6 +399,7 @@ impl FlashDevice {
 
     #[allow(dead_code)]
     fn read(&mut self, address: u32, length: u32) -> Result<Vec<u8>> {
+        let rbs = self.read_block_size;
         let mut result = Vec::with_capacity(length as usize);
         let mut addr = address;
         let mut remaining = length as usize;
@@ -402,7 +415,7 @@ impl FlashDevice {
         }
 
         while remaining >= 8 {
-            let chunk_len = std::cmp::min(BLOCK_SIZE, remaining / 8 * 8);
+            let chunk_len = std::cmp::min(rbs, remaining / 8 * 8);
             let block = self.read_block(addr, chunk_len)?;
             result.extend_from_slice(&block);
             addr += chunk_len as u32;
@@ -657,6 +670,7 @@ fn cmd_version(cli: &Cli) -> Result<()> {
 
 fn cmd_read(cli: &Cli, address: u32, length: u32, output: Option<PathBuf>) -> Result<()> {
     let mut device = open_device(cli)?;
+    let rbs = device.read_block_size;
 
     let pb = ProgressBar::new(length as u64);
     pb.set_style(
@@ -681,7 +695,7 @@ fn cmd_read(cli: &Cli, address: u32, length: u32, output: Option<PathBuf>) -> Re
     }
 
     while remaining >= 8 {
-        let chunk_len = std::cmp::min(BLOCK_SIZE, remaining / 8 * 8);
+        let chunk_len = std::cmp::min(rbs, remaining / 8 * 8);
         let block = device.read_block(addr, chunk_len)?;
         result.extend_from_slice(&block);
         addr += chunk_len as u32;
@@ -820,8 +834,9 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
         let mut offset = 0;
         let mut errors = 0;
 
+        let rbs = device.read_block_size;
         while offset < padded.len() {
-            let chunk_len = std::cmp::min(BLOCK_SIZE, padded.len() - offset);
+            let chunk_len = std::cmp::min(rbs, padded.len() - offset);
             let readback = device.read_block(addr, chunk_len)?;
 
             for (i, (a, b)) in padded[offset..offset + chunk_len]

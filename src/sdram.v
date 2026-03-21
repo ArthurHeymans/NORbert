@@ -80,14 +80,16 @@ module sdram(
     assign dq_i = dq_io;
 
     // Timing parameters (in clock cycles)
+    // Based on W9825G6KH-6 datasheet (166MHz grade, tCK_min=6ns for CL=3)
+    // At 120MHz: tCK = 8.33ns
     localparam integer tINIT        = 100 * CLK_FREQ_MHZ;   // 100us init
-    localparam integer tREFRESH     = (CLK_FREQ_MHZ * 32000) / 8192;  // ~516 cycles
-    localparam integer tRP          = 3;   // 18ns precharge (min 15ns)
-    localparam integer tRC          = 9;   // 60ns row cycle
+    localparam integer tREFRESH     = (CLK_FREQ_MHZ * 32000) / 8192;  // ~468 cycles
+    localparam integer tRP          = 2;   // 16.7ns precharge (min 15ns for -6)
+    localparam integer tRC          = 8;   // 66.7ns row cycle (min 60ns for -6)
     localparam integer tMRD         = 2;   // 2 cycles mode register set
-    localparam integer tRCD         = 3;   // 18ns RAS to CAS delay (min 15ns)
-    localparam integer tDPL         = 2;   // Write recovery
-    localparam integer tRAS         = 6;   // 37ns row active time
+    localparam integer tRCD         = 2;   // 16.7ns RAS to CAS delay (min 15ns for -6)
+    localparam integer tDPL         = 2;   // Write recovery (min 2 tCK)
+    localparam integer tRAS         = 6;   // 50ns row active time (min 42ns for -6)
     localparam integer tCAS         = 3;   // CAS latency = 3 for W9825G6KH
 
     // Read pipeline delay: compensates for SDRAM clock phase shift and capture pipeline.

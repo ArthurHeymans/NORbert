@@ -326,6 +326,8 @@ module top(
     
     // UART for 2 Mbaud at 120MHz: 120MHz / 2M = 60
     // DIVISOR must be divisible by 4 (uart_rx uses DIVISOR/4 for 4x oversampling)
+    // Note: 3 Mbaud (DIVISOR=40) is achievable at 120MHz but the Sipeed
+    // BL702 USB debugger on the dock can't sustain it for multi-byte reads.
     uart #(
         .DIVISOR(60),
         .FIFO(256),

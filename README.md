@@ -122,28 +122,29 @@ Note: H11 is a core board button pin, repurposed for FT245 (buttons are unused b
 ## SPI read performance
 
 Sustained SPI clock limits are set by the SDRAM prefetch pipeline in `spi_trx.v`.
-Each 8-byte SDRAM burst takes ~14 system clock cycles (132 MHz) from activate to
-data valid. The maximum SPI clock is determined by how many SPI clocks the pipeline
-has between triggering the next SDRAM read and needing the data (`fresh_read`):
+Each 8-byte SDRAM burst takes ~12 system clock cycles (120 MHz) from activate to
+data valid (tRCD=2 + tREAD=8 + 2-FF sync). The maximum SPI clock is determined by
+how many SPI clocks the pipeline has between triggering the next SDRAM read and
+needing the data (`fresh_read`):
 
-**f_spi_max = 132 MHz x N_spi / 14**
+**f_spi_max = 120 MHz x N_spi / 12**
 
 ### Sustained streaming (continuous sequential read)
 
 | Command | Mode | Bits/clk | N_spi | Max SPI clock | Throughput |
 |---------|------|----------|-------|---------------|------------|
-| 0x03 Read | 1-1-1 | 1 | 4 | ~37 MHz | ~4.7 MB/s |
-| 0x0B Fast Read | 1-1-1 | 1 | 4 | ~37 MHz | ~4.7 MB/s |
-| 0x3B Dual Output | 1-1-2 | 2 | 8 | ~75 MHz | ~18.9 MB/s |
-| 0xBB Dual I/O | 1-2-2 | 2 | 8 | ~75 MHz | ~18.9 MB/s |
-| 0x6B Quad Output | 1-1-4 | 4 | 4 | ~37 MHz | ~18.9 MB/s |
-| 0xEB Quad I/O | 1-4-4 | 4 | 4 | ~37 MHz | ~18.9 MB/s |
+| 0x03 Read | 1-1-1 | 1 | 4 | ~40 MHz | ~5.0 MB/s |
+| 0x0B Fast Read | 1-1-1 | 1 | 4 | ~40 MHz | ~5.0 MB/s |
+| 0x3B Dual Output | 1-1-2 | 2 | 8 | ~80 MHz | ~20 MB/s |
+| 0xBB Dual I/O | 1-2-2 | 2 | 8 | ~80 MHz | ~20 MB/s |
+| 0x6B Quad Output | 1-1-4 | 4 | 4 | ~40 MHz | ~20 MB/s |
+| 0xEB Quad I/O | 1-4-4 | 4 | 4 | ~40 MHz | ~20 MB/s |
 
 The single-width data pipeline (STA_READ) triggers the next SDRAM burst during byte
 7 of the current burst (4 SPI clocks of headroom). The dual pipeline (STA_READ_DUAL)
 triggers at byte 6 (8 SPI clocks), while quad (STA_READ_QUAD) also triggers at byte
 6 but with only 4 SPI clocks due to 2 clocks/byte. This means dual and quad modes
-hit the same ~19 MB/s throughput ceiling, but dual can clock 2x faster.
+hit the same ~20 MB/s throughput ceiling, but dual can clock 2x faster.
 
 ### First-burst limits
 
@@ -152,10 +153,10 @@ dummy clocks get more headroom for the first burst:
 
 | Command | N_spi (initial) | Max SPI (initial) |
 |---------|-----------------|-------------------|
-| 0x03 / 0x13 (no dummy) | 4 | ~37 MHz |
-| 0x0B / 0x3B / 0x6B (8 dummy clocks) | 12 | ~113 MHz |
-| 0xBB (dual addr + 4 mode/dummy) | 5 | ~47 MHz |
-| 0xEB (quad addr + 6 mode/dummy) | 6 | ~56 MHz |
+| 0x03 / 0x13 (no dummy) | 4 | ~40 MHz |
+| 0x0B / 0x3B / 0x6B (8 dummy clocks) | 12 | ~120 MHz |
+| 0xBB (dual addr + 4 mode/dummy) | 5 | ~50 MHz |
+| 0xEB (quad addr + 6 mode/dummy) | 6 | ~60 MHz |
 
 After the first burst, sustained rates apply. Commands with single-bit address
 phases (0x0B, 0x3B, 0x6B) benefit most from dummy clocks. The multi-bit address
