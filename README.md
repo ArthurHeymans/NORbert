@@ -1,6 +1,6 @@
 # NORbert
 
-A friendly FPGA that pretends to be your NOR flash.
+A friendly FPGA that pretends to be your SPI NOR flash.
 
 NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang/tang-primer-25k/primer-25k.html) to emulate a SPI NOR flash chip, backed by 64MB of SDRAM. Load a firmware image over UART, and NORbert will serve it to your target system as if it were a real flash chip -- supporting single, dual, and quad SPI read modes with pipelined SDRAM prefetch for real-time streaming.
 
@@ -180,3 +180,9 @@ tool/
   src/chip.rs  Chip definition loading from rflasher RON database
   src/sfdp.rs  SFDP/BFPT table generation from chip definitions
 ```
+
+## Acknowledgments
+
+- [Arisotura/spi_flash](https://github.com/Arisotura/spi_flash) -- SPI flash emulation logic adapted from this project
+- [ArthurHeymans/tang_20k_spi_flash](https://github.com/ArthurHeymans/tang_20k_spi_flash) -- my first attempt at porting Arisotura's project, targeting different Tang hardware with 8MB of embedded DRAM
+- [Trammel Hudson's SPISpy](https://trmm.net/SPISpy) -- the original FPGA-based SPI flash emulator that inspired this project
