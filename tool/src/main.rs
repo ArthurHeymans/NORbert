@@ -28,7 +28,7 @@ const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
 // host-to-FPGA, SDRAM writes complete in microseconds).
 const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
 
-const PROTOCOL_VERSION: u8 = 4;
+const PROTOCOL_VERSION: u8 = 5;
 
 // Protocol commands (shared between UART and FT245 transports)
 const CMD_VERSION: u8 = 0x30;
@@ -39,6 +39,21 @@ const CMD_START: u8 = 0x34; // Enable SPI emulation (protocol v4+)
 const CMD_STOP: u8 = 0x35; // Disable SPI emulation (protocol v4+)
 const CMD_STATUS: u8 = 0x36; // Query emulation state (protocol v4+)
 const CMD_HOLDCTL: u8 = 0x37; // Target flash #HOLD control (protocol v5+)
+const CMD_LOGCTL: u8 = 0x38; // Enable/disable SPI bus logging (protocol v5+)
+const CMD_TOCTOU: u8 = 0x39; // TOCTOU trap management (protocol v5+)
+
+// TOCTOU sub-commands
+const TOCTOU_SET: u8 = 0x01;
+const TOCTOU_ARM: u8 = 0x02;
+const TOCTOU_DISARM: u8 = 0x03;
+const TOCTOU_RESET: u8 = 0x04;
+const TOCTOU_RESET_ALL: u8 = 0x05;
+
+// Log packet type markers
+const LOG_CMD: u8 = 0xA1;
+const LOG_ADDR: u8 = 0xA2;
+const LOG_END: u8 = 0xA3;
+const LOG_TRAP: u8 = 0xA4;
 
 // FT2232H USB identifiers
 #[cfg(any(feature = "d2xx", feature = "ftdi"))]
@@ -53,6 +68,8 @@ const FT2232H_PID: u16 = 0x6010;
 trait Transport {
     fn write_all(&mut self, data: &[u8]) -> Result<()>;
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
+    /// Read whatever is currently available (non-blocking, returns 0 if nothing).
+    fn read_available(&mut self, buf: &mut [u8]) -> Result<usize>;
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +172,13 @@ impl Transport for SerialTransport {
         self.port.read_exact(buf)?;
         Ok(())
     }
+
+    fn read_available(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.port.set_timeout(Duration::from_millis(10))?;
+        let n = self.port.read(buf).unwrap_or(0);
+        self.port.set_timeout(Duration::from_secs(2))?;
+        Ok(n)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +269,17 @@ impl Transport for Ft245Transport {
             pos += n;
         }
         Ok(())
+    }
+
+    fn read_available(&mut self, buf: &mut [u8]) -> Result<usize> {
+        use libftd2xx::FtdiCommon;
+        let n = self.ft.queue_status().unwrap_or(0);
+        if n == 0 {
+            return Ok(0);
+        }
+        let to_read = std::cmp::min(n, buf.len());
+        let got = self.ft.read(&mut buf[..to_read])?;
+        Ok(got)
     }
 }
 
@@ -341,6 +376,10 @@ impl Transport for Ft245Transport {
             pos += n;
         }
         Ok(())
+    }
+
+    fn read_available(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.dev.read_data(buf).map_err(|e| anyhow!(e))
     }
 }
 
@@ -678,6 +717,103 @@ impl FlashDevice {
         Ok(())
     }
 
+    fn log_start(&mut self) -> Result<()> {
+        self.transport.write_all(&[CMD_LOGCTL, 0x01])?;
+        let mut resp = [0u8; 1];
+        self.transport.read_exact(&mut resp)?;
+        if resp[0] != 0x01 {
+            bail!("LOGCTL start failed: unexpected response 0x{:02x}", resp[0]);
+        }
+        Ok(())
+    }
+
+    fn log_stop(&mut self) -> Result<()> {
+        self.transport.write_all(&[CMD_LOGCTL, 0x00])?;
+        let mut resp = [0u8; 1];
+        self.transport.read_exact(&mut resp)?;
+        if resp[0] != 0x01 {
+            bail!("LOGCTL stop failed: unexpected response 0x{:02x}", resp[0]);
+        }
+        Ok(())
+    }
+
+    fn toctou_set(&mut self, index: u8, start: u32, mask: u32, replace: u32) -> Result<()> {
+        let buf = [
+            CMD_TOCTOU,
+            TOCTOU_SET,
+            index & 0x03,
+            ((start >> 16) & 0xFF) as u8,
+            ((start >> 8) & 0xFF) as u8,
+            (start & 0xFF) as u8,
+            ((mask >> 16) & 0xFF) as u8,
+            ((mask >> 8) & 0xFF) as u8,
+            (mask & 0xFF) as u8,
+            ((replace >> 16) & 0xFF) as u8,
+            ((replace >> 8) & 0xFF) as u8,
+            (replace & 0xFF) as u8,
+        ];
+        self.transport.write_all(&buf)?;
+        let mut resp = [0u8; 1];
+        self.transport.read_exact(&mut resp)?;
+        if resp[0] != 0x01 {
+            bail!("TOCTOU set failed: unexpected response 0x{:02x}", resp[0]);
+        }
+        Ok(())
+    }
+
+    fn toctou_arm(&mut self, index: u8) -> Result<()> {
+        self.transport
+            .write_all(&[CMD_TOCTOU, TOCTOU_ARM, index & 0x03])?;
+        let mut resp = [0u8; 1];
+        self.transport.read_exact(&mut resp)?;
+        if resp[0] != 0x01 {
+            bail!("TOCTOU arm failed: unexpected response 0x{:02x}", resp[0]);
+        }
+        Ok(())
+    }
+
+    fn toctou_disarm(&mut self, index: u8) -> Result<()> {
+        self.transport
+            .write_all(&[CMD_TOCTOU, TOCTOU_DISARM, index & 0x03])?;
+        let mut resp = [0u8; 1];
+        self.transport.read_exact(&mut resp)?;
+        if resp[0] != 0x01 {
+            bail!(
+                "TOCTOU disarm failed: unexpected response 0x{:02x}",
+                resp[0]
+            );
+        }
+        Ok(())
+    }
+
+    fn toctou_reset(&mut self, index: u8) -> Result<()> {
+        self.transport
+            .write_all(&[CMD_TOCTOU, TOCTOU_RESET, index & 0x03])?;
+        let mut resp = [0u8; 1];
+        self.transport.read_exact(&mut resp)?;
+        if resp[0] != 0x01 {
+            bail!("TOCTOU reset failed: unexpected response 0x{:02x}", resp[0]);
+        }
+        Ok(())
+    }
+
+    fn toctou_reset_all(&mut self) -> Result<()> {
+        self.transport.write_all(&[CMD_TOCTOU, TOCTOU_RESET_ALL])?;
+        let mut resp = [0u8; 1];
+        self.transport.read_exact(&mut resp)?;
+        if resp[0] != 0x01 {
+            bail!(
+                "TOCTOU reset-all failed: unexpected response 0x{:02x}",
+                resp[0]
+            );
+        }
+        Ok(())
+    }
+
+    fn read_log_bytes(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.transport.read_available(buf)
+    }
+
     #[allow(dead_code)]
     fn write(&mut self, address: u32, data: &[u8]) -> Result<()> {
         if address % 8 != 0 {
@@ -816,6 +952,19 @@ enum Commands {
         state: String,
     },
 
+    /// Monitor SPI bus activity in real time via FT245 logging.
+    /// Displays commands, addresses, and data flow.  Also detects
+    /// addresses read more than once (potential TOCTOU targets).
+    Monitor,
+
+    /// Configure TOCTOU attack traps.  On second read of a trapped
+    /// address range, the FPGA serves replacement data from a
+    /// different SDRAM location.
+    Toctou {
+        #[command(subcommand)]
+        action: ToctouAction,
+    },
+
     /// List available serial ports
     Ports,
 
@@ -833,6 +982,41 @@ enum Commands {
 
     /// Query whether SPI emulation is currently running
     Status,
+}
+
+#[derive(Subcommand)]
+enum ToctouAction {
+    /// Configure a trap entry (does NOT arm it)
+    Set {
+        /// Trap index (0-3)
+        index: u8,
+        /// Start address of the range to trap (hex or decimal)
+        #[arg(value_parser = parse_address)]
+        start: u32,
+        /// Mask: 1-bits must match, 0-bits are don't-care (e.g. 0xFFF000 for 4KB)
+        #[arg(value_parser = parse_address)]
+        mask: u32,
+        /// Replacement byte address base in SDRAM
+        #[arg(value_parser = parse_address)]
+        replace: u32,
+    },
+    /// Arm a trap (starts monitoring for the address range)
+    Arm {
+        /// Trap index (0-3)
+        index: u8,
+    },
+    /// Disarm a trap
+    Disarm {
+        /// Trap index (0-3)
+        index: u8,
+    },
+    /// Reset a trap (clear triggered state so first read serves original data again)
+    Reset {
+        /// Trap index (0-3)
+        index: u8,
+    },
+    /// Reset all traps (disarm + clear triggered for all 4 entries)
+    ResetAll,
 }
 
 fn parse_address(s: &str) -> Result<u32, String> {
@@ -1550,6 +1734,270 @@ fn cmd_hold(cli: &Cli, state: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// SPI opcode names for log display
+// ---------------------------------------------------------------------------
+
+fn spi_opcode_name(opcode: u8) -> &'static str {
+    match opcode {
+        0x01 => "WRITE_STATUS",
+        0x02 => "PAGE_PROGRAM",
+        0x03 => "READ",
+        0x04 => "WRITE_DISABLE",
+        0x05 => "READ_STATUS",
+        0x06 => "WRITE_ENABLE",
+        0x0B => "FAST_READ",
+        0x0C => "FAST_READ_4B",
+        0x13 => "READ_4B",
+        0x20 => "SECTOR_ERASE_4K",
+        0x35 => "READ_STATUS2",
+        0x3B => "DUAL_READ",
+        0x52 => "BLOCK_ERASE_32K",
+        0x5A => "READ_SFDP",
+        0x60 => "CHIP_ERASE",
+        0x6B => "QUAD_READ",
+        0x9E | 0x9F => "READ_JEDEC_ID",
+        0xB7 => "4BYTE_ENABLE",
+        0xBB => "DUAL_IO_READ",
+        0xC7 => "CHIP_ERASE",
+        0xD8 => "BLOCK_ERASE_64K",
+        0xE9 => "4BYTE_DISABLE",
+        0xEB => "QUAD_IO_READ",
+        _ => "UNKNOWN",
+    }
+}
+
+fn is_read_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        0x03 | 0x0B | 0x0C | 0x13 | 0x3B | 0x5A | 0x6B | 0xBB | 0xEB
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Monitor command -- real-time SPI bus logging with TOCTOU detection
+// ---------------------------------------------------------------------------
+
+fn cmd_monitor(cli: &Cli) -> Result<()> {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let mut device = open_device(cli)?;
+
+    // Set up Ctrl+C handler
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })
+    .context("Failed to set Ctrl+C handler")?;
+
+    // Enable logging
+    device.log_start()?;
+    eprintln!("Logging started. Press Ctrl+C to stop.\n");
+    eprintln!(
+        "{:<6} {:<18} {:<10} {}",
+        "TXN#", "COMMAND", "ADDRESS", "INFO"
+    );
+    eprintln!("{}", "-".repeat(60));
+
+    // TOCTOU detection state: address range -> access count
+    // Key: (start_addr, opcode), Value: count
+    let mut access_map: HashMap<(u32, u8), u32> = HashMap::new();
+    let mut double_reads: Vec<(u32, u8)> = Vec::new();
+
+    // Log packet parser state
+    let mut buf = [0u8; 4096];
+    let mut pending = Vec::new();
+    let mut txn_count: u32 = 0;
+    let mut current_opcode: u8 = 0;
+    let mut current_addr: u32 = 0;
+
+    while running.load(Ordering::SeqCst) {
+        let n = device.read_log_bytes(&mut buf)?;
+        if n == 0 {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+
+        pending.extend_from_slice(&buf[..n]);
+
+        // Parse complete packets from pending buffer
+        let mut pos = 0;
+        while pos < pending.len() {
+            let remaining = pending.len() - pos;
+            match pending[pos] {
+                LOG_CMD if remaining >= 2 => {
+                    let opcode = pending[pos + 1];
+                    current_opcode = opcode;
+                    txn_count += 1;
+                    print!(
+                        "{:<6} 0x{:02X} {:<13}",
+                        txn_count,
+                        opcode,
+                        spi_opcode_name(opcode)
+                    );
+                    pos += 2;
+                }
+                LOG_ADDR if remaining >= 5 => {
+                    let addr = ((pending[pos + 1] as u32) << 24)
+                        | ((pending[pos + 2] as u32) << 16)
+                        | ((pending[pos + 3] as u32) << 8)
+                        | (pending[pos + 4] as u32);
+                    current_addr = addr;
+                    if addr > 0xFFFFFF {
+                        print!(" 0x{:08X}", addr);
+                    } else {
+                        print!(" 0x{:06X}", addr);
+                    }
+
+                    // TOCTOU detection: track read accesses
+                    if is_read_opcode(current_opcode) {
+                        let key = (addr, current_opcode);
+                        let count = access_map.entry(key).or_insert(0);
+                        *count += 1;
+                        if *count == 2 {
+                            double_reads.push(key);
+                            print!("  ** DOUBLE READ (TOCTOU candidate)");
+                        } else if *count > 2 {
+                            print!("  ** READ #{}", count);
+                        }
+                    }
+                    println!();
+                    pos += 5;
+                }
+                LOG_END if remaining >= 4 => {
+                    let count = ((pending[pos + 1] as u32) << 16)
+                        | ((pending[pos + 2] as u32) << 8)
+                        | (pending[pos + 3] as u32);
+                    // +1 because the counter starts at 0 for the first byte
+                    let byte_count = count + 1;
+                    if byte_count > 1 {
+                        eprintln!(
+                            "       end: {} bytes from 0x{:06X}",
+                            byte_count, current_addr
+                        );
+                    }
+                    pos += 4;
+                }
+                LOG_TRAP if remaining >= 6 => {
+                    let index = pending[pos + 1];
+                    let addr = ((pending[pos + 2] as u32) << 16)
+                        | ((pending[pos + 3] as u32) << 8)
+                        | (pending[pos + 4] as u32);
+                    eprintln!(
+                        "  !! TOCTOU TRAP #{} FIRED at 0x{:06X} -- serving replacement data",
+                        index, addr
+                    );
+                    pos += 6; // type(1) + index(1) + addr(3) + pad(1)
+                }
+                0xA1..=0xAF => {
+                    // Known packet type but incomplete -- wait for more data
+                    break;
+                }
+                _ => {
+                    // Unknown byte, skip it
+                    pos += 1;
+                }
+            }
+        }
+        // Remove consumed bytes
+        pending.drain(..pos);
+    }
+
+    // Stop logging
+    eprintln!("\nStopping...");
+
+    // Drain any remaining log data before sending stop command.
+    // The FT245 TX mux switches back to glue on log_stop, so we need
+    // to clear the FT2232H RX buffer first to avoid mixing log and ACK bytes.
+    thread::sleep(Duration::from_millis(10));
+    loop {
+        let n = device.read_log_bytes(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+    }
+
+    device.log_stop()?;
+
+    // Print TOCTOU summary
+    if !double_reads.is_empty() {
+        eprintln!("\n--- TOCTOU Detection Summary ---");
+        eprintln!("{} address(es) read more than once:\n", double_reads.len());
+        for (addr, opcode) in &double_reads {
+            let count = access_map[&(*addr, *opcode)];
+            eprintln!(
+                "  0x{:06X}  ({})  read {} times",
+                addr,
+                spi_opcode_name(*opcode),
+                count
+            );
+        }
+        eprintln!("\nThese are potential TOCTOU attack targets.");
+        eprintln!("Use 'toctou set' to configure traps for these addresses.");
+    } else {
+        eprintln!("\nNo double-reads detected.");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// TOCTOU command -- configure trap entries
+// ---------------------------------------------------------------------------
+
+fn cmd_toctou(cli: &Cli, action: &ToctouAction) -> Result<()> {
+    let mut device = open_device(cli)?;
+
+    match action {
+        ToctouAction::Set {
+            index,
+            start,
+            mask,
+            replace,
+        } => {
+            if *index > 3 {
+                bail!("Trap index must be 0-3");
+            }
+            device.toctou_set(*index, *start, *mask, *replace)?;
+            eprintln!(
+                "Trap {} configured: start=0x{:06X} mask=0x{:06X} replace=0x{:06X}",
+                index, start, mask, replace
+            );
+            eprintln!("Use 'toctou arm {}' to activate.", index);
+        }
+        ToctouAction::Arm { index } => {
+            if *index > 3 {
+                bail!("Trap index must be 0-3");
+            }
+            device.toctou_arm(*index)?;
+            eprintln!("Trap {} armed.", index);
+        }
+        ToctouAction::Disarm { index } => {
+            if *index > 3 {
+                bail!("Trap index must be 0-3");
+            }
+            device.toctou_disarm(*index)?;
+            eprintln!("Trap {} disarmed.", index);
+        }
+        ToctouAction::Reset { index } => {
+            if *index > 3 {
+                bail!("Trap index must be 0-3");
+            }
+            device.toctou_reset(*index)?;
+            eprintln!("Trap {} reset (triggered flag cleared).", index);
+        }
+        ToctouAction::ResetAll => {
+            device.toctou_reset_all()?;
+            eprintln!("All traps reset and disarmed.");
+        }
+    }
+
+    Ok(())
+}
+
 fn cmd_ports() -> Result<()> {
     let ports = serialport::available_ports()?;
     if ports.is_empty() {
@@ -1628,6 +2076,8 @@ fn main() -> Result<()> {
         } => cmd_dump(&cli, file, *address, *length),
         Commands::Configure { chip_db, chip } => cmd_configure(&cli, chip_db, chip),
         Commands::Hold { state } => cmd_hold(&cli, state),
+        Commands::Monitor => cmd_monitor(&cli),
+        Commands::Toctou { action } => cmd_toctou(&cli, action),
         Commands::Ports => cmd_ports(),
         Commands::FtList => cmd_ft_list(),
         Commands::Probe => cmd_probe(&cli),
