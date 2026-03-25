@@ -40,7 +40,7 @@ module spi_trx(
     
     // For writing
     output reg write_cmd,
-    output reg write_type,  // 0=page program, 1=erase (sector/block/chip)
+    output reg [1:0] write_type,  // 00=page program, 01=erase, 10=AAI RMW
     output reg [22:0] write_addr,     // 23-bit burst address
     output reg [22:0] write_len,
     input wire write_done,
@@ -131,6 +131,8 @@ module spi_trx(
         CMD_DUALIOREAD      = 8'hBB,  // Dual I/O Read (1-2-2)
         CMD_CHIPERASE2      = 8'hC7,
         CMD_BLOCKERASE_64K  = 8'hD8,
+        CMD_EWSR            = 8'h50,  // Enable Write Status Register (SST)
+        CMD_AAI_WORD        = 8'hAD,  // AAI Word Program (SST)
         CMD_4BYTEDISABLE    = 8'hE9,
         CMD_QUADIOREAD      = 8'hEB,  // Quad I/O Read (1-4-4)
         CMD_LOG             = 8'hF2;
@@ -154,7 +156,8 @@ module spi_trx(
         STA_ADDR_READ_QUAD  = 14,  // Quad I/O address phase (1-4-4)
         STA_READ_QUAD       = 15,  // Quad data output phase (1-1-4 & 1-4-4)
         STA_WRITESTATUS     = 16,  // Receive status register write data
-        STA_READSFDP        = 17;  // SFDP data output phase
+        STA_READSFDP        = 17,  // SFDP data output phase
+        STA_AAI_DATA        = 18;  // AAI data reception (2 bytes)
     
     reg [4:0] state;
     reg [2:0] dummy_count = 0;
@@ -163,6 +166,10 @@ module spi_trx(
     reg is_quad_read = 0;       // Set for both 0x6B and 0xEB
     reg is_sfdp_read = 0;       // Set for CMD 0x5A (Read SFDP)
     reg [2:0] mode_count = 0;   // Mode+dummy counter (4 for dual, 6 for quad)
+    
+    // AAI (Auto Address Increment) state -- persists across CS cycles
+    reg aai_active = 0;         // In AAI word program mode
+    reg is_aai = 0;             // Current transaction is AAI (per-CS flag)
     
     reg [31:0] addr;
     reg [4:0] addr_count;
@@ -204,13 +211,16 @@ module spi_trx(
                 
                 state <= STA_CMD;
                 
-                addr <= 0;
+                // Preserve addr during AAI mode (auto-increment persists across CS)
+                if (!aai_active)
+                    addr <= 0;
                 addr_count <= 0;
                 dummy_count <= 0;
                 is_fast_read <= 0;
                 is_dual_read <= 0;
                 is_quad_read <= 0;
                 is_sfdp_read <= 0;
+                is_aai <= 0;
                 mode_count <= 0;
                 
                 log_strobe <= 0;
@@ -227,6 +237,8 @@ module spi_trx(
                 if (reset_power) begin
                     status_reg[1:0] <= 2'b00;
                     addr_4byte <= 0;
+                    aai_active <= 0;
+                    addr <= 0;
                     
                     log_strobe <= 1;
                     log_val <= 8'hE2;
@@ -264,9 +276,18 @@ module spi_trx(
                     
                     CMD_WRITEDISABLE: begin
                         status_reg[1] <= 0;
+                        aai_active <= 0;
                     end
                     
                     CMD_WRITEENABLE: begin
+                        status_reg[1] <= 1;
+                    end
+                    
+                    CMD_EWSR: begin
+                        // SST Enable-Write-Status-Register: acts like WREN
+                        // for status register writes.  For emulation we just
+                        // set WEL; the distinction only matters for hardware
+                        // write protection which the emulator doesn't enforce.
                         status_reg[1] <= 1;
                     end
                     
@@ -367,7 +388,7 @@ module spi_trx(
                         if (status_reg[1]) begin
                             state <= STA_ERASE;
                             write_cmd <= 1;
-                            write_type <= 1'd1;
+                            write_type <= 2'd1;
                             write_addr <= 23'b0;
                             write_len <= cfg_chip_erase_bursts;
                             status_reg[1] <= 0;
@@ -380,6 +401,32 @@ module spi_trx(
                             state <= STA_ADDR_WRITE;
                             addr_count <= addr_4byte ? 31 : 23;
                             write_len <= 23'h0001F; // 256 byte page = 32 × 8-byte bursts - 1
+                        end
+                    end
+                    
+                    // AAI Word Program (SST, 0xAD):
+                    //   First:      0xAD + addr(3) + byte0 + byte1
+                    //   Subsequent: 0xAD + byte0 + byte1
+                    // Address auto-increments by 2. Mode persists across
+                    // CS cycles until WRDI (0x04).  A0 is forced to 0.
+                    CMD_AAI_WORD: begin
+                        if (status_reg[1] || aai_active) begin
+                            if (!aai_active) begin
+                                // First AAI: need address phase
+                                state <= STA_ADDR_WRITE;
+                                addr_count <= addr_4byte ? 31 : 23;
+                                is_aai <= 1;
+                                write_len <= 0;
+                                aai_active <= 1;
+                            end else begin
+                                // Subsequent AAI: skip address, go to data
+                                state <= STA_AAI_DATA;
+                                write_cmd <= 1;
+                                write_type <= 2'd2;
+                                write_addr <= addr[25:3];
+                                write_len <= 0;
+                                status_reg[0] <= 1;
+                            end
                         end
                     end
                     
@@ -541,7 +588,7 @@ module spi_trx(
                     if (addr_count == 0) begin
                         state <= STA_ERASE;
                         write_cmd <= 1;
-                        write_type <= 1'd1;
+                        write_type <= 2'd1;
                         
                         // Align address based on erase size
                         // write_addr is 23-bit burst address = byte_addr[25:3]
@@ -566,16 +613,27 @@ module spi_trx(
                 end
                 else if (state == STA_ADDR_WRITE) begin
                     if (addr_count == 0) begin
-                        state <= STA_WRITE;
-                        write_cmd <= 1;
-                        write_type <= 0;
-                        
-                        // Page-aligned address in 8-byte burst units
-                        // byte_addr[25:3] -> burst address, page = 256 bytes = 32 bursts
-                        write_addr <= {addr[25:8], 5'b0};
+                        if (is_aai) begin
+                            // AAI: single-burst RMW, don't clear WEL
+                            state <= STA_AAI_DATA;
+                            write_cmd <= 1;
+                            write_type <= 2'd2;
+                            write_addr <= addr[25:3];
+                            write_len <= 0;
+                            status_reg[0] <= 1;
+                            addr[0] <= 0;  // Force even alignment per SST spec
+                        end else begin
+                            state <= STA_WRITE;
+                            write_cmd <= 1;
+                            write_type <= 2'd0;
                             
-                        status_reg[1] <= 0;
-                        status_reg[0] <= 1;
+                            // Page-aligned address in 8-byte burst units
+                            // byte_addr[25:3] -> burst address, page = 256 bytes = 32 bursts
+                            write_addr <= {addr[25:8], 5'b0};
+                                
+                            status_reg[1] <= 0;
+                            status_reg[0] <= 1;
+                        end
                     end
                     
                     addr[addr_count] <= spi_io0_in;
@@ -592,6 +650,20 @@ module spi_trx(
                     write_buf_val <= {mosi_byte[7:1], spi_io0_in};
                     
                     addr[7:0] <= addr[7:0] + 1;
+                end
+                // ---------------------------------------------------------
+                // AAI data reception (2 bytes per CS cycle)
+                // Bytes are written to the page buffer at addr[7:0].
+                // Full 32-bit address auto-increments (crosses pages).
+                // Master deasserts CS after 2 bytes; glue.v performs
+                // read-modify-write of the single 8-byte SDRAM burst.
+                // ---------------------------------------------------------
+                else if ((state == STA_AAI_DATA) && (bit_count_in == 0)) begin
+                    write_buf_strobe <= 1;
+                    write_buf_offset <= addr[7:0];
+                    write_buf_val <= {mosi_byte[7:1], spi_io0_in};
+                    
+                    addr <= addr + 1;  // Full address auto-increment
                 end
                 else if (state == STA_LOG) begin
                     if (bit_count_in == 0) begin

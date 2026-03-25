@@ -1081,6 +1081,12 @@ fn cmd_configure(cli: &Cli, chip_db_path: &str, chip_name: &str) -> Result<()> {
     eprintln!("  4-byte addr: {}", chip.supports_4byte);
     eprintln!("  Dual I/O:   {}", chip.supports_dual);
     eprintln!("  Quad I/O:   {}", chip.supports_quad);
+    if chip.aai_word {
+        eprintln!("  Write mode: AAI Word Program (0xAD)");
+    }
+    if chip.write_byte {
+        eprintln!("  Write mode: Byte program");
+    }
 
     let erase_ops = chip.sector_erase_ops();
     for op in &erase_ops {

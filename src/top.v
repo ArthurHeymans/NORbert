@@ -224,7 +224,7 @@ module top(
     wire [22:0] spi_ram_addr;    // 23-bit for 64MB addressing
     
     wire spi_write_cmd;
-    wire spi_write_type;  // 0=page program, 1=erase (sector/block/chip)
+    wire [1:0] spi_write_type;  // 00=page program, 01=erase, 10=AAI RMW
     wire [22:0] spi_write_addr;  // 23-bit
     wire [22:0] spi_write_len;
     wire spi_write_done;

@@ -56,7 +56,7 @@ module glue(
     input wire spi_csel,
     
     input wire spi_cmd_write,
-    input wire spi_write_type,  // 0=page program, 1=erase (sector/block/chip)
+    input wire [1:0] spi_write_type,  // 00=page program, 01=erase, 10=AAI RMW
     input wire [22:0] spi_write_addr,   // 23-bit burst address
     input wire [22:0] spi_write_len,
     output reg spi_write_done,
@@ -189,7 +189,7 @@ module glue(
     reg spi_write_ack;
     reg [1:0] spi_cmd_write_buf;
     
-    reg i_spi_write_type;
+    reg [1:0] i_spi_write_type;
     reg [3:0] i_spi_write_state;
     reg [22:0] i_spi_len;
     
@@ -361,7 +361,9 @@ module glue(
             // this covers the serial (UART tool) and SPI write paths.
             sdram_inhibit_refresh <= (read_state != 0) ||
                                     (write_state != 0) ||
-                                    (spi_writing && (i_spi_write_state == 4'd2 || i_spi_write_state == 4'd3));
+                                    (spi_writing && (i_spi_write_state == 4'd2 || i_spi_write_state == 4'd3 ||
+                                                     i_spi_write_state == 4'd6 || i_spi_write_state == 4'd7 ||
+                                                     i_spi_write_state == 4'd8));
     
             if (sdram_access_cmd)
                 sdram_access_cmd <= 0;
@@ -413,13 +415,18 @@ module glue(
                 spi_write_ack <= 1;
                 
                 i_spi_write_type <= spi_write_type;
-                i_spi_write_state <= (spi_write_type != 0) ? 2 : 0;
+                case (spi_write_type)
+                    2'd0: i_spi_write_state <= 0;  // Page program: prepare data
+                    2'd1: i_spi_write_state <= 2;  // Erase: activate for write
+                    2'd2: i_spi_write_state <= 6;  // AAI: read-modify-write
+                    default: i_spi_write_state <= 0;
+                endcase
                 
                 addr <= spi_write_addr;
                 i_spi_len <= spi_write_len;
                 spi_write_done <= 0;
                 
-                if (spi_write_type != 0)
+                if (spi_write_type == 2'd1)
                     write_buffer <= 64'hFFFFFFFFFFFFFFFF;
             end
             
@@ -452,13 +459,58 @@ module glue(
                     end
                 end
                 else if (i_spi_write_state == 4) begin
-                    i_spi_write_state <= (i_spi_write_type != 0) ? 2 : 0;
+                    case (i_spi_write_type)
+                        2'd0: i_spi_write_state <= 0;  // Page program: next burst
+                        2'd1: i_spi_write_state <= 2;  // Erase: next burst
+                        default: i_spi_write_state <= 0;
+                    endcase
                     addr <= addr + 1;
                     i_spi_len <= i_spi_len - 1;
                 end
                 else if (i_spi_write_state == 5) begin
                     spi_writing <= 0;
                     spi_write_done <= 1;
+                    
+                    // Clear page buffer write flags after AAI so the next
+                    // AAI word starts with a clean flag state.
+                    if (i_spi_write_type == 2'd2) begin
+                        for (i = 0; i < 256; i = i + 1)
+                            i_spi_write_data[i][8] <= 0;
+                    end
+                end
+                // ---------------------------------------------------------
+                // AAI Read-Modify-Write (write_type == 2)
+                //
+                // Writes exactly 2 bytes into a single 8-byte SDRAM burst
+                // without corrupting the other 6 bytes.  Uses the page
+                // buffer write flags (bit 8) to select which bytes come
+                // from the page buffer and which are preserved from SDRAM.
+                //
+                // State 6: Activate row for read
+                // State 7: Issue SDRAM read command
+                // State 8: Merge page buffer bytes into read data,
+                //          then continue to state 2 (activate for write)
+                // ---------------------------------------------------------
+                else if (i_spi_write_state == 6) begin
+                    // Activate for read
+                    sdram_access_cmd <= 2'b11;
+                    i_spi_write_state <= 7;
+                end
+                else if (i_spi_write_state == 7) begin
+                    // Issue read
+                    sdram_access_cmd <= 2'b01;
+                    i_spi_write_state <= 8;
+                end
+                else if (i_spi_write_state == 8) begin
+                    // Merge: for each byte in the burst, use page buffer
+                    // data if its write flag is set, otherwise keep SDRAM data.
+                    for (i = 0; i < 8; i = i + 1) begin
+                        if (i_spi_write_data[{addr[4:0], 3'b000} + i][8])
+                            write_buffer[i*8 +: 8] <= i_spi_write_data[{addr[4:0], 3'b000} + i][7:0];
+                        else
+                            write_buffer[i*8 +: 8] <= sdram_read_buffer[i*8 +: 8];
+                    end
+                    i_spi_write_state <= 2;  // Activate for write
                 end
             end
             
