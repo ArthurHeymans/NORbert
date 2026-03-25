@@ -173,8 +173,12 @@ module top(
     assign spi_io2_pin = (spi_io2_oe && spi_active_out) ? spi_io2_out : 1'bz;
     wire spi_io2_in = spi_io2_pin;
     
-    // IO3 (/HOLD pin): input normally, output during quad read data phase
-    assign spi_io3_pin = (spi_io3_oe && spi_active_out) ? spi_io3_out : 1'bz;
+    // IO3 (/HOLD pin): input normally, output during quad read data phase.
+    // When hold_out is asserted, IO3 is driven LOW continuously to keep
+    // the target flash in hold state (mutually exclusive with quad I/O).
+    wire hold_out;
+    assign spi_io3_pin = hold_out ? 1'b0 :
+                         (spi_io3_oe && spi_active_out) ? spi_io3_out : 1'bz;
     wire spi_io3_in = spi_io3_pin;
     
     assign spi_debug_pin = spi_debug_out;
@@ -489,7 +493,8 @@ module top(
         .sfdp_rdata(sfdp_rdata),
         
         .spi_running(spi_running),
-        
+        .hold_out(hold_out),
+
         .led(led_out)
     );
     
