@@ -115,6 +115,8 @@ pub struct FeaturesDef {
     pub wp_bp3: bool,
     #[serde(default)]
     pub wp_wps: bool,
+    #[serde(default)]
+    pub sst26_bpr: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +210,8 @@ pub struct FlashChip {
     pub supports_dual: bool,
     pub supports_quad: bool,
     pub supports_fast_read: bool,
+    pub aai_word: bool,
+    pub write_byte: bool,
     pub erase_ops: Vec<EraseOp>,
 }
 
@@ -289,6 +293,8 @@ pub fn load_chip_db(dir: &Path) -> Result<Vec<FlashChip>> {
                 supports_dual: chip_def.features.dual_io,
                 supports_quad: chip_def.features.quad_io,
                 supports_fast_read: chip_def.features.fast_read,
+                aai_word: chip_def.features.aai_word,
+                write_byte: chip_def.features.write_byte,
                 erase_ops,
             });
         }
