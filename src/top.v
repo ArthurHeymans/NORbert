@@ -240,6 +240,13 @@ module top(
     wire log_strobe;
     wire [7:0] log_val;
     
+    // Structured logging signals (SPI clock domain)
+    wire log_cmd_valid;
+    wire [7:0] log_cmd_opcode;
+    wire log_addr_valid;
+    wire [31:0] log_addr_out;
+    wire [23:0] log_byte_count;
+    
     // Chip configuration wires (glue -> spi_trx)
     wire [23:0] cfg_jedec_id;
     wire cfg_4byte;
@@ -297,8 +304,57 @@ module top(
         .sfdp_rdata(sfdp_rdata),
         
         .log_strobe(log_strobe),
-        .log_val(log_val)
+        .log_val(log_val),
+        
+        .log_cmd_valid(log_cmd_valid),
+        .log_cmd_opcode(log_cmd_opcode),
+        .log_addr_valid(log_addr_valid),
+        .log_addr_out(log_addr_out),
+        .log_byte_count(log_byte_count)
     );
+    
+    // -----------------------------------------------------------
+    // Logging signal synchronization (SPI -> system clock domain)
+    //
+    // The glue module needs synchronized versions of log_addr_valid
+    // and spi_active to perform TOCTOU trap checks.  spi_trx signals
+    // are in the SPI clock domain; these 2-FF synchronizers bring
+    // them into the system clock domain with edge detection in glue.
+    // -----------------------------------------------------------
+    
+    reg [1:0] log_addr_valid_sys;
+    reg [1:0] spi_active_sys;
+    reg [31:0] log_addr_latched;
+    
+    always @(posedge clk) begin
+        log_addr_valid_sys <= {log_addr_valid_sys[0], log_addr_valid};
+        spi_active_sys     <= {spi_active_sys[0], spi_active};
+        // Latch addr when valid fires (stable for multiple sys clocks)
+        if (log_addr_valid && !log_addr_valid_sys[0])
+            log_addr_latched <= log_addr_out;
+    end
+    
+    // -----------------------------------------------------------
+    // TOCTOU Address Redirect Mux
+    //
+    // Transparently transforms the SPI SDRAM address when a TOCTOU
+    // trap is active.  The redirect uses a bitwise mux controlled
+    // by the trap mask:
+    //   new_addr = (redirect_base & redirect_mask) |
+    //              (original_addr & ~redirect_mask)
+    //
+    // The first 8 bytes of a redirected read use the original
+    // address (the SDRAM pipeline fires before the trap check
+    // completes).  All subsequent bursts use the redirected address.
+    // -----------------------------------------------------------
+    
+    wire redirect_active;
+    wire [22:0] redirect_mask;
+    wire [22:0] redirect_base;
+    
+    wire [22:0] spi_ram_addr_final = redirect_active ?
+        ((redirect_base & redirect_mask) | (spi_ram_addr & ~redirect_mask)) :
+        spi_ram_addr;
     
     // -----------------------------------------------------------
     // SDRAM Controller
@@ -327,11 +383,11 @@ module top(
         .dqm_o(sdram_dqm),
         .dq_io(IO_sdram_dq),
         
-        // SPI fast-path control
+        // SPI fast-path control (address passes through TOCTOU redirect mux)
         .spi_inhibit_refresh(spi_ram_inhibit_refresh),
         .spi_cmd_activate(spi_ram_activate),
         .spi_cmd_read(spi_ram_read),
-        .spi_addr(spi_ram_addr),
+        .spi_addr(spi_ram_addr_final),
         
         // Serial path control
         .access_cmd(sdram_access_cmd),
@@ -379,9 +435,9 @@ module top(
     // FT245 Interface (FT2232H async FIFO)
     // -----------------------------------------------------------
     
-    wire ft_txd_ready;
-    wire [7:0] ft_txd;
-    wire ft_txd_strobe;
+    wire ft_txd_ready_raw;       // Raw ready from ft245
+    wire [7:0] ft_txd_muxed;    // Muxed TX data to ft245
+    wire ft_txd_strobe_muxed;   // Muxed TX strobe to ft245
     wire ft_rxd_strobe_raw;
     wire [7:0] ft_rxd_raw;
     
@@ -395,10 +451,53 @@ module top(
         .ft_wr_n(ft_wr_n),
         .rxd(ft_rxd_raw),
         .rxd_strobe(ft_rxd_strobe_raw),
-        .txd(ft_txd),
-        .txd_strobe(ft_txd_strobe),
-        .txd_ready(ft_txd_ready)
+        .txd(ft_txd_muxed),
+        .txd_strobe(ft_txd_strobe_muxed),
+        .txd_ready(ft_txd_ready_raw)
     );
+    
+    // -----------------------------------------------------------
+    // Logger Module
+    // -----------------------------------------------------------
+    
+    wire log_active;
+    wire log_txd_strobe;
+    wire [7:0] log_txd_data;
+    wire trap_notify_strobe;
+    wire [1:0] trap_notify_index;
+    wire [23:0] trap_notify_addr;
+    
+    // FT245 TX ready routed to active sender
+    wire glue_ft_txd_ready = log_active ? 1'b0 : ft_txd_ready_raw;
+    wire log_ft_txd_ready  = log_active ? ft_txd_ready_raw : 1'b0;
+    
+    logger logger_i(
+        .clk(clk),
+        .reset(reset),
+        .enable(log_active),
+        
+        .spi_log_cmd_valid(log_cmd_valid),
+        .spi_log_cmd_opcode(log_cmd_opcode),
+        .spi_log_addr_valid(log_addr_valid),
+        .spi_log_addr(log_addr_out),
+        .spi_active(spi_active),
+        .spi_log_byte_count(log_byte_count),
+        
+        .trap_notify_strobe(trap_notify_strobe),
+        .trap_notify_index(trap_notify_index),
+        .trap_notify_addr(trap_notify_addr),
+        
+        .txd_ready(log_ft_txd_ready),
+        .txd_strobe(log_txd_strobe),
+        .txd_data(log_txd_data)
+    );
+    
+    // FT245 TX mux: log data when logging active, glue data otherwise
+    wire glue_ft_txd_strobe;
+    wire [7:0] glue_ft_txd_data;
+    
+    assign ft_txd_strobe_muxed = log_active ? log_txd_strobe : glue_ft_txd_strobe;
+    assign ft_txd_muxed        = log_active ? log_txd_data   : glue_ft_txd_data;
     
     // -----------------------------------------------------------
     // FT245 RX FIFO: decouple ft245 byte delivery from glue
@@ -455,9 +554,9 @@ module top(
         .ft_rx_data(ft_rxfifo_data),
         .ft_rx_pop(ft_rx_pop),
         
-        .ft_txd_ready(ft_txd_ready),
-        .ft_txd_strobe(ft_txd_strobe),
-        .ft_txd_data(ft_txd),
+        .ft_txd_ready(glue_ft_txd_ready),
+        .ft_txd_strobe(glue_ft_txd_strobe),
+        .ft_txd_data(glue_ft_txd_data),
         
         .sdram_access_cmd(sdram_access_cmd),
         .sdram_access_addr(sdram_access_addr),
@@ -494,6 +593,20 @@ module top(
         
         .spi_running(spi_running),
         .hold_out(hold_out),
+
+        .log_active(log_active),
+
+        .log_addr_valid_sync(log_addr_valid_sys[1]),
+        .log_addr_sync(log_addr_latched[23:0]),
+        .spi_active_sync(spi_active_sys[1]),
+
+        .redirect_active(redirect_active),
+        .redirect_mask(redirect_mask),
+        .redirect_base(redirect_base),
+
+        .trap_notify_strobe(trap_notify_strobe),
+        .trap_notify_index(trap_notify_index),
+        .trap_notify_addr(trap_notify_addr),
 
         .led(led_out)
     );
