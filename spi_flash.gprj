@@ -12,6 +12,7 @@
         <File path="src/uart.v" type="file.verilog" enable="1"/>
         <File path="src/ft245.v" type="file.verilog" enable="1"/>
         <File path="src/fifo.v" type="file.verilog" enable="1"/>
+        <File path="src/logger.v" type="file.verilog" enable="1"/>
         <File path="src/util.v" type="file.verilog" enable="1"/>
         <File path="src/pll.v" type="file.verilog" enable="1"/>
         <File path="tangprimer25k.cst" type="file.cst" enable="1"/>
