@@ -69,17 +69,78 @@ impl SerialTransport {
             .open()
             .with_context(|| format!("Failed to open serial port {}", port_name))?;
 
-        // Sync with FPGA: USB-UART bridges can send spurious bytes on
-        // port open (DTR/RTS toggling, line glitches). Wait for the
-        // FPGA's idle timeout to fire and reset the parser, then flush.
-        thread::sleep(Duration::from_millis(5));
+        // Sync with FPGA.  Two distinct glitch sources conspire here:
+        //
+        //   1. A fresh JTAG load of the FPGA briefly tri-states then
+        //      redrives the UART TX pin; the USB-serial bridge decodes
+        //      that transition as a byte -- typically 0xFF (line was
+        //      momentarily high with no start bit).
+        //   2. Opening /dev/ttyUSB* toggles DTR/RTS which can glitch
+        //      the line a second time.
+        //
+        // Either stray can land in the host's tty buffer any time from
+        // a few ms to several tens of ms after port open.  We defend in
+        // two layers: a generous settle + drain, then an *active*
+        // resync that sends CMD_VERSION and discards any non-version
+        // bytes that appear before the real reply.
+        thread::sleep(Duration::from_millis(20));
 
         let mut discard = [0u8; 256];
-        port.set_timeout(Duration::from_millis(1))?;
+        port.set_timeout(Duration::from_millis(5))?;
         while port.read(&mut discard).unwrap_or(0) > 0 {}
-        port.set_timeout(Duration::from_secs(2))?;
 
-        Ok(Self { port })
+        // Active resync: send CMD_VERSION, read everything that
+        // arrives within the reply window, and accept the last byte
+        // seen.  A stray 0xFF that arrived just before or during the
+        // reply will appear *before* the version byte; the last byte
+        // is then the FPGA's reply.  Retry a few times to cover a
+        // stray that arrives *after* the reply (it would be seen as
+        // the last byte on the first attempt, forcing a retry).
+        const SYNC_ATTEMPTS: u32 = 5;
+        for attempt in 0..SYNC_ATTEMPTS {
+            port.write_all(&[CMD_VERSION])?;
+            port.flush().ok();
+
+            // 10 ms window covers FPGA command processing (a few µs)
+            // plus any late-arriving stray bytes.
+            thread::sleep(Duration::from_millis(10));
+
+            let mut last: Option<u8> = None;
+            port.set_timeout(Duration::from_millis(5))?;
+            loop {
+                let mut buf = [0u8; 1];
+                match port.read_exact(&mut buf) {
+                    Ok(()) => last = Some(buf[0]),
+                    Err(_) => break,
+                }
+            }
+
+            // 0x00 is a leaked modem-status zero; 0xFF is the usual
+            // glitch byte.  Anything else is a plausible version reply
+            // (versions 1..=127 are in range for this protocol).
+            match last {
+                Some(v) if v != 0x00 && v != 0xFF => {
+                    // Double-check the line is now quiet.
+                    port.set_timeout(Duration::from_millis(5))?;
+                    while port.read(&mut discard).unwrap_or(0) > 0 {}
+                    port.set_timeout(Duration::from_secs(2))?;
+                    if attempt > 0 {
+                        eprintln!(
+                            "Serial resync: version 0x{:02x} after {} retries",
+                            v,
+                            attempt + 1
+                        );
+                    }
+                    return Ok(Self { port });
+                }
+                _ => {} // keep trying
+            }
+        }
+        bail!(
+            "Failed to sync with FPGA on {} after {} attempts (only saw 0x00/0xFF junk)",
+            port_name,
+            SYNC_ATTEMPTS
+        );
     }
 }
 
