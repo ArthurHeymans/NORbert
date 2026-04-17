@@ -28,13 +28,16 @@ const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
 // host-to-FPGA, SDRAM writes complete in microseconds).
 const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
 
-const PROTOCOL_VERSION: u8 = 3;
+const PROTOCOL_VERSION: u8 = 4;
 
 // Protocol commands (shared between UART and FT245 transports)
 const CMD_VERSION: u8 = 0x30;
 const CMD_READ: u8 = 0x31;
 const CMD_WRITE: u8 = 0x32;
 const CMD_CHIPCONFIG: u8 = 0x33;
+const CMD_START: u8 = 0x34; // Enable SPI emulation (protocol v4+)
+const CMD_STOP: u8 = 0x35; // Disable SPI emulation (protocol v4+)
+const CMD_STATUS: u8 = 0x36; // Query emulation state (protocol v4+)
 
 // FT2232H USB identifiers
 #[cfg(any(feature = "d2xx", feature = "ftdi"))]
@@ -311,6 +314,125 @@ impl FlashDevice {
         Ok(buf[0])
     }
 
+    /// Read one response byte, transparently skipping stray 0x00 bytes
+    /// that the FT2232H 245 FIFO mode occasionally leaks through D2XX
+    /// (the 2-byte USB IN modem status header).  Used by all single-
+    /// byte-ack commands.
+    fn read_ack(&mut self, context: &str) -> Result<u8> {
+        let mut resp = [0u8; 1];
+        let mut skipped = 0u32;
+        loop {
+            self.transport.read_exact(&mut resp)?;
+            if resp[0] != 0x00 {
+                return Ok(resp[0]);
+            }
+            skipped += 1;
+            if skipped > 8 {
+                bail!("{}: too many 0x00 bytes before ACK", context);
+            }
+        }
+    }
+
+    /// Start SPI emulation.  ACK = 0x01.  Safe to call while running
+    /// (no-op that still acks).
+    fn start_emulation(&mut self) -> Result<()> {
+        self.transport.write_all(&[CMD_START])?;
+        let ack = self.read_ack("start")?;
+        if ack != 0x01 {
+            bail!("start: unexpected response 0x{:02x}", ack);
+        }
+        Ok(())
+    }
+
+    /// Stop SPI emulation.  ACK = 0x01.  Safe to call while stopped.
+    ///
+    /// Always deliverable: even when SPI emulation is actively driving
+    /// the target, the FPGA's always-safe dispatcher picks up this
+    /// command ahead of the usual SPI-idle gate.
+    fn stop_emulation(&mut self) -> Result<()> {
+        self.transport.write_all(&[CMD_STOP])?;
+        let ack = self.read_ack("stop")?;
+        if ack != 0x01 {
+            bail!("stop: unexpected response 0x{:02x}", ack);
+        }
+        Ok(())
+    }
+
+    /// Query the current emulation state.  Returns true when running.
+    ///
+    /// The FPGA encodes stopped as 0x02 (not 0x00) so that any leaked
+    /// FT2232H modem-status zeros can be transparently skipped.
+    fn status(&mut self) -> Result<bool> {
+        self.transport.write_all(&[CMD_STATUS])?;
+        let resp = self.read_ack("status")?;
+        match resp {
+            0x01 => Ok(true),  // running
+            0x02 => Ok(false), // stopped
+            other => bail!("status: unexpected response 0x{:02x}", other),
+        }
+    }
+
+    /// Ensure emulation is stopped for the duration of `f`, then
+    /// restore the prior state.  On v3 or older firmware (which has
+    /// no START/STOP/STATUS opcodes) `f` runs unconditionally and the
+    /// caller is responsible for ensuring the SPI bus is idle.
+    ///
+    /// State is restored on a best-effort basis even when `f` returns
+    /// an error so a failed operation doesn't leave the emulator
+    /// unexpectedly stopped.
+    fn with_emulation_stopped<F, R>(&mut self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Self) -> Result<R>,
+    {
+        let version = self.get_version()?;
+        if version < 4 {
+            eprintln!(
+                "Note: FPGA protocol v{} has no START/STOP; assuming idle SPI bus.",
+                version
+            );
+            return f(self);
+        }
+
+        let was_running = self.status()?;
+        if was_running {
+            eprintln!("Stopping SPI emulation for operation...");
+            self.stop_emulation()?;
+        }
+        let result = f(self);
+        if was_running {
+            match self.start_emulation() {
+                Ok(()) => eprintln!("SPI emulation resumed."),
+                Err(e) => eprintln!("Warning: failed to resume SPI emulation: {}", e),
+            }
+        }
+        result
+    }
+
+    /// Stop emulation, run `f`, then start emulation unconditionally.
+    /// Used by `load`, whose natural end state is "ready to serve".
+    fn with_emulation_then_start<F, R>(&mut self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Self) -> Result<R>,
+    {
+        let version = self.get_version()?;
+        if version < 4 {
+            eprintln!(
+                "Note: FPGA protocol v{} has no START/STOP; assuming idle SPI bus.",
+                version
+            );
+            return f(self);
+        }
+
+        eprintln!("Stopping SPI emulation...");
+        self.stop_emulation()?;
+        let result = f(self);
+        match self.start_emulation() {
+            Ok(()) => eprintln!("SPI emulation started; target can now read the loaded data."),
+            Err(e) => eprintln!("Warning: failed to start SPI emulation: {}", e),
+        }
+        result
+    }
+
     fn read_block(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
         if length == 0 || length > BLOCK_SIZE {
             bail!("Invalid length: must be 1-{}", BLOCK_SIZE);
@@ -371,26 +493,12 @@ impl FlashDevice {
         buf.extend_from_slice(data);
         self.transport.write_all(&buf)?;
 
-        // Wait for completion byte.
-        // The FT2232H in 245 FIFO mode occasionally leaks modem status
-        // bytes (0x00) through D2XX into the data stream.  Skip any
-        // leading 0x00 bytes before the real ACK.
-        let mut resp = [0u8; 1];
-        let mut skipped = 0u32;
-        loop {
-            self.transport.read_exact(&mut resp)?;
-            if resp[0] != 0x00 {
-                break;
-            }
-            skipped += 1;
-            if skipped > 8 {
-                bail!("Too many 0x00 bytes before ACK");
-            }
-        }
-        if resp[0] != 0x01 {
+        // Wait for completion byte (read_ack skips leaked FT2232H 0x00s).
+        let ack = self.read_ack("write")?;
+        if ack != 0x01 {
             bail!(
                 "Unexpected ACK: 0x{:02x} (expected 0x01, data[0..4]={:02x?})",
-                resp[0],
+                ack,
                 &data[..std::cmp::min(4, data.len())]
             );
         }
@@ -468,21 +576,9 @@ impl FlashDevice {
         buf.extend_from_slice(sfdp_table);
         self.transport.write_all(&buf)?;
 
-        // Wait for ack (skip modem status bytes, see write_block)
-        let mut resp = [0u8; 1];
-        let mut skipped = 0u32;
-        loop {
-            self.transport.read_exact(&mut resp)?;
-            if resp[0] != 0x00 {
-                break;
-            }
-            skipped += 1;
-            if skipped > 8 {
-                bail!("Chip config: too many 0x00 bytes before ACK");
-            }
-        }
-        if resp[0] != 0x01 {
-            bail!("Chip config failed: unexpected response 0x{:02x}", resp[0]);
+        let ack = self.read_ack("chip config")?;
+        if ack != 0x01 {
+            bail!("Chip config failed: unexpected response 0x{:02x}", ack);
         }
         Ok(())
     }
@@ -622,6 +718,15 @@ enum Commands {
 
     /// Diagnostic: send test bytes and report what comes back
     Probe,
+
+    /// Start SPI emulation (target can now read the loaded firmware)
+    Start,
+
+    /// Stop SPI emulation (required before RAM/config operations)
+    Stop,
+
+    /// Query whether SPI emulation is currently running
+    Status,
 }
 
 fn parse_address(s: &str) -> Result<u32, String> {
@@ -670,77 +775,80 @@ fn cmd_version(cli: &Cli) -> Result<()> {
 
 fn cmd_read(cli: &Cli, address: u32, length: u32, output: Option<PathBuf>) -> Result<()> {
     let mut device = open_device(cli)?;
-    let rbs = device.read_block_size;
 
-    let pb = ProgressBar::new(length as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
-            .progress_chars("#>-"),
-    );
+    device.with_emulation_stopped(|device| {
+        let rbs = device.read_block_size;
 
-    let mut result = Vec::with_capacity(length as usize);
-    let mut addr = address;
-    let mut remaining = length as usize;
+        let pb = ProgressBar::new(length as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
+                .progress_chars("#>-"),
+        );
 
-    let start_offset = (addr % 8) as usize;
-    if start_offset != 0 {
-        let aligned_addr = addr - start_offset as u32;
-        let chunk_len = std::cmp::min(8 - start_offset, remaining);
-        let block = device.read_block(aligned_addr, 8)?;
-        result.extend_from_slice(&block[start_offset..start_offset + chunk_len]);
-        addr += chunk_len as u32;
-        remaining -= chunk_len;
-        pb.inc(chunk_len as u64);
-    }
+        let mut result = Vec::with_capacity(length as usize);
+        let mut addr = address;
+        let mut remaining = length as usize;
 
-    while remaining >= 8 {
-        let chunk_len = std::cmp::min(rbs, remaining / 8 * 8);
-        let block = device.read_block(addr, chunk_len)?;
-        result.extend_from_slice(&block);
-        addr += chunk_len as u32;
-        remaining -= chunk_len;
-        pb.inc(chunk_len as u64);
-    }
-
-    if remaining > 0 {
-        let block = device.read_block(addr, 8)?;
-        result.extend_from_slice(&block[..remaining]);
-        pb.inc(remaining as u64);
-    }
-
-    pb.finish_with_message("done");
-
-    match output {
-        Some(path) => {
-            let mut file = File::create(&path)?;
-            file.write_all(&result)?;
-            println!("Wrote {} bytes to {}", result.len(), path.display());
+        let start_offset = (addr % 8) as usize;
+        if start_offset != 0 {
+            let aligned_addr = addr - start_offset as u32;
+            let chunk_len = std::cmp::min(8 - start_offset, remaining);
+            let block = device.read_block(aligned_addr, 8)?;
+            result.extend_from_slice(&block[start_offset..start_offset + chunk_len]);
+            addr += chunk_len as u32;
+            remaining -= chunk_len;
+            pb.inc(chunk_len as u64);
         }
-        None => {
-            for (i, chunk) in result.chunks(16).enumerate() {
-                print!("{:08x}: ", address as usize + i * 16);
-                for b in chunk {
-                    print!("{:02x} ", b);
-                }
-                for _ in chunk.len()..16 {
-                    print!("   ");
-                }
-                print!(" |");
-                for b in chunk {
-                    let c = *b as char;
-                    if c.is_ascii_graphic() || c == ' ' {
-                        print!("{}", c);
-                    } else {
-                        print!(".");
+
+        while remaining >= 8 {
+            let chunk_len = std::cmp::min(rbs, remaining / 8 * 8);
+            let block = device.read_block(addr, chunk_len)?;
+            result.extend_from_slice(&block);
+            addr += chunk_len as u32;
+            remaining -= chunk_len;
+            pb.inc(chunk_len as u64);
+        }
+
+        if remaining > 0 {
+            let block = device.read_block(addr, 8)?;
+            result.extend_from_slice(&block[..remaining]);
+            pb.inc(remaining as u64);
+        }
+
+        pb.finish_with_message("done");
+
+        match output {
+            Some(path) => {
+                let mut file = File::create(&path)?;
+                file.write_all(&result)?;
+                println!("Wrote {} bytes to {}", result.len(), path.display());
+            }
+            None => {
+                for (i, chunk) in result.chunks(16).enumerate() {
+                    print!("{:08x}: ", address as usize + i * 16);
+                    for b in chunk {
+                        print!("{:02x} ", b);
                     }
+                    for _ in chunk.len()..16 {
+                        print!("   ");
+                    }
+                    print!(" |");
+                    for b in chunk {
+                        let c = *b as char;
+                        if c.is_ascii_graphic() || c == ' ' {
+                            print!("{}", c);
+                        } else {
+                            print!(".");
+                        }
+                    }
+                    println!("|");
                 }
-                println!("|");
             }
         }
-    }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 fn cmd_write(cli: &Cli, address: u32, data_hex: &str) -> Result<()> {
@@ -758,7 +866,7 @@ fn cmd_write(cli: &Cli, address: u32, data_hex: &str) -> Result<()> {
         padded.resize((padded.len() + 7) / 8 * 8, 0xFF);
     }
 
-    device.write_block(address, &padded)?;
+    device.with_emulation_stopped(|device| device.write_block(address, &padded))?;
     println!("Wrote {} bytes to 0x{:08x}", data.len(), address);
     Ok(())
 }
@@ -788,89 +896,93 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
         padded.resize((padded.len() + 7) / 8 * 8, 0xFF);
     }
 
-    let pb = ProgressBar::new(padded.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
-            .progress_chars("#>-"),
-    );
-
-    let mut addr = address;
-    let mut offset = 0;
-    let total_blocks = (padded.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    let mut block_num = 0;
-
-    while offset < padded.len() {
-        let chunk_len = std::cmp::min(BLOCK_SIZE, padded.len() - offset);
-        device
-            .write_block(addr, &padded[offset..offset + chunk_len])
-            .with_context(|| {
-                format!(
-                    "Block {}/{} at addr 0x{:06x}",
-                    block_num, total_blocks, addr
-                )
-            })?;
-        addr += chunk_len as u32;
-        offset += chunk_len;
-        block_num += 1;
-        pb.inc(chunk_len as u64);
-    }
-
-    pb.finish_with_message("done");
-    println!("Loaded {} bytes ({} blocks)", padded.len(), block_num);
-
-    if verify {
-        println!("Verifying...");
+    // Load is the one command whose natural end state is "ready to
+    // serve", so the dance is stop -> write -> (verify) -> start.
+    device.with_emulation_then_start(|device| {
         let pb = ProgressBar::new(padded.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template(
-                    "[{elapsed_precise}] [{bar:40.green/blue}] {bytes}/{total_bytes} ({eta})",
-                )?
+                .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
                 .progress_chars("#>-"),
         );
 
         let mut addr = address;
         let mut offset = 0;
-        let mut errors = 0;
+        let total_blocks = (padded.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let mut block_num = 0;
 
-        let rbs = device.read_block_size;
         while offset < padded.len() {
-            let chunk_len = std::cmp::min(rbs, padded.len() - offset);
-            let readback = device.read_block(addr, chunk_len)?;
-
-            for (i, (a, b)) in padded[offset..offset + chunk_len]
-                .iter()
-                .zip(readback.iter())
-                .enumerate()
-            {
-                if a != b {
-                    if errors < 10 {
-                        eprintln!(
-                            "Mismatch at 0x{:08x}: expected 0x{:02x}, got 0x{:02x}",
-                            addr + i as u32,
-                            a,
-                            b
-                        );
-                    }
-                    errors += 1;
-                }
-            }
-
+            let chunk_len = std::cmp::min(BLOCK_SIZE, padded.len() - offset);
+            device
+                .write_block(addr, &padded[offset..offset + chunk_len])
+                .with_context(|| {
+                    format!(
+                        "Block {}/{} at addr 0x{:06x}",
+                        block_num, total_blocks, addr
+                    )
+                })?;
             addr += chunk_len as u32;
             offset += chunk_len;
+            block_num += 1;
             pb.inc(chunk_len as u64);
         }
 
         pb.finish_with_message("done");
+        println!("Loaded {} bytes ({} blocks)", padded.len(), block_num);
 
-        if errors > 0 {
-            bail!("Verification failed: {} byte(s) differ", errors);
+        if verify {
+            println!("Verifying...");
+            let pb = ProgressBar::new(padded.len() as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "[{elapsed_precise}] [{bar:40.green/blue}] {bytes}/{total_bytes} ({eta})",
+                    )?
+                    .progress_chars("#>-"),
+            );
+
+            let mut addr = address;
+            let mut offset = 0;
+            let mut errors = 0;
+
+            let rbs = device.read_block_size;
+            while offset < padded.len() {
+                let chunk_len = std::cmp::min(rbs, padded.len() - offset);
+                let readback = device.read_block(addr, chunk_len)?;
+
+                for (i, (a, b)) in padded[offset..offset + chunk_len]
+                    .iter()
+                    .zip(readback.iter())
+                    .enumerate()
+                {
+                    if a != b {
+                        if errors < 10 {
+                            eprintln!(
+                                "Mismatch at 0x{:08x}: expected 0x{:02x}, got 0x{:02x}",
+                                addr + i as u32,
+                                a,
+                                b
+                            );
+                        }
+                        errors += 1;
+                    }
+                }
+
+                addr += chunk_len as u32;
+                offset += chunk_len;
+                pb.inc(chunk_len as u64);
+            }
+
+            pb.finish_with_message("done");
+
+            if errors > 0 {
+                bail!("Verification failed: {} byte(s) differ", errors);
+            }
+            println!("Verification passed!");
         }
-        println!("Verification passed!");
-    }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 fn cmd_dump(cli: &Cli, file: &PathBuf, address: u32, length: u32) -> Result<()> {
@@ -922,9 +1034,10 @@ fn cmd_configure(cli: &Cli, chip_db_path: &str, chip_name: &str) -> Result<()> {
     let sfdp_table = sfdp::generate_sfdp(chip);
     eprintln!("  SFDP table: {} bytes", sfdp_table.len());
 
-    // Send to FPGA
+    // Send to FPGA.  Must be stopped while CHIPCONFIG is processed,
+    // otherwise spi_trx could read inconsistent cfg_* values mid-transfer.
     let mut device = open_device(cli)?;
-    device.send_chip_config(chip, &sfdp_table)?;
+    device.with_emulation_stopped(|device| device.send_chip_config(chip, &sfdp_table))?;
 
     eprintln!("Configuration applied successfully.");
     Ok(())
@@ -1327,6 +1440,30 @@ fn cmd_ports() -> Result<()> {
     Ok(())
 }
 
+fn cmd_start(cli: &Cli) -> Result<()> {
+    let mut device = open_device(cli)?;
+    device.start_emulation()?;
+    println!("SPI emulation started.");
+    Ok(())
+}
+
+fn cmd_stop(cli: &Cli) -> Result<()> {
+    let mut device = open_device(cli)?;
+    device.stop_emulation()?;
+    println!("SPI emulation stopped.");
+    Ok(())
+}
+
+fn cmd_status(cli: &Cli) -> Result<()> {
+    let mut device = open_device(cli)?;
+    let running = device.status()?;
+    println!(
+        "SPI emulation: {}",
+        if running { "running" } else { "stopped" }
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1356,6 +1493,9 @@ fn main() -> Result<()> {
         Commands::Ports => cmd_ports(),
         Commands::FtList => cmd_ft_list(),
         Commands::Probe => cmd_probe(&cli),
+        Commands::Start => cmd_start(&cli),
+        Commands::Stop => cmd_stop(&cli),
+        Commands::Status => cmd_status(&cli),
     }
 }
 

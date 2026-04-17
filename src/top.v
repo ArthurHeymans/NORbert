@@ -185,6 +185,15 @@ module top(
             spi_reset_count <= 0;
         end
     end
+
+    // Effective SPI reset: also held high whenever the host has stopped
+    // emulation via the serial STOP command (spi_running=0).  This keeps
+    // spi_trx fully in reset so the SPI pins are ignored, and is also
+    // fed back into glue.v so its serial_gate stops depending on SPI pin
+    // state -- guaranteeing the host can always reach the FPGA over
+    // UART/FT245 regardless of whether a target board is connected.
+    wire spi_running;
+    wire spi_reset_effective = spi_reset || !spi_running;
     
     // -----------------------------------------------------------
     // SPI Transceiver
@@ -222,7 +231,7 @@ module top(
         .clk(clk),
         
         .spi_clk(spi_clk_in),
-        .spi_reset(spi_reset),
+        .spi_reset(spi_reset_effective),
         .spi_csel(spi_cs_in),
         .spi_io0_in(spi_io0_in),
         .spi_io0_out(spi_io0_out),
@@ -438,7 +447,7 @@ module top(
         
         .sdram_write_buffer(sdram_write_buffer),
         
-        .spi_reset(spi_reset),
+        .spi_reset(spi_reset_effective),
         .spi_csel(spi_cs_in),
         
         .spi_cmd_write(spi_write_cmd),
@@ -460,6 +469,8 @@ module top(
         
         .sfdp_raddr(sfdp_raddr),
         .sfdp_rdata(sfdp_rdata),
+        
+        .spi_running(spi_running),
         
         .led(led_out)
     );
