@@ -17,8 +17,20 @@ const BFPT_OFFSET: u32 = 0x10;
 const BFPT_DWORDS: u8 = 16; // JESD216A/B
 
 /// Generate the full SFDP table for a given chip.
+///
+/// Chips that do not implement SFDP in real hardware (e.g. SST25VFxxx
+/// series) get an all-0xFF table.  A valid SFDP response would mislead
+/// tools like flashprog that probe SFDP before consulting their chip
+/// table -- they would parse a fabricated signature and potentially
+/// override the correct hardcoded behavior.  Returning 0xFF (erased
+/// flash pattern, invalid "SFDP" signature) makes the probe fail as
+/// it would on the real part.
 pub fn generate_sfdp(chip: &FlashChip) -> [u8; SFDP_TABLE_SIZE] {
     let mut table = [0xFFu8; SFDP_TABLE_SIZE];
+
+    if !chip.supports_sfdp {
+        return table;
+    }
 
     write_sfdp_header(&mut table);
     write_param_header(&mut table);
@@ -81,8 +93,18 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     let mut dw1: u32 = 0;
     // [1:0] Block/Sector erase granularity
     dw1 |= if has_4k_erase { 0x01 } else { 0x03 };
-    // [2] Write granularity: 1 = buffer >= 64 bytes (page_size is typically 256)
-    if chip.page_size >= 64 {
+    // [2] Write granularity: 1 = buffer >= 64 bytes, 0 = 1 byte.
+    //
+    // Per JESD216B, this selects between page program (>= 64 byte
+    // buffer) and byte program (1 byte).  There is no SFDP flag for
+    // AAI word program, so chips whose native multi-byte write is AAI
+    // (e.g. SST25VFxxx: AAI writes 2 bytes, byte program writes 1) or
+    // that only support 0x02 as a single-byte write must advertise 0
+    // here.  Tools that rely solely on SFDP then fall back to byte
+    // programming via 0x02; tools with a hardcoded chip table (e.g.
+    // flashprog) will use their own AAI path regardless.
+    let large_buffer = chip.page_size >= 64 && !chip.aai_word && !chip.write_byte;
+    if large_buffer {
         dw1 |= 1 << 2;
     }
     // [3] WREN required for volatile SR write

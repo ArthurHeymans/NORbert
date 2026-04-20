@@ -212,6 +212,7 @@ pub struct FlashChip {
     pub supports_fast_read: bool,
     pub aai_word: bool,
     pub write_byte: bool,
+    pub supports_sfdp: bool,
     pub erase_ops: Vec<EraseOp>,
 }
 
@@ -295,6 +296,7 @@ pub fn load_chip_db(dir: &Path) -> Result<Vec<FlashChip>> {
                 supports_fast_read: chip_def.features.fast_read,
                 aai_word: chip_def.features.aai_word,
                 write_byte: chip_def.features.write_byte,
+                supports_sfdp: chip_def.features.sfdp,
                 erase_ops,
             });
         }
