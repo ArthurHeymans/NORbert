@@ -86,8 +86,17 @@ module glue(
     // Target flash HOLD control (active high: 1 = assert #HOLD on target)
     output reg hold_out,
 
-    // Logging control
-    output reg log_active,          // 1 = logging enabled, drives FT245 TX mux
+    // Logging control: 1 = logger captures SPI events into the ring
+    // FIFO; 0 = logger ignores events.  The host drains the FIFO via
+    // CMD_LOGPOLL regardless of this flag (so residual bytes remain
+    // retrievable after LOGCTL stop).
+    output reg log_active,
+
+    // Logger ring FIFO read interface -- glue pops bytes here while
+    // serving a CMD_LOGPOLL response.
+    input wire log_fifo_data_available,
+    input wire [7:0] log_fifo_read_data,
+    output reg log_fifo_read_strobe,
 
     // TOCTOU trap interface
     // Structured log inputs (synchronized from SPI domain)
@@ -119,8 +128,20 @@ module glue(
         CMD_STOP         = 8'h35,  // Disable SPI emulation
         CMD_STATUS       = 8'h36,  // Query running state
         CMD_HOLDCTL      = 8'h37,  // Assert/release target flash #HOLD
-        CMD_LOGCTL       = 8'h38,  // Enable/disable SPI bus logging
-        CMD_TOCTOU       = 8'h39;  // TOCTOU trap management
+        CMD_LOGCTL       = 8'h38,  // Enable/disable SPI bus logging capture
+        CMD_TOCTOU       = 8'h39,  // TOCTOU trap management
+        CMD_LOGPOLL      = 8'h3A;  // Drain logger ring FIFO
+
+    // Terminator byte appended to every CMD_LOGPOLL response.  The
+    // logger never emits 0xA0 (all its packet type bytes are 0xA1-0xA4),
+    // so the host can unambiguously detect end-of-poll.
+    localparam LOG_POLL_TERMINATOR = 8'hA0;
+
+    // Max log bytes sent per poll.  Bounds response length so the host
+    // cannot be starved by a busy SPI master filling the FIFO faster
+    // than it can be drained.  Remaining data is delivered on the next
+    // poll.
+    localparam [7:0] LOG_POLL_MAX = 8'd255;
 
     localparam VERSION = 8'h05;  // Version 5: HOLDCTL + logging + TOCTOU
 
@@ -150,6 +171,13 @@ module glue(
     reg [2:0] write_state;
     reg [2:0] write_pos;
 
+    // CMD_LOGPOLL state machine.
+    //   log_poll_state 0 = idle
+    //                  1 = drain FIFO (send log bytes while available)
+    //                  2 = terminator (send 0xA0 and return to idle)
+    reg [1:0] log_poll_state;
+    reg [7:0] log_poll_remain;  // bytes still allowed before forced terminator
+
     reg txd_strobe_buf;
     reg [7:0] txd_data_buf;
     
@@ -172,7 +200,8 @@ module glue(
     // Latched when a command byte arrives while idle.
     reg active_port;
 
-    wire cmd_idle = (cmd == CMD_NOP) && (in_count == 0) && !read_state && !write_state;
+    wire cmd_idle = (cmd == CMD_NOP) && (in_count == 0) &&
+                    !read_state && !write_state && (log_poll_state == 0);
     wire mux_txd_ready = active_port ? ft_txd_ready : txd_ready;
 
     // Serial handler gate: only consume FIFO bytes when SPI is inactive.
@@ -194,7 +223,8 @@ module glue(
                                ((ft_rx_data == CMD_VERSION) ||
                                 (ft_rx_data == CMD_START)   ||
                                 (ft_rx_data == CMD_STOP)    ||
-                                (ft_rx_data == CMD_STATUS));
+                                (ft_rx_data == CMD_STATUS)  ||
+                                (ft_rx_data == CMD_LOGPOLL));
 
     // Hold flag: prevent double-consume from FIFO.  Set for 1 cycle
     // after popping a byte, cleared the next cycle.  Gives a 2-cycle
@@ -284,6 +314,10 @@ module glue(
             write_state <= 0;
             write_pos <= 0;
 
+            log_poll_state <= 0;
+            log_poll_remain <= 0;
+            log_fifo_read_strobe <= 0;
+
             sdram_access_cmd <= 0;
             sdram_inhibit_refresh <= 0;
 
@@ -363,6 +397,7 @@ module glue(
         end
         else begin
             txd_strobe_buf <= 0;
+            log_fifo_read_strobe <= 0;
 
             // TX pipeline cooldown
             if (txd_strobe_buf)
@@ -454,14 +489,10 @@ module glue(
             led[2] <= hold_out;                         // Target flash held
             led[0] <= heartbeat[25];                    // Heartbeat ~2Hz at 132MHz
             
-            // Log strobe handling -- only forward to UART (active_port=0).
-            // SPI noise can trigger spurious log bytes; sending them on
-            // FT245 would corrupt the binary command stream.
-            if (log_strobe_buf[1] && !log_ack && !active_port) begin
-                txd_strobe_buf <= 1;
-                txd_data_buf <= log_val;
-                log_ack <= 1;
-            end
+            // Legacy single-byte log_strobe/log_val path is superseded
+            // by the structured logger + CMD_LOGPOLL flow.  The acknowledge
+            // register is still shadowed so the input does not synthesize
+            // into a dangling always-block, but no bytes are forwarded.
             if (!log_strobe_buf[1]) log_ack <= 0;
             
             // -------------------------------------------------------
@@ -684,8 +715,49 @@ module glue(
                     // the FT2232H's occasional leaked modem-status bytes.
                     txd_data_buf <= spi_running ? 8'h01 : 8'h02;
                 end
+                CMD_LOGPOLL: begin
+                    // LOGPOLL: no argument bytes.  Enter drain state
+                    // machine which emits up to LOG_POLL_MAX bytes from
+                    // the logger FIFO followed by a 0xA0 terminator.
+                    // The state machine runs outside the SPI-gated
+                    // dispatcher so polls complete even while a flash
+                    // read is in progress on the SPI pins.
+                    cmd             <= CMD_LOGPOLL;
+                    log_poll_state  <= 2'd1;
+                    log_poll_remain <= LOG_POLL_MAX;
+                end
                 default: ;  // fall through to gated dispatcher below
                 endcase
+            end
+
+            // -----------------------------------------------------------
+            // CMD_LOGPOLL drain state machine (always runs, ungated).
+            //
+            // LOGPOLL only touches the logger FIFO and the host TX path,
+            // so it is safe to process even while the SPI master is
+            // actively hammering the bus.  Running ungated also means
+            // monitor tools can poll while logging real-time traffic.
+            //
+            //   State 1: pop one byte per TX slot while FIFO has data
+            //            and the per-poll cap has not been exhausted.
+            //   State 2: emit 0xA0 terminator and return to idle.
+            // -----------------------------------------------------------
+            if (log_poll_state == 2'd1 && can_send) begin
+                if (log_fifo_data_available && log_poll_remain != 0) begin
+                    txd_strobe_buf       <= 1;
+                    txd_data_buf         <= log_fifo_read_data;
+                    log_fifo_read_strobe <= 1;
+                    log_poll_remain      <= log_poll_remain - 1;
+                end
+                else begin
+                    log_poll_state <= 2'd2;
+                end
+            end
+            else if (log_poll_state == 2'd2 && can_send) begin
+                txd_strobe_buf <= 1;
+                txd_data_buf   <= LOG_POLL_TERMINATOR;
+                log_poll_state <= 2'd0;
+                cmd            <= CMD_NOP;
             end
 
             // -----------------------------------------------------------

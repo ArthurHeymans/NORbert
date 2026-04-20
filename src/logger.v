@@ -1,14 +1,19 @@
 // Logger Module
-// Captures SPI transaction events, formats log packets, and streams
-// them to the FT245 TX interface for real-time monitoring.
+// Captures SPI transaction events into a ring FIFO.  The FIFO is drained
+// by glue.v on CMD_LOGPOLL requests from the host, so the logger never
+// commandeers the UART or FT245 TX path -- logging coexists cleanly with
+// any protocol traffic on either transport.
 //
-// Log packet format (type byte 0xA0-0xAF to avoid collision with
-// normal protocol responses):
+// Log packet format (type byte 0xA0-0xAF to avoid collision with normal
+// protocol responses):
 //
 //   0xA1 <opcode>                                - SPI command decoded (2 bytes)
 //   0xA2 <addr3> <addr2> <addr1> <addr0>         - Address phase complete (5 bytes)
 //   0xA3 <count2> <count1> <count0>              - Transaction end + byte count (4 bytes)
 //   0xA4 <index> <addr3> <addr2> <addr1> <addr0> - TOCTOU trap triggered (6 bytes)
+//
+// Glue uses 0xA0 as the CMD_LOGPOLL terminator, which is NOT emitted by
+// this module, so the host can unambiguously parse the stream.
 //
 // SPI-domain inputs are synchronized internally via 3-FF synchronizers
 // with rising-edge detection.
@@ -33,10 +38,10 @@ module logger(
     input wire [1:0] trap_notify_index,
     input wire [23:0] trap_notify_addr,
 
-    // FT245 TX interface
-    input wire txd_ready,
-    output reg txd_strobe = 0,
-    output reg [7:0] txd_data = 0
+    // FIFO read interface (driven by glue CMD_LOGPOLL handler)
+    output wire out_data_available,
+    output wire [7:0] out_read_data,
+    input wire out_read_strobe
 );
 
     // -----------------------------------------------------------------
@@ -60,22 +65,19 @@ module logger(
     // Byte FIFO for log packet data
     // -----------------------------------------------------------------
     wire fifo_space;
-    wire fifo_data_available;
-    wire [7:0] fifo_read_data;
     reg fifo_write_strobe;
     reg [7:0] fifo_write_data;
-    reg fifo_read_strobe;
 
-    fifo #(.WIDTH(8), .NUM(256), .FREESPACE(8)) log_fifo(
+    fifo #(.WIDTH(8), .NUM(512), .FREESPACE(8)) log_fifo(
         .clk(clk),
         .reset(reset),
         .write_data(fifo_write_data),
         .write_strobe(fifo_write_strobe),
         .space_available(fifo_space),
-        .data_available(fifo_data_available),
+        .data_available(out_data_available),
         .more_available(),
-        .read_data(fifo_read_data),
-        .read_strobe(fifo_read_strobe)
+        .read_data(out_read_data),
+        .read_strobe(out_read_strobe)
     );
 
     // -----------------------------------------------------------------
@@ -186,34 +188,6 @@ module logger(
                         pkt_state <= PKT_IDLE;
                 end
             end
-        end
-    end
-
-    // -----------------------------------------------------------------
-    // FIFO drain: send buffered log bytes to FT245 TX
-    //
-    // Single-byte cadence: assert txd_strobe for 1 cycle, then wait
-    // for txd_ready before sending the next.  drain_hold prevents
-    // double-send during the ready propagation delay.
-    // -----------------------------------------------------------------
-    reg drain_hold;
-
-    always @(posedge clk) begin
-        txd_strobe      <= 0;
-        fifo_read_strobe <= 0;
-
-        if (reset) begin
-            drain_hold <= 0;
-        end
-        else if (enable && fifo_data_available && txd_ready && !drain_hold) begin
-            txd_strobe       <= 1;
-            txd_data         <= fifo_read_data;
-            fifo_read_strobe <= 1;
-            drain_hold       <= 1;
-        end
-        else begin
-            if (drain_hold)
-                drain_hold <= 0;
         end
     end
 

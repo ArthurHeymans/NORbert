@@ -39,8 +39,13 @@ const CMD_START: u8 = 0x34; // Enable SPI emulation (protocol v4+)
 const CMD_STOP: u8 = 0x35; // Disable SPI emulation (protocol v4+)
 const CMD_STATUS: u8 = 0x36; // Query emulation state (protocol v4+)
 const CMD_HOLDCTL: u8 = 0x37; // Target flash #HOLD control (protocol v5+)
-const CMD_LOGCTL: u8 = 0x38; // Enable/disable SPI bus logging (protocol v5+)
+const CMD_LOGCTL: u8 = 0x38; // Enable/disable SPI bus logging capture (protocol v5+)
 const CMD_TOCTOU: u8 = 0x39; // TOCTOU trap management (protocol v5+)
+const CMD_LOGPOLL: u8 = 0x3A; // Drain logger ring FIFO (protocol v5+)
+
+// CMD_LOGPOLL response terminator.  Everything the logger emits starts
+// with 0xA1-0xA4, so 0xA0 unambiguously signals end-of-poll.
+const LOG_POLL_TERMINATOR: u8 = 0xA0;
 
 // TOCTOU sub-commands
 const TOCTOU_SET: u8 = 0x01;
@@ -68,8 +73,6 @@ const FT2232H_PID: u16 = 0x6010;
 trait Transport {
     fn write_all(&mut self, data: &[u8]) -> Result<()>;
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
-    /// Read whatever is currently available (non-blocking, returns 0 if nothing).
-    fn read_available(&mut self, buf: &mut [u8]) -> Result<usize>;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,13 +175,6 @@ impl Transport for SerialTransport {
         self.port.read_exact(buf)?;
         Ok(())
     }
-
-    fn read_available(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.port.set_timeout(Duration::from_millis(10))?;
-        let n = self.port.read(buf).unwrap_or(0);
-        self.port.set_timeout(Duration::from_secs(2))?;
-        Ok(n)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,17 +265,6 @@ impl Transport for Ft245Transport {
             pos += n;
         }
         Ok(())
-    }
-
-    fn read_available(&mut self, buf: &mut [u8]) -> Result<usize> {
-        use libftd2xx::FtdiCommon;
-        let n = self.ft.queue_status().unwrap_or(0);
-        if n == 0 {
-            return Ok(0);
-        }
-        let to_read = std::cmp::min(n, buf.len());
-        let got = self.ft.read(&mut buf[..to_read])?;
-        Ok(got)
     }
 }
 
@@ -376,10 +361,6 @@ impl Transport for Ft245Transport {
             pos += n;
         }
         Ok(())
-    }
-
-    fn read_available(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.dev.read_data(buf).map_err(|e| anyhow!(e))
     }
 }
 
@@ -719,22 +700,50 @@ impl FlashDevice {
 
     fn log_start(&mut self) -> Result<()> {
         self.transport.write_all(&[CMD_LOGCTL, 0x01])?;
-        let mut resp = [0u8; 1];
-        self.transport.read_exact(&mut resp)?;
-        if resp[0] != 0x01 {
-            bail!("LOGCTL start failed: unexpected response 0x{:02x}", resp[0]);
+        let ack = self.read_ack("log start")?;
+        if ack != 0x01 {
+            bail!("LOGCTL start failed: unexpected response 0x{:02x}", ack);
         }
         Ok(())
     }
 
     fn log_stop(&mut self) -> Result<()> {
         self.transport.write_all(&[CMD_LOGCTL, 0x00])?;
-        let mut resp = [0u8; 1];
-        self.transport.read_exact(&mut resp)?;
-        if resp[0] != 0x01 {
-            bail!("LOGCTL stop failed: unexpected response 0x{:02x}", resp[0]);
+        let ack = self.read_ack("log stop")?;
+        if ack != 0x01 {
+            bail!("LOGCTL stop failed: unexpected response 0x{:02x}", ack);
         }
         Ok(())
+    }
+
+    /// Drain the logger ring FIFO in a single poll.
+    ///
+    /// Protocol (CMD_LOGPOLL = 0x3A):
+    ///   Host:  0x3A
+    ///   FPGA:  [log byte]* 0xA0
+    /// The response ends when 0xA0 is seen.  The FPGA caps each poll at
+    /// 255 data bytes; any remaining log data is picked up on the next
+    /// poll.
+    fn log_poll(&mut self) -> Result<Vec<u8>> {
+        self.transport.write_all(&[CMD_LOGPOLL])?;
+        let mut out = Vec::with_capacity(256);
+        loop {
+            let mut byte = [0u8; 1];
+            self.transport.read_exact(&mut byte)?;
+            if byte[0] == LOG_POLL_TERMINATOR {
+                return Ok(out);
+            }
+            out.push(byte[0]);
+            // Safety net: cap log poll responses so a misbehaving
+            // device cannot lock the tool in this loop.  Should never
+            // trip given the FPGA's LOG_POLL_MAX = 255 + terminator.
+            if out.len() > 1024 {
+                bail!(
+                    "log poll overran 1024 bytes without terminator; last byte 0x{:02x}",
+                    byte[0]
+                );
+            }
+        }
     }
 
     fn toctou_set(&mut self, index: u8, start: u32, mask: u32, replace: u32) -> Result<()> {
@@ -808,10 +817,6 @@ impl FlashDevice {
             );
         }
         Ok(())
-    }
-
-    fn read_log_bytes(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.transport.read_available(buf)
     }
 
     #[allow(dead_code)]
@@ -1808,20 +1813,22 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
     let mut double_reads: Vec<(u32, u8)> = Vec::new();
 
     // Log packet parser state
-    let mut buf = [0u8; 4096];
     let mut pending = Vec::new();
     let mut txn_count: u32 = 0;
     let mut current_opcode: u8 = 0;
     let mut current_addr: u32 = 0;
 
+    // Poll loop: ask the FPGA for log data every ~5ms.  Every poll
+    // response is self-delimited (ends with LOG_POLL_TERMINATOR) so
+    // there is no ambiguity between log bytes and protocol bytes.
     while running.load(Ordering::SeqCst) {
-        let n = device.read_log_bytes(&mut buf)?;
-        if n == 0 {
-            thread::sleep(Duration::from_millis(1));
+        let data = device.log_poll()?;
+        if data.is_empty() {
+            thread::sleep(Duration::from_millis(5));
             continue;
         }
 
-        pending.extend_from_slice(&buf[..n]);
+        pending.extend_from_slice(&data);
 
         // Parse complete packets from pending buffer
         let mut pos = 0;
@@ -1906,21 +1913,15 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
         pending.drain(..pos);
     }
 
-    // Stop logging
+    // Stop logging and drain any residual log bytes.  Since logging
+    // and protocol responses travel separately now (no mux), the stop
+    // ACK is guaranteed to be the *only* reply to CMD_LOGCTL.
     eprintln!("\nStopping...");
-
-    // Drain any remaining log data before sending stop command.
-    // The FT245 TX mux switches back to glue on log_stop, so we need
-    // to clear the FT2232H RX buffer first to avoid mixing log and ACK bytes.
-    thread::sleep(Duration::from_millis(10));
-    loop {
-        let n = device.read_log_bytes(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-    }
-
     device.log_stop()?;
+    let remaining = device.log_poll()?;
+    if !remaining.is_empty() {
+        eprintln!("(drained {} residual log bytes)", remaining.len());
+    }
 
     // Print TOCTOU summary
     if !double_reads.is_empty() {
