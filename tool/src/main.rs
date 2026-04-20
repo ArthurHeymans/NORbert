@@ -1097,9 +1097,18 @@ fn cmd_configure(cli: &Cli, chip_db_path: &str, chip_name: &str) -> Result<()> {
         );
     }
 
-    // Generate SFDP table
+    // Generate SFDP table.  For chips that do not support SFDP in real
+    // hardware (e.g. older SST25VFxxx), the table is all-0xFF so SFDP
+    // probes see no valid signature, matching the real part.
     let sfdp_table = sfdp::generate_sfdp(chip);
-    eprintln!("  SFDP table: {} bytes", sfdp_table.len());
+    if chip.supports_sfdp {
+        eprintln!("  SFDP table: {} bytes (valid)", sfdp_table.len());
+    } else {
+        eprintln!(
+            "  SFDP table: {} bytes (blank, chip does not support SFDP)",
+            sfdp_table.len()
+        );
+    }
 
     // Send to FPGA.  Must be stopped while CHIPCONFIG is processed,
     // otherwise spi_trx could read inconsistent cfg_* values mid-transfer.
