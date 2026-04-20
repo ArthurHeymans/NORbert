@@ -236,6 +236,7 @@ module spi_trx(
                 
                 if (reset_power) begin
                     status_reg[1:0] <= 2'b00;
+                    status_reg[6] <= 0;     // AAI bit
                     addr_4byte <= 0;
                     aai_active <= 0;
                     addr <= 0;
@@ -276,6 +277,7 @@ module spi_trx(
                     
                     CMD_WRITEDISABLE: begin
                         status_reg[1] <= 0;
+                        status_reg[6] <= 0;  // Clear AAI bit
                         aai_active <= 0;
                     end
                     
@@ -408,7 +410,16 @@ module spi_trx(
                     //   First:      0xAD + addr(3) + byte0 + byte1
                     //   Subsequent: 0xAD + byte0 + byte1
                     // Address auto-increments by 2. Mode persists across
-                    // CS cycles until WRDI (0x04).  A0 is forced to 0.
+                    // CS cycles until WRDI (0x04).  The host is expected
+                    // to send an even starting address per the SST spec;
+                    // A0 of the transmitted address is accepted as-is
+                    // (matches real SST chips which ignore A0 internally
+                    // because writes are word-aligned).
+                    //
+                    // SR bit 6 (AAI flag) is set on entry and cleared on
+                    // WRDI, matching the SST25VFxxx datasheet and what
+                    // flashprog's spi_prettyprint_status_register_sst25
+                    // reports.
                     CMD_AAI_WORD: begin
                         if (status_reg[1] || aai_active) begin
                             if (!aai_active) begin
@@ -418,6 +429,7 @@ module spi_trx(
                                 is_aai <= 1;
                                 write_len <= 0;
                                 aai_active <= 1;
+                                status_reg[6] <= 1;  // Set AAI bit
                             end else begin
                                 // Subsequent AAI: skip address, go to data
                                 state <= STA_AAI_DATA;
@@ -615,13 +627,16 @@ module spi_trx(
                     if (addr_count == 0) begin
                         if (is_aai) begin
                             // AAI: single-burst RMW, don't clear WEL
+                            // (address is word-aligned per SST spec;
+                            // A0 is shifted in below but only addr[25:3]
+                            // is used for write_addr, and addr[2:1] index
+                            // into the page buffer correctly).
                             state <= STA_AAI_DATA;
                             write_cmd <= 1;
                             write_type <= 2'd2;
                             write_addr <= addr[25:3];
                             write_len <= 0;
                             status_reg[0] <= 1;
-                            addr[0] <= 0;  // Force even alignment per SST spec
                         end else begin
                             state <= STA_WRITE;
                             write_cmd <= 1;
