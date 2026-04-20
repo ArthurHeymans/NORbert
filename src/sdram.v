@@ -410,6 +410,41 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
+                // Refresh sequence transitions.  Handled inside the main
+                // dispatcher (rather than a separate always-block hunk
+                // after it) so they take priority over any SPI fast-path
+                // or serial command dispatch that might otherwise fire in
+                // the same cycle.  If a post-dispatch hunk overrode the
+                // state back to REFRESH2, the command-side flags
+                // (spi_cmd_activate_ack / spi_activate_done) set by the
+                // overridden dispatch would persist, and the next
+                // cycle's READ would fire without a matching ACTIVATE --
+                // reading from a bank with no open row and returning all
+                // 0xff from the floating DQ bus for the rest of the SPI
+                // burst.
+                else if (state == STA_REFRESH) begin
+                    // Chip 0 refreshed, now refresh chip 1.
+                    state <= STA_REFRESH2;
+                    cmdtarget <= tRC;
+
+                    cs_o <= 1;       // Chip 1
+                    ras_o <= 0;
+                    cas_o <= 0;
+                    we_o <= 1;
+                    dqm_o <= 2'b11;
+
+                    refresh_chip <= 1;
+                end
+                else if (state == STA_REFRESH2) begin
+                    // Chip 1 refreshed, back to idle.
+                    refresh_chip <= 0;
+                    state <= STA_IDLE;
+                    cmdtarget <= 1;
+                    ras_o <= 1;
+                    cas_o <= 1;
+                    we_o <= 1;
+                    dqm_o <= 2'b11;
+                end
                 else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack) begin
                     // SPI fast-path activate
                     state <= STA_ACTIVATE;
@@ -524,30 +559,10 @@ module sdram(
                 end
             end
 
-            // After refresh completes, schedule refresh for the other chip
-            if (state == STA_REFRESH && cmdcount >= cmdtarget) begin
-                if (!refresh_chip) begin
-                    // Just refreshed chip 0, now refresh chip 1
-                    state <= STA_REFRESH2;
-                    cmdcount <= 1;
-                    cmdtarget <= tRC;
-                    
-                    cs_o <= 1;       // Chip 1
-                    ras_o <= 0;
-                    cas_o <= 0;
-                    we_o <= 1;
-                    dqm_o <= 2'b11;
-                    
-                    refresh_chip <= 1;
-                end
-                else begin
-                    refresh_chip <= 0;
-                end
-            end
-            
-            if (state == STA_REFRESH2 && cmdcount >= cmdtarget) begin
-                refresh_chip <= 0;
-            end
+            // REFRESH -> REFRESH2 -> IDLE transitions are now handled
+            // inside the main dispatcher (as STA_REFRESH / STA_REFRESH2
+            // cases) so they take priority over SPI and serial command
+            // dispatches in the same cycle.
             
             // Read data capture (de-interleave 16-bit data to 64-bit buffer)
             // Uses aux_clk-captured data (dq_captured) for reliable sampling.

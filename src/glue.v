@@ -7,6 +7,15 @@
 // Accepts bytes from EITHER UART or FT245.  When idle (no active command),
 // whichever port delivers a byte first becomes the "active port" for that
 // entire command.  Responses are routed back to the same port.
+//
+// SPI emulation is gated by `spi_running`, controlled by the START (0x34)
+// and STOP (0x35) serial commands.  At power-on/reset the FPGA starts in
+// STOPPED state, which means spi_trx is held in reset via top.v (so SPI
+// pin state never blocks serial traffic) and all serial commands are
+// accepted.  When RUNNING, only the always-safe commands (VERSION, START,
+// STOP, STATUS) are processed so the host can reach NORbert regardless of
+// what the emulated master is doing; destructive commands (RAMREAD,
+// RAMWRITE, CHIPCONFIG) are rejected until the host sends STOP.
 
 `default_nettype none
 
@@ -68,6 +77,12 @@ module glue(
     input wire [6:0] sfdp_raddr,
     output wire [7:0] sfdp_rdata,
     
+    // SPI emulation enable (1 = running, 0 = stopped).
+    // Exported to top.v which uses it to gate spi_reset feeding both
+    // spi_trx and back into this module -- so while stopped the SPI pins
+    // are ignored and serial commands always have a clear path.
+    output reg spi_running,
+
     output reg [7:0] led
 );
 
@@ -77,9 +92,12 @@ module glue(
         CMD_VERSION      = 8'h30,
         CMD_RAMREAD      = 8'h31,
         CMD_RAMWRITE     = 8'h32,
-        CMD_CHIPCONFIG   = 8'h33;
+        CMD_CHIPCONFIG   = 8'h33,
+        CMD_START        = 8'h34,  // Enable SPI emulation
+        CMD_STOP         = 8'h35,  // Disable SPI emulation
+        CMD_STATUS       = 8'h36;  // Query running state
 
-    localparam VERSION = 8'h03;  // Version 3: 16-bit burst length
+    localparam VERSION = 8'h04;  // Version 4: add START/STOP/STATUS
 
     reg [7:0] cmd;
     reg [7:0] in_count;
@@ -127,7 +145,23 @@ module glue(
     // Serial handler gate: only consume FIFO bytes when SPI is inactive.
     // This prevents popping bytes that the serial handler would ignore,
     // which is the root cause of the ACK corruption (0x00 instead of 0x01).
+    // When spi_running=0, top.v forces this module's spi_reset input high
+    // so this gate collapses to just !spi_writing (which is always 0 when
+    // stopped, since spi_trx is in reset and cannot initiate writes).
     wire serial_gate = (spi_reset || spi_csel_buf[1]) && !spi_writing;
+
+    // Always-safe command bypass: when the parser is idle and the next
+    // byte waiting in the FT245 RX FIFO is a VERSION/START/STOP/STATUS
+    // opcode, pop it even if serial_gate is closed (SPI master mid-
+    // transaction).  These commands do not touch SDRAM or spi_trx state
+    // and are handled in a separate dispatcher below, so letting them
+    // through while SPI is live is safe and guarantees the host can
+    // always reach the FPGA.
+    wire peek_is_always_safe = cmd_idle &&
+                               ((ft_rx_data == CMD_VERSION) ||
+                                (ft_rx_data == CMD_START)   ||
+                                (ft_rx_data == CMD_STOP)    ||
+                                (ft_rx_data == CMD_STATUS));
 
     // Hold flag: prevent double-consume from FIFO.  Set for 1 cycle
     // after popping a byte, cleared the next cycle.  Gives a 2-cycle
@@ -239,6 +273,11 @@ module glue(
             sfdp_wr_pos <= 0;
             cfg_sfdp_remaining <= 0;
 
+            // Start with SPI emulation STOPPED so the host can always
+            // reach the FPGA regardless of target-board state; the host
+            // tool sends START explicitly after loading firmware.
+            spi_running <= 0;
+
             for (i = 0; i < 256; i = i + 1)
                 i_spi_write_data[i][8] <= 0;
             
@@ -268,10 +307,17 @@ module glue(
             end
 
             // Pull-based RX mux: FT245 FIFO has priority over UART.
-            // Only pop from FIFO when the serial handler gate is open,
+            // Normally we only pop when the serial handler gate is open,
             // preventing byte loss during SPI CS noise or spi_writing.
+            // However, if the byte at the head of the FIFO is an always-
+            // safe command (VERSION/START/STOP/STATUS) AND the parser is
+            // idle, pop it anyway -- the always-safe dispatcher below can
+            // handle it without touching SDRAM or spi_trx state.  This is
+            // what lets the host issue STOP while SPI is actively being
+            // read, recovering control of the device.
             ft_rx_pop <= 0;
-            if (ft_rx_data_available && !ft_rx_hold && serial_gate) begin
+            if (ft_rx_data_available && !ft_rx_hold &&
+                (serial_gate || peek_is_always_safe)) begin
                 rxd_strobe_buf <= 1;
                 rxd_data_buf <= ft_rx_data;
                 ft_rx_pop <= 1;
@@ -432,32 +478,81 @@ module glue(
                 serial_idle_count <= 0;
             end
             
-            // Serial protocol handling
+            // -----------------------------------------------------------
+            // Always-safe command dispatcher.
+            //
+            // Handles VERSION/START/STOP/STATUS regardless of SPI state.
+            // None of these touch SDRAM, chip configuration, or spi_trx
+            // state, so processing them while SPI emulation is live is
+            // safe -- and is exactly what lets the host recover control
+            // (via STOP) when a target is hammering the SPI bus.  The
+            // parser must be idle (cmd_idle) so we do not collide with
+            // an in-progress multi-byte command.
+            // -----------------------------------------------------------
+            if (rxd_strobe_buf && cmd_idle) begin
+                case (rxd_data_buf)
+                CMD_VERSION: begin
+                    txd_strobe_buf <= 1;
+                    txd_data_buf <= VERSION;
+                end
+                CMD_START: begin
+                    spi_running <= 1;
+                    txd_strobe_buf <= 1;
+                    txd_data_buf <= 8'h01;
+                end
+                CMD_STOP: begin
+                    spi_running <= 0;
+                    txd_strobe_buf <= 1;
+                    txd_data_buf <= 8'h01;
+                end
+                CMD_STATUS: begin
+                    txd_strobe_buf <= 1;
+                    // 0x01 = running, 0x02 = stopped.  Using two non-zero
+                    // codes (rather than 0x00 for stopped) lets the host
+                    // tool's transparent 0x00 skipping still work around
+                    // the FT2232H's occasional leaked modem-status bytes.
+                    txd_data_buf <= spi_running ? 8'h01 : 8'h02;
+                end
+                default: ;  // fall through to gated dispatcher below
+                endcase
+            end
+
+            // -----------------------------------------------------------
+            // Gated command dispatcher.
+            //
+            // Handles RAMREAD/RAMWRITE/CHIPCONFIG (which touch SDRAM or
+            // chip config) plus all multi-byte continuations and the
+            // serial SDRAM read/write state machines.  Gated on SPI bus
+            // idle so we never race with an in-flight SPI transaction,
+            // and initial commands are additionally gated on !spi_running
+            // so the host cannot accidentally disturb live emulation.
+            // -----------------------------------------------------------
             if ((spi_reset || spi_csel_buf[1]) && !spi_writing) begin
                 
                 if (rxd_strobe_buf) begin
                     serial_idle_count <= 0;
 
                     if (in_count == 0) begin
-                        if (rxd_data_buf == CMD_VERSION) begin
-                            txd_strobe_buf <= 1;
-                            txd_data_buf <= VERSION;
-                            in_count <= 0;
-                        end
-                        else if (rxd_data_buf == CMD_RAMREAD ||
-                                 rxd_data_buf == CMD_RAMWRITE) begin
-                            cmd <= rxd_data_buf;
-                            in_count <= 1;
+                        // VERSION/START/STOP/STATUS are handled above.
+                        // Destructive commands are only accepted when
+                        // SPI emulation is stopped (spi_trx is in reset
+                        // and cannot contend for SDRAM or cfg registers).
+                        if (!spi_running) begin
+                            if (rxd_data_buf == CMD_RAMREAD ||
+                                rxd_data_buf == CMD_RAMWRITE) begin
+                                cmd <= rxd_data_buf;
+                                in_count <= 1;
 
-                            read_state <= 0;
-                            read_pos <= 0;
+                                read_state <= 0;
+                                read_pos <= 0;
 
-                            write_state <= 0;
-                            write_pos <= 0;
-                        end
-                        else if (rxd_data_buf == CMD_CHIPCONFIG) begin
-                            cmd <= CMD_CHIPCONFIG;
-                            in_count <= 1;
+                                write_state <= 0;
+                                write_pos <= 0;
+                            end
+                            else if (rxd_data_buf == CMD_CHIPCONFIG) begin
+                                cmd <= CMD_CHIPCONFIG;
+                                in_count <= 1;
+                            end
                         end
                     end
                     else if (cmd == CMD_CHIPCONFIG) begin
