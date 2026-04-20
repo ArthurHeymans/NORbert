@@ -13,6 +13,9 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 - **Pipelined prefetch**: SDRAM reads are issued during SPI address/dummy phases so data is ready on the first clock edge
 - **2 Mbaud UART** interface for loading and dumping images from a host PC
 - **FT245 asynchronous FIFO** via FT2232H for faster bulk transfers (requires one-time EEPROM configuration)
+- **SPI bus logging**: real-time command/address/byte-count packets drained over either transport via a 512-byte ring FIFO (`monitor` subcommand)
+- **TOCTOU traps**: four independent address-match entries that transparently redirect reads to a different SDRAM location on the second access, for exercising verify-then-use flows
+- **Target flash #HOLD control**: drive IO3 low to silence a real flash chip sharing the SPI bus
 
 ## Hardware
 
@@ -63,8 +66,9 @@ Load a firmware image into NORbert's SDRAM, then let your target SPI master read
 ```
 # Check connection
 spi-flash-tool version
+spi-flash-tool status       # running | stopped
 
-# Load a firmware image
+# Load a firmware image (auto stops + starts emulation around the load)
 spi-flash-tool load firmware.bin
 
 # Load with verification
@@ -79,13 +83,66 @@ spi-flash-tool read 0x0 0x100
 # Configure chip identity (uses rflasher chip database)
 spi-flash-tool configure W25Q128JV --chips-dir ~/src/rflasher/chips/vendors
 
+# Gate SPI emulation explicitly (the dance above does this automatically)
+spi-flash-tool start
+spi-flash-tool stop
+
 # List available serial ports
 spi-flash-tool ports
 ```
 
 The `configure` command loads a chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database and sends the JEDEC ID, size, and a generated SFDP table to the FPGA. The chip name is matched by substring, so `W25Q128` is enough if it's unambiguous. Without configuration, NORbert defaults to Winbond W25Q64FV.
 
+At power-on the FPGA boots in the STOPPED state -- the SPI pins are held in reset and the host can always reach the tool, regardless of what the target board is doing. `load` automatically stops emulation, writes the image, and starts it again. Use `start`/`stop`/`status` for manual control.
+
 Use `-p /dev/ttyUSBx` if your device isn't on the default `/dev/ttyUSB0`.
+
+### SPI bus monitoring
+
+`monitor` streams decoded SPI activity from NORbert in real time. It works over either UART or FT245 and is safe to run while the target is actively reading:
+
+```
+spi-flash-tool monitor
+```
+
+Example output while flashprog reads a 4 KB region:
+
+```
+TXN#   COMMAND            ADDRESS    INFO
+------------------------------------------------------------
+1      0x9F READ_JEDEC_ID
+2      0x05 READ_STATUS
+3      0x05 READ_STATUS
+4      0xBB DUAL_IO_READ  0x001000
+       end: 4097 bytes from 0x001000
+```
+
+The monitor also tracks double-reads of the same (opcode, address) pair and flags them as TOCTOU candidates. Press Ctrl+C to stop. The underlying protocol is a poll-based ring-buffer drain (`CMD_LOGPOLL` = 0x3A); packet types are `0xA1` (command), `0xA2` (address), `0xA3` (end + byte count) and `0xA4` (TOCTOU trap fired), with `0xA0` as the per-poll terminator.
+
+### TOCTOU traps
+
+Four independent trap entries redirect matching reads to a different SDRAM location on the second (and subsequent) access. The first matching read is let through unchanged -- it arms the trap. The first 8 bytes of the redirected read come from the original address because the SDRAM prefetch pipeline fires before the trap check completes; bytes 8+ come from the replacement.
+
+```
+# Configure: any read in 0x001000-0x001FFF gets redirected to 0x101000-0x101FFF
+spi-flash-tool toctou set 1 0x001000 0xFFF000 0x101000
+spi-flash-tool toctou arm 1
+
+# First target read of 0x001000 returns the original data.
+# Second target read of 0x001000 returns the replacement data.
+
+# Clear the triggered flag so the next read is "first" again:
+spi-flash-tool toctou reset 1
+
+# Tear everything down:
+spi-flash-tool toctou reset-all
+```
+
+Arguments to `toctou set` are `<index 0..3> <start-address> <match-mask> <replace-base>`, all as byte addresses. 1-bits in the mask must match exactly; 0-bits are don't-care. The replacement preserves the "don't-care" bits of the original address.
+
+### Target flash #HOLD
+
+When NORbert shares a SPI bus with a real flash chip, `hold on` drives IO3 low continuously, asserting `#HOLD` on the target flash so it tristates and ignores all commands. `hold off` releases it. Mutually exclusive with quad I/O because IO3 is shared.
 
 ### FT245 transport (FT2232H)
 
@@ -166,20 +223,56 @@ commands (0xBB, 0xEB) use fewer SPI clocks for the address, leaving less headroo
 
 ```
 src/
-  top.v        Top-level module, clock/reset, bus wiring
+  top.v        Top-level module, clock/reset, bus wiring, TOCTOU address mux
   spi_trx.v    SPI flash transceiver (command decoder + data path)
   sdram.v      Dual-chip SDRAM controller with interleaved storage
-  glue.v       Protocol handler, UART/FT245 mux, SPI write engine, LED control
+  glue.v       Protocol handler, UART/FT245 I/O, SPI write engine, TOCTOU trap engine, LOGPOLL state machine, LED control
+  logger.v     SPI event capture into a 512-byte ring FIFO drained by CMD_LOGPOLL
   uart.v       UART TX/RX (2 Mbaud)
   ft245.v      FT2232H async 245 FIFO interface
   fifo.v       Synchronous FIFO (first-word-fall-through)
   util.v       Clock divider, PWM, synchronizers
   pll.v        PLL: 50MHz -> 120MHz with phase-shifted outputs
 tool/
-  src/main.rs  Host-side CLI (Rust) for loading/dumping over UART or FT245
+  src/main.rs  Host-side CLI (Rust) for loading/dumping/monitoring/TOCTOU over UART or FT245
   src/chip.rs  Chip definition loading from rflasher RON database
   src/sfdp.rs  SFDP/BFPT table generation from chip definitions
 ```
+
+## Serial protocol
+
+All opcodes reply with a single `0x01` ACK unless otherwise noted. The FPGA
+accepts command bytes from whichever port (UART or FT245) first delivers one
+while the parser is idle, and routes the response back to the same port.
+
+| Opcode | Name       | Args                                                | Reply                            |
+|--------|------------|-----------------------------------------------------|----------------------------------|
+| `0x30` | VERSION    | none                                                | 1 byte (current: `0x04`)         |
+| `0x31` | RAMREAD    | 3-byte burst addr + 2-byte burst count              | `count*8` data bytes             |
+| `0x32` | RAMWRITE   | 3-byte burst addr + 2-byte burst count + data       | `0x01`                           |
+| `0x33` | CHIPCONFIG | JEDEC(3) + flags + erase_bursts(3) + sfdp_len + sfdp| `0x01`                           |
+| `0x34` | START      | none -- enable SPI emulation                        | `0x01`                           |
+| `0x35` | STOP       | none -- hold spi_trx in reset                       | `0x01`                           |
+| `0x36` | STATUS     | none                                                | `0x01` running / `0x02` stopped  |
+| `0x37` | HOLDCTL    | 1 byte: `0x01` assert, `0x00` release               | `0x01`                           |
+| `0x38` | LOGCTL     | 1 byte: `0x01` start capture, `0x00` stop capture   | `0x01`                           |
+| `0x39` | TOCTOU     | sub-command + args (see below)                      | `0x01`                           |
+| `0x3A` | LOGPOLL    | none                                                | log bytes terminated by `0xA0`   |
+
+TOCTOU sub-commands (all prefixed with opcode `0x39`):
+
+| Sub    | Name      | Args                                                 |
+|--------|-----------|------------------------------------------------------|
+| `0x01` | SET       | index + start(3) + mask(3) + replace(3), all big-endian |
+| `0x02` | ARM       | index                                                |
+| `0x03` | DISARM    | index                                                |
+| `0x04` | RESET     | index -- clear triggered flag                        |
+| `0x05` | RESET_ALL | none -- disarm + clear all four                      |
+
+RAMREAD/RAMWRITE/CHIPCONFIG are only accepted while emulation is stopped, to
+avoid racing the SPI fast path on SDRAM. The other commands are always safe to
+issue and bypass the SPI-idle gate so the host can reach the tool even while a
+target is hammering the bus.
 
 ## Acknowledgments
 
