@@ -15,6 +15,7 @@ VERILOG_FILES = \
 	src/uart.v \
 	src/ft245.v \
 	src/fifo.v \
+	src/logger.v \
 	src/util.v \
 	src/pll.v
 

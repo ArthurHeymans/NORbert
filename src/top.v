@@ -240,6 +240,13 @@ module top(
     wire log_strobe;
     wire [7:0] log_val;
     
+    // Structured logging signals (SPI clock domain)
+    wire log_cmd_valid;
+    wire [7:0] log_cmd_opcode;
+    wire log_addr_valid;
+    wire [31:0] log_addr_out;
+    wire [23:0] log_byte_count;
+    
     // Chip configuration wires (glue -> spi_trx)
     wire [23:0] cfg_jedec_id;
     wire cfg_4byte;
@@ -297,8 +304,57 @@ module top(
         .sfdp_rdata(sfdp_rdata),
         
         .log_strobe(log_strobe),
-        .log_val(log_val)
+        .log_val(log_val),
+        
+        .log_cmd_valid(log_cmd_valid),
+        .log_cmd_opcode(log_cmd_opcode),
+        .log_addr_valid(log_addr_valid),
+        .log_addr_out(log_addr_out),
+        .log_byte_count(log_byte_count)
     );
+    
+    // -----------------------------------------------------------
+    // Logging signal synchronization (SPI -> system clock domain)
+    //
+    // The glue module needs synchronized versions of log_addr_valid
+    // and spi_active to perform TOCTOU trap checks.  spi_trx signals
+    // are in the SPI clock domain; these 2-FF synchronizers bring
+    // them into the system clock domain with edge detection in glue.
+    // -----------------------------------------------------------
+    
+    reg [1:0] log_addr_valid_sys;
+    reg [1:0] spi_active_sys;
+    reg [31:0] log_addr_latched;
+    
+    always @(posedge clk) begin
+        log_addr_valid_sys <= {log_addr_valid_sys[0], log_addr_valid};
+        spi_active_sys     <= {spi_active_sys[0], spi_active};
+        // Latch addr when valid fires (stable for multiple sys clocks)
+        if (log_addr_valid && !log_addr_valid_sys[0])
+            log_addr_latched <= log_addr_out;
+    end
+    
+    // -----------------------------------------------------------
+    // TOCTOU Address Redirect Mux
+    //
+    // Transparently transforms the SPI SDRAM address when a TOCTOU
+    // trap is active.  The redirect uses a bitwise mux controlled
+    // by the trap mask:
+    //   new_addr = (redirect_base & redirect_mask) |
+    //              (original_addr & ~redirect_mask)
+    //
+    // The first 8 bytes of a redirected read use the original
+    // address (the SDRAM pipeline fires before the trap check
+    // completes).  All subsequent bursts use the redirected address.
+    // -----------------------------------------------------------
+    
+    wire redirect_active;
+    wire [22:0] redirect_mask;
+    wire [22:0] redirect_base;
+    
+    wire [22:0] spi_ram_addr_final = redirect_active ?
+        ((redirect_base & redirect_mask) | (spi_ram_addr & ~redirect_mask)) :
+        spi_ram_addr;
     
     // -----------------------------------------------------------
     // SDRAM Controller
@@ -327,11 +383,11 @@ module top(
         .dqm_o(sdram_dqm),
         .dq_io(IO_sdram_dq),
         
-        // SPI fast-path control
+        // SPI fast-path control (address passes through TOCTOU redirect mux)
         .spi_inhibit_refresh(spi_ram_inhibit_refresh),
         .spi_cmd_activate(spi_ram_activate),
         .spi_cmd_read(spi_ram_read),
-        .spi_addr(spi_ram_addr),
+        .spi_addr(spi_ram_addr_final),
         
         // Serial path control
         .access_cmd(sdram_access_cmd),
@@ -350,8 +406,6 @@ module top(
     // -----------------------------------------------------------
     
     wire uart_txd_ready;
-    wire [7:0] uart_txd;
-    wire uart_txd_strobe;
     wire uart_rxd_strobe;
     wire [7:0] uart_rxd;
     
@@ -359,6 +413,8 @@ module top(
     // DIVISOR must be divisible by 4 (uart_rx uses DIVISOR/4 for 4x oversampling)
     // Note: 3 Mbaud (DIVISOR=40) is achievable at 120MHz but the Sipeed
     // BL702 USB debugger on the dock can't sustain it for multi-byte reads.
+    wire [7:0] uart_txd;
+    wire uart_txd_strobe;
     uart #(
         .DIVISOR(60),
         .FIFO(256),
@@ -378,13 +434,13 @@ module top(
     // -----------------------------------------------------------
     // FT245 Interface (FT2232H async FIFO)
     // -----------------------------------------------------------
-    
+
     wire ft_txd_ready;
     wire [7:0] ft_txd;
     wire ft_txd_strobe;
     wire ft_rxd_strobe_raw;
     wire [7:0] ft_rxd_raw;
-    
+
     ft245 ft245_i(
         .clk(clk),
         .reset(reset),
@@ -398,6 +454,46 @@ module top(
         .txd(ft_txd),
         .txd_strobe(ft_txd_strobe),
         .txd_ready(ft_txd_ready)
+    );
+    
+    // -----------------------------------------------------------
+    // Logger Module
+    //
+    // The logger captures SPI transaction events into its internal 512-
+    // byte ring FIFO.  Glue drains the FIFO on CMD_LOGPOLL requests from
+    // the host, so logging never commandeers the UART or FT245 TX path
+    // and coexists cleanly with any other protocol traffic on either
+    // transport (no active-port mux is needed).
+    // -----------------------------------------------------------
+
+    wire log_active;
+    wire trap_notify_strobe;
+    wire [1:0] trap_notify_index;
+    wire [23:0] trap_notify_addr;
+
+    wire log_fifo_data_available;
+    wire [7:0] log_fifo_read_data;
+    wire log_fifo_read_strobe;
+
+    logger logger_i(
+        .clk(clk),
+        .reset(reset),
+        .enable(log_active),
+
+        .spi_log_cmd_valid(log_cmd_valid),
+        .spi_log_cmd_opcode(log_cmd_opcode),
+        .spi_log_addr_valid(log_addr_valid),
+        .spi_log_addr(log_addr_out),
+        .spi_active(spi_active),
+        .spi_log_byte_count(log_byte_count),
+
+        .trap_notify_strobe(trap_notify_strobe),
+        .trap_notify_index(trap_notify_index),
+        .trap_notify_addr(trap_notify_addr),
+
+        .out_data_available(log_fifo_data_available),
+        .out_read_data(log_fifo_read_data),
+        .out_read_strobe(log_fifo_read_strobe)
     );
     
     // -----------------------------------------------------------
@@ -445,16 +541,16 @@ module top(
         // UART byte interface
         .rxd_strobe(uart_rxd_strobe),
         .rxd_data(uart_rxd),
-        
+
         .txd_ready(uart_txd_ready),
         .txd_strobe(uart_txd_strobe),
         .txd_data(uart_txd),
-        
+
         // FT245 byte interface (pull-based via RX FIFO)
         .ft_rx_data_available(ft_rxfifo_data_available),
         .ft_rx_data(ft_rxfifo_data),
         .ft_rx_pop(ft_rx_pop),
-        
+
         .ft_txd_ready(ft_txd_ready),
         .ft_txd_strobe(ft_txd_strobe),
         .ft_txd_data(ft_txd),
@@ -494,6 +590,26 @@ module top(
         
         .spi_running(spi_running),
         .hold_out(hold_out),
+
+        .log_active(log_active),
+
+        // Logger FIFO read interface (drained on CMD_LOGPOLL)
+        .log_fifo_data_available(log_fifo_data_available),
+        .log_fifo_read_data(log_fifo_read_data),
+        .log_fifo_read_strobe(log_fifo_read_strobe),
+
+
+        .log_addr_valid_sync(log_addr_valid_sys[1]),
+        .log_addr_sync(log_addr_latched[23:0]),
+        .spi_active_sync(spi_active_sys[1]),
+
+        .redirect_active(redirect_active),
+        .redirect_mask(redirect_mask),
+        .redirect_base(redirect_base),
+
+        .trap_notify_strobe(trap_notify_strobe),
+        .trap_notify_index(trap_notify_index),
+        .trap_notify_addr(trap_notify_addr),
 
         .led(led_out)
     );

@@ -86,6 +86,34 @@ module glue(
     // Target flash HOLD control (active high: 1 = assert #HOLD on target)
     output reg hold_out,
 
+    // Logging control: 1 = logger captures SPI events into the ring
+    // FIFO; 0 = logger ignores events.  The host drains the FIFO via
+    // CMD_LOGPOLL regardless of this flag (so residual bytes remain
+    // retrievable after LOGCTL stop).
+    output reg log_active,
+
+    // Logger ring FIFO read interface -- glue pops bytes here while
+    // serving a CMD_LOGPOLL response.
+    input wire log_fifo_data_available,
+    input wire [7:0] log_fifo_read_data,
+    output reg log_fifo_read_strobe,
+
+    // TOCTOU trap interface
+    // Structured log inputs (synchronized from SPI domain)
+    input wire log_addr_valid_sync, // Pulse: address phase complete (system clock)
+    input wire [23:0] log_addr_sync,// Flash byte address (latched when valid)
+    input wire spi_active_sync,     // SPI CS active (synchronized)
+
+    // TOCTOU redirect outputs (directly to address mux in top.v)
+    output reg redirect_active,
+    output reg [22:0] redirect_mask,    // Burst address mask bits
+    output reg [22:0] redirect_base,    // Burst address replacement base
+
+    // TOCTOU trap notification (to logger)
+    output reg trap_notify_strobe,
+    output reg [1:0] trap_notify_index,
+    output reg [23:0] trap_notify_addr,
+
     output reg [7:0] led
 );
 
@@ -99,9 +127,31 @@ module glue(
         CMD_START        = 8'h34,  // Enable SPI emulation
         CMD_STOP         = 8'h35,  // Disable SPI emulation
         CMD_STATUS       = 8'h36,  // Query running state
-        CMD_HOLDCTL      = 8'h37;  // Assert/release target flash #HOLD
+        CMD_HOLDCTL      = 8'h37,  // Assert/release target flash #HOLD
+        CMD_LOGCTL       = 8'h38,  // Enable/disable SPI bus logging capture
+        CMD_TOCTOU       = 8'h39,  // TOCTOU trap management
+        CMD_LOGPOLL      = 8'h3A;  // Drain logger ring FIFO
 
-    localparam VERSION = 8'h05;  // Version 5: add HOLDCTL
+    // Terminator byte appended to every CMD_LOGPOLL response.  The
+    // logger never emits 0xA0 (all its packet type bytes are 0xA1-0xA4),
+    // so the host can unambiguously detect end-of-poll.
+    localparam LOG_POLL_TERMINATOR = 8'hA0;
+
+    // Max log bytes sent per poll.  Bounds response length so the host
+    // cannot be starved by a busy SPI master filling the FIFO faster
+    // than it can be drained.  Remaining data is delivered on the next
+    // poll.
+    localparam [7:0] LOG_POLL_MAX = 8'd255;
+
+    localparam VERSION = 8'h05;  // Version 5: HOLDCTL + logging + TOCTOU
+
+    // TOCTOU sub-commands
+    localparam
+        TOCTOU_SET       = 8'h01,
+        TOCTOU_ARM       = 8'h02,
+        TOCTOU_DISARM    = 8'h03,
+        TOCTOU_RESET     = 8'h04,
+        TOCTOU_RESET_ALL = 8'h05;
 
     reg [7:0] cmd;
     reg [7:0] in_count;
@@ -120,6 +170,13 @@ module glue(
 
     reg [2:0] write_state;
     reg [2:0] write_pos;
+
+    // CMD_LOGPOLL state machine.
+    //   log_poll_state 0 = idle
+    //                  1 = drain FIFO (send log bytes while available)
+    //                  2 = terminator (send 0xA0 and return to idle)
+    reg [1:0] log_poll_state;
+    reg [7:0] log_poll_remain;  // bytes still allowed before forced terminator
 
     reg txd_strobe_buf;
     reg [7:0] txd_data_buf;
@@ -143,7 +200,8 @@ module glue(
     // Latched when a command byte arrives while idle.
     reg active_port;
 
-    wire cmd_idle = (cmd == CMD_NOP) && (in_count == 0) && !read_state && !write_state;
+    wire cmd_idle = (cmd == CMD_NOP) && (in_count == 0) &&
+                    !read_state && !write_state && (log_poll_state == 0);
     wire mux_txd_ready = active_port ? ft_txd_ready : txd_ready;
 
     // Serial handler gate: only consume FIFO bytes when SPI is inactive.
@@ -165,7 +223,8 @@ module glue(
                                ((ft_rx_data == CMD_VERSION) ||
                                 (ft_rx_data == CMD_START)   ||
                                 (ft_rx_data == CMD_STOP)    ||
-                                (ft_rx_data == CMD_STATUS));
+                                (ft_rx_data == CMD_STATUS)  ||
+                                (ft_rx_data == CMD_LOGPOLL));
 
     // Hold flag: prevent double-consume from FIFO.  Set for 1 cycle
     // after popping a byte, cleared the next cycle.  Gives a 2-cycle
@@ -213,6 +272,26 @@ module glue(
     reg [6:0] sfdp_wr_pos;
     reg [6:0] cfg_sfdp_remaining;
     
+    // TOCTOU trap table (4 entries)
+    reg [23:0] trap_start [0:3];     // Byte address match value
+    reg [23:0] trap_mask  [0:3];     // Byte address mask (1 = must match)
+    reg [23:0] trap_replace [0:3];   // Byte address replacement base
+    reg [3:0]  trap_armed;           // Trap is active
+    reg [3:0]  trap_triggered;       // First read has occurred, next read redirects
+    
+    // TOCTOU command parsing state
+    reg [7:0]  toctou_sub_cmd;
+    reg [1:0]  toctou_index;
+    reg [23:0] toctou_start_buf;
+    reg [23:0] toctou_mask_buf;
+    
+    // TOCTOU address check: detect rising edge of log_addr_valid_sync
+    reg log_addr_valid_prev;
+    wire log_addr_event = log_addr_valid_sync && !log_addr_valid_prev;
+    
+    // SPI active edge detection for redirect clear
+    reg spi_active_prev;
+    
     // Convert 23-bit burst address to 25-bit access_addr for SDRAM controller
     // Burst address: [22]=chip, [21:9]=row, [8:7]=bank, [6:0]=col_burst
     // Access addr:   [24]=chip, [23:11]=row, [10:9]=bank, [8:0]=col
@@ -234,6 +313,10 @@ module glue(
 
             write_state <= 0;
             write_pos <= 0;
+
+            log_poll_state <= 0;
+            log_poll_remain <= 0;
+            log_fifo_read_strobe <= 0;
 
             sdram_access_cmd <= 0;
             sdram_inhibit_refresh <= 0;
@@ -272,6 +355,20 @@ module glue(
             write_buffer <= 0;
             
             hold_out <= 0;
+            log_active <= 0;
+            
+            redirect_active <= 0;
+            redirect_mask <= 0;
+            redirect_base <= 0;
+            trap_notify_strobe <= 0;
+            
+            trap_armed <= 0;
+            trap_triggered <= 0;
+            toctou_sub_cmd <= 0;
+            toctou_index <= 0;
+            
+            log_addr_valid_prev <= 0;
+            spi_active_prev <= 0;
             
             cfg_jedec_id <= {8'h17, 8'h40, 8'hEF};  // Default: W25Q64FV (EF 40 17)
             cfg_4byte <= 0;
@@ -287,6 +384,12 @@ module glue(
             for (i = 0; i < 256; i = i + 1)
                 i_spi_write_data[i][8] <= 0;
             
+            for (i = 0; i < 4; i = i + 1) begin
+                trap_start[i] <= 0;
+                trap_mask[i] <= 0;
+                trap_replace[i] <= 0;
+            end
+            
             tx_wait <= 0;
 
             for (i = 0; i < 128; i = i + 1)
@@ -294,6 +397,7 @@ module glue(
         end
         else begin
             txd_strobe_buf <= 0;
+            log_fifo_read_strobe <= 0;
 
             // TX pipeline cooldown
             if (txd_strobe_buf)
@@ -385,15 +489,54 @@ module glue(
             led[2] <= hold_out;                         // Target flash held
             led[0] <= heartbeat[25];                    // Heartbeat ~2Hz at 132MHz
             
-            // Log strobe handling -- only forward to UART (active_port=0).
-            // SPI noise can trigger spurious log bytes; sending them on
-            // FT245 would corrupt the binary command stream.
-            if (log_strobe_buf[1] && !log_ack && !active_port) begin
-                txd_strobe_buf <= 1;
-                txd_data_buf <= log_val;
-                log_ack <= 1;
-            end
+            // Legacy single-byte log_strobe/log_val path is superseded
+            // by the structured logger + CMD_LOGPOLL flow.  The acknowledge
+            // register is still shadowed so the input does not synthesize
+            // into a dangling always-block, but no bytes are forwarded.
             if (!log_strobe_buf[1]) log_ack <= 0;
+            
+            // -------------------------------------------------------
+            // TOCTOU trap check: on address phase completion, compare
+            // against all 4 trap entries.  First match wins.
+            //
+            // - Armed && !Triggered: mark triggered (serve original data)
+            // - Armed && Triggered:  activate redirect (serve replacement)
+            // -------------------------------------------------------
+            log_addr_valid_prev <= log_addr_valid_sync;
+            spi_active_prev <= spi_active_sync;
+            trap_notify_strobe <= 0;
+            
+            if (log_addr_event) begin
+                // Check read commands only (opcodes 0x03, 0x0B, 0x0C, 0x13,
+                // 0x3B, 0x6B, 0xBB, 0xEB and SFDP 0x5A).
+                // We check all traps; the address comparison handles filtering.
+                for (i = 0; i < 4; i = i + 1) begin
+                    if (trap_armed[i] &&
+                        ((log_addr_sync & trap_mask[i]) ==
+                         (trap_start[i] & trap_mask[i]))) begin
+                        if (!trap_triggered[i]) begin
+                            // First access: mark triggered, serve original data
+                            trap_triggered[i] <= 1;
+                        end
+                        else begin
+                            // Second+ access: activate redirect
+                            redirect_active <= 1;
+                            redirect_mask <= trap_mask[i][23:3];
+                            // Compute replacement burst addr via bitwise mux:
+                            // new_burst = (replace & mask) | (original & ~mask)
+                            redirect_base <= trap_replace[i][23:3];
+                            
+                            trap_notify_strobe <= 1;
+                            trap_notify_index  <= i[1:0];
+                            trap_notify_addr   <= log_addr_sync;
+                        end
+                    end
+                end
+            end
+            
+            // Clear redirect when SPI transaction ends (CS deasserts)
+            if (spi_active_prev && !spi_active_sync)
+                redirect_active <= 0;
                 
             // SPI write buffer handling
             spi_write_buf_strobe_buf <= {spi_write_buf_strobe_buf[0], spi_write_buf_strobe};
@@ -572,8 +715,49 @@ module glue(
                     // the FT2232H's occasional leaked modem-status bytes.
                     txd_data_buf <= spi_running ? 8'h01 : 8'h02;
                 end
+                CMD_LOGPOLL: begin
+                    // LOGPOLL: no argument bytes.  Enter drain state
+                    // machine which emits up to LOG_POLL_MAX bytes from
+                    // the logger FIFO followed by a 0xA0 terminator.
+                    // The state machine runs outside the SPI-gated
+                    // dispatcher so polls complete even while a flash
+                    // read is in progress on the SPI pins.
+                    cmd             <= CMD_LOGPOLL;
+                    log_poll_state  <= 2'd1;
+                    log_poll_remain <= LOG_POLL_MAX;
+                end
                 default: ;  // fall through to gated dispatcher below
                 endcase
+            end
+
+            // -----------------------------------------------------------
+            // CMD_LOGPOLL drain state machine (always runs, ungated).
+            //
+            // LOGPOLL only touches the logger FIFO and the host TX path,
+            // so it is safe to process even while the SPI master is
+            // actively hammering the bus.  Running ungated also means
+            // monitor tools can poll while logging real-time traffic.
+            //
+            //   State 1: pop one byte per TX slot while FIFO has data
+            //            and the per-poll cap has not been exhausted.
+            //   State 2: emit 0xA0 terminator and return to idle.
+            // -----------------------------------------------------------
+            if (log_poll_state == 2'd1 && can_send) begin
+                if (log_fifo_data_available && log_poll_remain != 0) begin
+                    txd_strobe_buf       <= 1;
+                    txd_data_buf         <= log_fifo_read_data;
+                    log_fifo_read_strobe <= 1;
+                    log_poll_remain      <= log_poll_remain - 1;
+                end
+                else begin
+                    log_poll_state <= 2'd2;
+                end
+            end
+            else if (log_poll_state == 2'd2 && can_send) begin
+                txd_strobe_buf <= 1;
+                txd_data_buf   <= LOG_POLL_TERMINATOR;
+                log_poll_state <= 2'd0;
+                cmd            <= CMD_NOP;
             end
 
             // -----------------------------------------------------------
@@ -593,10 +777,25 @@ module glue(
 
                     if (in_count == 0) begin
                         // VERSION/START/STOP/STATUS are handled above.
-                        // Destructive commands are only accepted when
-                        // SPI emulation is stopped (spi_trx is in reset
-                        // and cannot contend for SDRAM or cfg registers).
-                        if (!spi_running) begin
+                        // HOLDCTL/LOGCTL/TOCTOU only flip flags/GPIO and
+                        // do not touch SDRAM or spi_trx state, so they
+                        // are safe to accept in either spi_running state.
+                        // Destructive commands (RAMREAD/RAMWRITE/CHIPCONFIG)
+                        // are only accepted when SPI emulation is stopped
+                        // so they cannot contend for SDRAM or cfg registers.
+                        if (rxd_data_buf == CMD_HOLDCTL) begin
+                            cmd <= CMD_HOLDCTL;
+                            in_count <= 1;
+                        end
+                        else if (rxd_data_buf == CMD_LOGCTL) begin
+                            cmd <= CMD_LOGCTL;
+                            in_count <= 1;
+                        end
+                        else if (rxd_data_buf == CMD_TOCTOU) begin
+                            cmd <= CMD_TOCTOU;
+                            in_count <= 1;
+                        end
+                        else if (!spi_running) begin
                             if (rxd_data_buf == CMD_RAMREAD ||
                                 rxd_data_buf == CMD_RAMWRITE) begin
                                 cmd <= rxd_data_buf;
@@ -612,13 +811,6 @@ module glue(
                                 cmd <= CMD_CHIPCONFIG;
                                 in_count <= 1;
                             end
-                        end
-                        // HOLDCTL toggles a simple GPIO on the target flash
-                        // and does not touch SDRAM or spi_trx state, so it
-                        // is accepted regardless of spi_running.
-                        if (rxd_data_buf == CMD_HOLDCTL) begin
-                            cmd <= CMD_HOLDCTL;
-                            in_count <= 1;
                         end
                     end
                     else if (cmd == CMD_CHIPCONFIG) begin
@@ -698,6 +890,92 @@ module glue(
                         txd_data_buf <= 8'h01;
                         in_count <= 0;
                         cmd <= CMD_NOP;
+                    end
+                    else if (cmd == CMD_LOGCTL) begin
+                        // -----------------------------------------------
+                        // LOGCTL protocol:
+                        //   Byte 1: 0x01 = start logging, 0x00 = stop
+                        // Response: 0x01
+                        // -----------------------------------------------
+                        log_active <= rxd_data_buf[0];
+                        txd_strobe_buf <= 1;
+                        txd_data_buf <= 8'h01;
+                        in_count <= 0;
+                        cmd <= CMD_NOP;
+                    end
+                    else if (cmd == CMD_TOCTOU) begin
+                        // -----------------------------------------------
+                        // TOCTOU protocol:
+                        //   Byte 1: sub-command
+                        //     0x01 SET:  +index(1) +start(3) +mask(3) +replace(3)
+                        //     0x02 ARM:  +index(1)
+                        //     0x03 DISARM: +index(1)
+                        //     0x04 RESET:  +index(1)
+                        //     0x05 RESET_ALL: (no extra bytes)
+                        // Response: 0x01 on completion
+                        // -----------------------------------------------
+                        if (in_count == 1) begin
+                            toctou_sub_cmd <= rxd_data_buf;
+                            if (rxd_data_buf == TOCTOU_RESET_ALL) begin
+                                trap_armed <= 0;
+                                trap_triggered <= 0;
+                                redirect_active <= 0;
+                                txd_strobe_buf <= 1;
+                                txd_data_buf <= 8'h01;
+                                in_count <= 0;
+                                cmd <= CMD_NOP;
+                            end
+                            else
+                                in_count <= 2;
+                        end
+                        else if (in_count == 2) begin
+                            toctou_index <= rxd_data_buf[1:0];
+                            if (toctou_sub_cmd == TOCTOU_ARM) begin
+                                trap_armed[rxd_data_buf[1:0]] <= 1;
+                                txd_strobe_buf <= 1;
+                                txd_data_buf <= 8'h01;
+                                in_count <= 0;
+                                cmd <= CMD_NOP;
+                            end
+                            else if (toctou_sub_cmd == TOCTOU_DISARM) begin
+                                trap_armed[rxd_data_buf[1:0]] <= 0;
+                                txd_strobe_buf <= 1;
+                                txd_data_buf <= 8'h01;
+                                in_count <= 0;
+                                cmd <= CMD_NOP;
+                            end
+                            else if (toctou_sub_cmd == TOCTOU_RESET) begin
+                                trap_triggered[rxd_data_buf[1:0]] <= 0;
+                                txd_strobe_buf <= 1;
+                                txd_data_buf <= 8'h01;
+                                in_count <= 0;
+                                cmd <= CMD_NOP;
+                            end
+                            else
+                                in_count <= 3;
+                        end
+                        // TOCTOU SET: receive start(3), mask(3), replace(3)
+                        else if (in_count == 3)  begin toctou_start_buf[23:16] <= rxd_data_buf; in_count <= 4; end
+                        else if (in_count == 4)  begin toctou_start_buf[15:8]  <= rxd_data_buf; in_count <= 5; end
+                        else if (in_count == 5)  begin toctou_start_buf[7:0]   <= rxd_data_buf; in_count <= 6; end
+                        else if (in_count == 6)  begin toctou_mask_buf[23:16]  <= rxd_data_buf; in_count <= 7; end
+                        else if (in_count == 7)  begin toctou_mask_buf[15:8]   <= rxd_data_buf; in_count <= 8; end
+                        else if (in_count == 8)  begin toctou_mask_buf[7:0]    <= rxd_data_buf; in_count <= 9; end
+                        else if (in_count == 9)  begin
+                            trap_start[toctou_index] <= toctou_start_buf;
+                            trap_mask[toctou_index]  <= toctou_mask_buf;
+                            trap_replace[toctou_index][23:16] <= rxd_data_buf;
+                            in_count <= 10;
+                        end
+                        else if (in_count == 10) begin trap_replace[toctou_index][15:8] <= rxd_data_buf; in_count <= 11; end
+                        else if (in_count == 11) begin
+                            trap_replace[toctou_index][7:0] <= rxd_data_buf;
+                            trap_triggered[toctou_index] <= 0;
+                            txd_strobe_buf <= 1;
+                            txd_data_buf <= 8'h01;
+                            in_count <= 0;
+                            cmd <= CMD_NOP;
+                        end
                     end
                     else begin
                         // RAMREAD / RAMWRITE handling (v3: 6-byte header)
