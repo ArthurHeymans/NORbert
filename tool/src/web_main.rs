@@ -3,13 +3,13 @@
 #![allow(deprecated, unused_unsafe)]
 
 use eframe::egui;
-use spi_flash_tool::chip::{find_chip_by_name, load_chip_db_from_ron_strings, FlashChip};
+use spi_flash_tool::chip::{find_chip_by_name, load_embedded_chip_db, FlashChip};
 use spi_flash_tool::gowin::{self, FlashOptions, ProgramProgress};
 use spi_flash_tool::protocol::{
     self, format_log_event, format_log_summary, hexdump, parse_hex_bytes, parse_u32, LogParser,
     BAUD_RATE, BLOCK_SIZE, CMD_LOGPOLL, CMD_START, CMD_STATUS, CMD_STOP, CMD_VERSION,
-    LOG_POLL_TERMINATOR, PROTOCOL_VERSION, TOCTOU_ARM, TOCTOU_DISARM, TOCTOU_RESET,
-    TOCTOU_RESET_ALL, UART_READ_BLOCK_SIZE,
+    LOG_POLL_ESCAPE, LOG_POLL_TERMINATOR, PROTOCOL_VERSION, TOCTOU_ARM, TOCTOU_DISARM,
+    TOCTOU_RESET, TOCTOU_RESET_ALL, UART_READ_BLOCK_SIZE,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -21,8 +21,6 @@ use web_sys::{
     ReadableStreamGetReaderOptions, ReadableStreamReaderMode, Response, SerialOptions, SerialPort,
     WritableStreamDefaultWriter,
 };
-
-include!(concat!(env!("OUT_DIR"), "/embedded_chip_db.rs"));
 
 #[wasm_bindgen]
 extern "C" {
@@ -319,10 +317,19 @@ impl FlashDevice {
         loop {
             let mut byte = [0u8; 1];
             self.transport.read_exact(&mut byte).await?;
-            if byte[0] == LOG_POLL_TERMINATOR {
-                return Ok(out);
+            match byte[0] {
+                LOG_POLL_TERMINATOR => return Ok(out),
+                LOG_POLL_ESCAPE => {
+                    let mut code = [0u8; 1];
+                    self.transport.read_exact(&mut code).await?;
+                    match code[0] {
+                        0x00 => out.push(LOG_POLL_TERMINATOR),
+                        0x05 => out.push(LOG_POLL_ESCAPE),
+                        other => return Err(format!("LOGPOLL: invalid escape code 0x{other:02x}")),
+                    }
+                }
+                b => out.push(b),
             }
-            out.push(byte[0]);
             if out.len() > 1024 {
                 return Err("log poll overran 1024 bytes without terminator".to_string());
             }
@@ -426,8 +433,7 @@ pub struct NorbertApp {
 
 impl NorbertApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let chips =
-            load_chip_db_from_ron_strings(EMBEDDED_CHIP_RON.iter().copied()).unwrap_or_default();
+        let chips = load_embedded_chip_db();
         Self {
             shared: Rc::new(RefCell::new(SharedState::default())),
             chips,
