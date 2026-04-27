@@ -7,7 +7,7 @@ use serialport::SerialPort;
 use spi_flash_tool::{chip, protocol::*, sfdp};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 #[cfg(any(feature = "d2xx", feature = "ftdi"))]
@@ -702,7 +702,7 @@ impl FlashDevice {
         let mut addr = address;
         let mut offset = 0;
 
-        let total_blocks = (padded.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let total_blocks = padded.len().div_ceil(BLOCK_SIZE);
         let mut block_num = 0;
         while offset < padded.len() {
             let chunk_len = std::cmp::min(BLOCK_SIZE, padded.len() - offset);
@@ -1060,7 +1060,7 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
 
         let mut addr = address;
         let mut offset = 0;
-        let total_blocks = (padded.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let total_blocks = padded.len().div_ceil(BLOCK_SIZE);
         let mut block_num = 0;
 
         while offset < padded.len() {
@@ -1137,15 +1137,15 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
     })
 }
 
-fn cmd_dump(cli: &Cli, file: &PathBuf, address: u32, length: u32) -> Result<()> {
-    cmd_read(cli, address, length, Some(file.clone()))
+fn cmd_dump(cli: &Cli, file: &Path, address: u32, length: u32) -> Result<()> {
+    cmd_read(cli, address, length, Some(file.to_path_buf()))
 }
 
 fn cmd_configure(cli: &Cli, chip_db_path: &str, chip_name: &str) -> Result<()> {
     // Expand ~ in path
-    let expanded = if chip_db_path.starts_with("~/") {
+    let expanded = if let Some(stripped) = chip_db_path.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        format!("{}/{}", home, &chip_db_path[2..])
+        format!("{home}/{stripped}")
     } else {
         chip_db_path.to_string()
     };
@@ -1615,10 +1615,7 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
 
     device.log_start()?;
     eprintln!("Logging started. Press Ctrl+C to stop.\n");
-    eprintln!(
-        "{:<6} {:<18} {:<10} {}",
-        "TXN#", "COMMAND", "ADDRESS", "INFO"
-    );
+    eprintln!("{:<6} {:<18} {:<10} INFO", "TXN#", "COMMAND", "ADDRESS");
     eprintln!("{}", "-".repeat(60));
 
     let mut parser = LogParser::default();

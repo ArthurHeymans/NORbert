@@ -2,7 +2,7 @@ name: Deploy WebUI to GitHub Pages
 
 on:
   push:
-    branches: [main, master, webui]
+    branches: [main, master]
   workflow_dispatch:
 
 permissions: read-all
@@ -34,6 +34,10 @@ jobs:
         run: trunk build --release
       - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
       - uses: DeterminateSystems/magic-nix-cache-action@87b14cf437d03d37989d87f0fa5ce4f5dc1a330b # v8
+      - name: Allow bubblewrap user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
       - name: Build FPGA bitstream
         run: nix develop --command make build
       - name: Add bitstream to Pages bundle
