@@ -59,7 +59,7 @@ module glue(
     input wire [1:0] spi_write_type,  // 00=page program, 01=erase, 10=AAI RMW
     input wire [22:0] spi_write_addr,   // 23-bit burst address
     input wire [22:0] spi_write_len,
-    output reg spi_write_done,
+    output reg spi_write_done,   // Toggles once per completed write/erase
     
     input wire spi_write_buf_strobe,
     input wire [7:0] spi_write_buf_offset,
@@ -132,10 +132,12 @@ module glue(
         CMD_TOCTOU       = 8'h39,  // TOCTOU trap management
         CMD_LOGPOLL      = 8'h3A;  // Drain logger ring FIFO
 
-    // Terminator byte appended to every CMD_LOGPOLL response.  The
-    // logger never emits 0xA0 (all its packet type bytes are 0xA1-0xA4),
-    // so the host can unambiguously detect end-of-poll.
+    // Terminator byte appended to every CMD_LOGPOLL response.  Log data
+    // bytes equal to the terminator or escape byte are byte-stuffed as
+    // 0xA5 0x00 (for 0xA0) or 0xA5 0x05 (for 0xA5), so the terminator is
+    // unambiguous even when raw packet payloads contain 0xA0.
     localparam LOG_POLL_TERMINATOR = 8'hA0;
+    localparam LOG_POLL_ESCAPE     = 8'hA5;
 
     // Max log bytes sent per poll.  Bounds response length so the host
     // cannot be starved by a busy SPI master filling the FIFO faster
@@ -173,10 +175,12 @@ module glue(
 
     // CMD_LOGPOLL state machine.
     //   log_poll_state 0 = idle
-    //                  1 = drain FIFO (send log bytes while available)
+    //                  1 = drain FIFO (send/escape log bytes while available)
     //                  2 = terminator (send 0xA0 and return to idle)
+    //                  3 = escaped byte payload
     reg [1:0] log_poll_state;
-    reg [7:0] log_poll_remain;  // bytes still allowed before forced terminator
+    reg [7:0] log_poll_remain;       // raw log bytes still allowed before terminator
+    reg [7:0] log_poll_escape_code;  // second byte after LOG_POLL_ESCAPE
 
     reg txd_strobe_buf;
     reg [7:0] txd_data_buf;
@@ -270,7 +274,7 @@ module glue(
     
     // CHIPCONFIG state
     reg [6:0] sfdp_wr_pos;
-    reg [6:0] cfg_sfdp_remaining;
+    reg [7:0] cfg_sfdp_remaining;
     
     // TOCTOU trap table (4 entries)
     reg [23:0] trap_start [0:3];     // Byte address match value
@@ -316,6 +320,7 @@ module glue(
 
             log_poll_state <= 0;
             log_poll_remain <= 0;
+            log_poll_escape_code <= 0;
             log_fifo_read_strobe <= 0;
 
             sdram_access_cmd <= 0;
@@ -566,7 +571,7 @@ module glue(
                 
                 i_spi_write_type <= spi_write_type;
                 case (spi_write_type)
-                    2'd0: i_spi_write_state <= 0;  // Page program: prepare data
+                    2'd0: i_spi_write_state <= 6;  // Page program: read-modify-write bursts
                     2'd1: i_spi_write_state <= 2;  // Erase: activate for write
                     2'd2: i_spi_write_state <= 6;  // AAI: read-modify-write
                     default: i_spi_write_state <= 0;
@@ -574,7 +579,6 @@ module glue(
                 
                 addr <= spi_write_addr;
                 i_spi_len <= spi_write_len;
-                spi_write_done <= 0;
                 
                 if (spi_write_type == 2'd1)
                     write_buffer <= 64'hFFFFFFFFFFFFFFFF;
@@ -583,11 +587,10 @@ module glue(
             // SPI write state machine
             if (spi_writing && !sdram_busy) begin
                 if (i_spi_write_state == 0) begin
-                    // Page program: prepare data from page buffer
-                    for (i = 0; i < 8; i = i + 1) begin
-                        write_buffer[i*8 +: 8] <= i_spi_write_data[{addr[4:0], 3'b000} + i][7:0];
-                    end
-                    i_spi_write_state <= 1;
+                    // Legacy direct page-program state is no longer used.
+                    // Page program now uses the RMW path (states 6-8) so
+                    // partial programs preserve untouched bytes.
+                    i_spi_write_state <= 6;
                 end
                 else if (i_spi_write_state == 1) begin
                     i_spi_write_state <= 2;
@@ -610,7 +613,7 @@ module glue(
                 end
                 else if (i_spi_write_state == 4) begin
                     case (i_spi_write_type)
-                        2'd0: i_spi_write_state <= 0;  // Page program: next burst
+                        2'd0: i_spi_write_state <= 6;  // Page program: next RMW burst
                         2'd1: i_spi_write_state <= 2;  // Erase: next burst
                         default: i_spi_write_state <= 0;
                     endcase
@@ -619,22 +622,24 @@ module glue(
                 end
                 else if (i_spi_write_state == 5) begin
                     spi_writing <= 0;
-                    spi_write_done <= 1;
+                    spi_write_done <= !spi_write_done;
                     
-                    // Clear page buffer write flags after AAI so the next
-                    // AAI word starts with a clean flag state.
-                    if (i_spi_write_type == 2'd2) begin
+                    // Clear page buffer write flags after SPI-originated
+                    // programs so the next program starts with a clean flag
+                    // state and cannot reuse stale bytes.
+                    if (i_spi_write_type == 2'd0 || i_spi_write_type == 2'd2) begin
                         for (i = 0; i < 256; i = i + 1)
                             i_spi_write_data[i][8] <= 0;
                     end
                 end
                 // ---------------------------------------------------------
-                // AAI Read-Modify-Write (write_type == 2)
+                // SPI program Read-Modify-Write (page program or AAI).
                 //
-                // Writes exactly 2 bytes into a single 8-byte SDRAM burst
-                // without corrupting the other 6 bytes.  Uses the page
-                // buffer write flags (bit 8) to select which bytes come
-                // from the page buffer and which are preserved from SDRAM.
+                // Page program writes a full 256-byte page window but only
+                // updates bytes whose write flags were set by the SPI data
+                // phase. AAI writes exactly the flagged bytes in one burst.
+                // Programmed bytes are merged as old & new to preserve NOR
+                // flash semantics (program can clear bits, not set them).
                 //
                 // State 6: Activate row for read
                 // State 7: Issue SDRAM read command
@@ -656,7 +661,7 @@ module glue(
                     // data if its write flag is set, otherwise keep SDRAM data.
                     for (i = 0; i < 8; i = i + 1) begin
                         if (i_spi_write_data[{addr[4:0], 3'b000} + i][8])
-                            write_buffer[i*8 +: 8] <= i_spi_write_data[{addr[4:0], 3'b000} + i][7:0];
+                            write_buffer[i*8 +: 8] <= sdram_read_buffer[i*8 +: 8] & i_spi_write_data[{addr[4:0], 3'b000} + i][7:0];
                         else
                             write_buffer[i*8 +: 8] <= sdram_read_buffer[i*8 +: 8];
                     end
@@ -738,16 +743,31 @@ module glue(
             // actively hammering the bus.  Running ungated also means
             // monitor tools can poll while logging real-time traffic.
             //
-            //   State 1: pop one byte per TX slot while FIFO has data
-            //            and the per-poll cap has not been exhausted.
+            //   State 1: pop one raw byte per TX slot while FIFO has data
+            //            and the per-poll cap has not been exhausted.  If
+            //            the raw byte collides with framing, send ESCAPE
+            //            now and state 3 sends the escape code next.
             //   State 2: emit 0xA0 terminator and return to idle.
+            //   State 3: emit second byte of an escaped raw log byte.
             // -----------------------------------------------------------
             if (log_poll_state == 2'd1 && can_send) begin
                 if (log_fifo_data_available && log_poll_remain != 0) begin
                     txd_strobe_buf       <= 1;
-                    txd_data_buf         <= log_fifo_read_data;
                     log_fifo_read_strobe <= 1;
                     log_poll_remain      <= log_poll_remain - 1;
+                    if (log_fifo_read_data == LOG_POLL_TERMINATOR) begin
+                        txd_data_buf         <= LOG_POLL_ESCAPE;
+                        log_poll_escape_code <= 8'h00;
+                        log_poll_state       <= 2'd3;
+                    end
+                    else if (log_fifo_read_data == LOG_POLL_ESCAPE) begin
+                        txd_data_buf         <= LOG_POLL_ESCAPE;
+                        log_poll_escape_code <= 8'h05;
+                        log_poll_state       <= 2'd3;
+                    end
+                    else begin
+                        txd_data_buf <= log_fifo_read_data;
+                    end
                 end
                 else begin
                     log_poll_state <= 2'd2;
@@ -758,6 +778,11 @@ module glue(
                 txd_data_buf   <= LOG_POLL_TERMINATOR;
                 log_poll_state <= 2'd0;
                 cmd            <= CMD_NOP;
+            end
+            else if (log_poll_state == 2'd3 && can_send) begin
+                txd_strobe_buf <= 1;
+                txd_data_buf   <= log_poll_escape_code;
+                log_poll_state <= 2'd1;
             end
 
             // -----------------------------------------------------------
@@ -845,7 +870,7 @@ module glue(
                         else if (in_count == 8'd7)
                             cfg_chip_erase_bursts[7:0] <= rxd_data_buf;
                         else if (in_count == 8'd8) begin
-                            cfg_sfdp_remaining <= rxd_data_buf[6:0];
+                            cfg_sfdp_remaining <= rxd_data_buf;
                             sfdp_wr_pos <= 0;
                         end
                         // SFDP data bytes
@@ -856,14 +881,14 @@ module glue(
                         end
                         
                         // Advance or finish
-                        if (in_count == 8'd8 && rxd_data_buf[6:0] == 0) begin
+                        if (in_count == 8'd8 && rxd_data_buf == 0) begin
                             // No SFDP data, done immediately
                             txd_strobe_buf <= 1;
                             txd_data_buf <= 8'h01;
                             in_count <= 0;
                             cmd <= CMD_NOP;
                         end
-                        else if (in_count > 8'd8 && cfg_sfdp_remaining == 7'd1) begin
+                        else if (in_count > 8'd8 && cfg_sfdp_remaining == 8'd1) begin
                             // Last SFDP byte received, done
                             txd_strobe_buf <= 1;
                             txd_data_buf <= 8'h01;
