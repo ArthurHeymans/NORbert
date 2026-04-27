@@ -1,10 +1,10 @@
-mod chip;
-mod sfdp;
-
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "ftdi")]
+use ftdi_usb as ftdi;
 use indicatif::{ProgressBar, ProgressStyle};
 use serialport::SerialPort;
+use spi_flash_tool::{chip, protocol::*, sfdp};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -12,56 +12,6 @@ use std::thread;
 use std::time::Duration;
 #[cfg(any(feature = "d2xx", feature = "ftdi"))]
 use std::time::Instant;
-
-const BAUD_RATE: u32 = 2_000_000;
-// Max bursts per command: 16-bit len field (v3), 8 bytes per burst.
-// 64KB blocks are unreliable -- the FPGA loses a byte during sustained
-// 8192-burst writes (likely a glue/SDRAM timing race under refresh
-// pressure).  16KB is the largest size that passes 10/10 stress tests.
-const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
-
-// UART read block size: must be smaller than BLOCK_SIZE because the
-// glue module inhibits SDRAM refresh for the entire serial-path read
-// duration.  At 2Mbaud (~200KB/s), a 16KB read takes ~82ms -- exceeding
-// the SDRAM's 64ms refresh window and risking data loss.  4KB takes
-// ~20ms, well within budget.  Writes are unaffected (data flows
-// host-to-FPGA, SDRAM writes complete in microseconds).
-const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
-const SDRAM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
-
-const PROTOCOL_VERSION: u8 = 5;
-
-// Protocol commands (shared between UART and FT245 transports)
-const CMD_VERSION: u8 = 0x30;
-const CMD_READ: u8 = 0x31;
-const CMD_WRITE: u8 = 0x32;
-const CMD_CHIPCONFIG: u8 = 0x33;
-const CMD_START: u8 = 0x34; // Enable SPI emulation (protocol v4+)
-const CMD_STOP: u8 = 0x35; // Disable SPI emulation (protocol v4+)
-const CMD_STATUS: u8 = 0x36; // Query emulation state (protocol v4+)
-const CMD_HOLDCTL: u8 = 0x37; // Target flash #HOLD control (protocol v5+)
-const CMD_LOGCTL: u8 = 0x38; // Enable/disable SPI bus logging capture (protocol v5+)
-const CMD_TOCTOU: u8 = 0x39; // TOCTOU trap management (protocol v5+)
-const CMD_LOGPOLL: u8 = 0x3A; // Drain logger ring FIFO (protocol v5+)
-
-// CMD_LOGPOLL framing. Raw log bytes equal to 0xA0 or 0xA5 are escaped
-// by the FPGA as 0xA5 0x00 or 0xA5 0x05 respectively, leaving 0xA0 as an
-// unambiguous end-of-poll marker.
-const LOG_POLL_TERMINATOR: u8 = 0xA0;
-const LOG_POLL_ESCAPE: u8 = 0xA5;
-
-// TOCTOU sub-commands
-const TOCTOU_SET: u8 = 0x01;
-const TOCTOU_ARM: u8 = 0x02;
-const TOCTOU_DISARM: u8 = 0x03;
-const TOCTOU_RESET: u8 = 0x04;
-const TOCTOU_RESET_ALL: u8 = 0x05;
-
-// Log packet type markers
-const LOG_CMD: u8 = 0xA1;
-const LOG_ADDR: u8 = 0xA2;
-const LOG_END: u8 = 0xA3;
-const LOG_TRAP: u8 = 0xA4;
 
 // FT2232H USB identifiers
 #[cfg(any(feature = "d2xx", feature = "ftdi"))]
@@ -275,12 +225,12 @@ impl Transport for Ft245Transport {
 // FT245 transport -- rs-ftdi backend (pure Rust, nusb)
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "ftdi", not(feature = "d2xx")))]
+#[cfg(feature = "ftdi")]
 struct Ft245Transport {
     dev: ftdi::FtdiDevice,
 }
 
-#[cfg(all(feature = "ftdi", not(feature = "d2xx")))]
+#[cfg(feature = "ftdi")]
 impl Ft245Transport {
     fn open(serial: Option<&str>) -> Result<Self> {
         // Open the FT2232H Channel A.  The EEPROM must already be
@@ -340,7 +290,7 @@ impl Ft245Transport {
     }
 }
 
-#[cfg(all(feature = "ftdi", not(feature = "d2xx")))]
+#[cfg(feature = "ftdi")]
 impl Transport for Ft245Transport {
     fn write_all(&mut self, data: &[u8]) -> Result<()> {
         self.dev.write_all(data).map_err(|e| anyhow!(e))?;
@@ -374,22 +324,6 @@ impl Transport for Ft245Transport {
 struct FlashDevice {
     transport: Box<dyn Transport>,
     read_block_size: usize,
-}
-
-fn validate_sdram_range(address: u32, length: usize, what: &str) -> Result<()> {
-    let end = (address as u64)
-        .checked_add(length as u64)
-        .with_context(|| format!("{} range overflows address arithmetic", what))?;
-    if end > SDRAM_SIZE_BYTES {
-        bail!(
-            "{} range 0x{:08x}..0x{:08x} exceeds {} MiB SDRAM backing store",
-            what,
-            address,
-            end,
-            SDRAM_SIZE_BYTES / (1024 * 1024)
-        );
-    }
-    Ok(())
 }
 
 impl FlashDevice {
@@ -533,31 +467,7 @@ impl FlashDevice {
     }
 
     fn read_block(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
-        if length == 0 || length > BLOCK_SIZE {
-            bail!("Invalid length: must be 1-{}", BLOCK_SIZE);
-        }
-        if address % 8 != 0 {
-            bail!("Address must be 8-byte aligned");
-        }
-        if length % 8 != 0 {
-            bail!("Length must be a multiple of 8");
-        }
-
-        validate_sdram_range(address, length, "read")?;
-
-        let addr_units = address / 8;
-        let len_units = length / 8;
-
-        // v3 header: cmd + 3 addr bytes + 2 len bytes (big-endian)
-        let cmd = [
-            CMD_READ,
-            ((addr_units >> 16) & 0xFF) as u8,
-            ((addr_units >> 8) & 0xFF) as u8,
-            (addr_units & 0xFF) as u8,
-            ((len_units >> 8) & 0xFF) as u8,
-            (len_units & 0xFF) as u8,
-        ];
-
+        let cmd = read_command(address, length).map_err(anyhow::Error::msg)?;
         self.transport.write_all(&cmd)?;
 
         let mut buf = vec![0u8; length];
@@ -566,34 +476,7 @@ impl FlashDevice {
     }
 
     fn write_block(&mut self, address: u32, data: &[u8]) -> Result<()> {
-        if data.is_empty() || data.len() > BLOCK_SIZE {
-            bail!("Invalid data length: must be 1-{}", BLOCK_SIZE);
-        }
-        if address % 8 != 0 {
-            bail!("Address must be 8-byte aligned");
-        }
-        if data.len() % 8 != 0 {
-            bail!("Data length must be a multiple of 8");
-        }
-
-        validate_sdram_range(address, data.len(), "write")?;
-
-        let addr_units = address / 8;
-        let len_units = data.len() / 8;
-
-        // Combine header and data into a single write to avoid
-        // transfer gaps that could trigger the FPGA's idle timeout.
-        // v3 header: cmd + 3 addr bytes + 2 len bytes (big-endian)
-        let mut buf = Vec::with_capacity(6 + data.len());
-        buf.extend_from_slice(&[
-            CMD_WRITE,
-            ((addr_units >> 16) & 0xFF) as u8,
-            ((addr_units >> 8) & 0xFF) as u8,
-            (addr_units & 0xFF) as u8,
-            ((len_units >> 8) & 0xFF) as u8,
-            (len_units & 0xFF) as u8,
-        ]);
-        buf.extend_from_slice(data);
+        let buf = write_command(address, data).map_err(anyhow::Error::msg)?;
         self.transport.write_all(&buf)?;
 
         // Wait for completion byte (read_ack skips leaked FT2232H 0x00s).
@@ -655,35 +538,8 @@ impl FlashDevice {
     ///   Byte 9+:   SFDP table data
     ///
     /// Response: 0x01 on success.
-    fn send_chip_config(&mut self, chip: &chip::FlashChip, sfdp_table: &[u8]) -> Result<()> {
-        let jedec = chip.jedec_id_bytes();
-        let erase_bursts = chip.chip_erase_bursts();
-        let flags: u8 = if chip.supports_4byte { 0x01 } else { 0x00 };
-
-        let sfdp_len = sfdp_table.len();
-        if sfdp_len > 128 {
-            bail!("SFDP table too large: {} bytes (max 128)", sfdp_len);
-        }
-        if chip.total_size as u64 > SDRAM_SIZE_BYTES {
-            bail!(
-                "chip size {} bytes exceeds {} MiB SDRAM backing store",
-                chip.total_size,
-                SDRAM_SIZE_BYTES / (1024 * 1024)
-            );
-        }
-
-        // Build the full command in one buffer to avoid USB transfer gaps
-        let mut buf = Vec::with_capacity(9 + sfdp_len);
-        buf.push(CMD_CHIPCONFIG);
-        buf.push(jedec[0]); // manufacturer
-        buf.push(jedec[1]); // device high
-        buf.push(jedec[2]); // device low
-        buf.push(flags);
-        buf.push(((erase_bursts >> 16) & 0x7F) as u8);
-        buf.push(((erase_bursts >> 8) & 0xFF) as u8);
-        buf.push((erase_bursts & 0xFF) as u8);
-        buf.push(sfdp_len as u8);
-        buf.extend_from_slice(sfdp_table);
+    fn send_chip_config(&mut self, chip: &chip::FlashChip) -> Result<()> {
+        let buf = chip_config_command(chip).map_err(anyhow::Error::msg)?;
         self.transport.write_all(&buf)?;
 
         let ack = self.read_ack("chip config")?;
@@ -704,8 +560,7 @@ impl FlashDevice {
     ///   Byte 1: 0x01 = assert hold, 0x00 = release hold
     ///   Response: 0x01 on success.
     fn set_hold(&mut self, enable: bool) -> Result<()> {
-        let data = if enable { 0x01u8 } else { 0x00u8 };
-        self.transport.write_all(&[CMD_HOLDCTL, data])?;
+        self.transport.write_all(&hold_command(enable))?;
 
         // Wait for ack (skip modem status bytes, see write_block)
         let mut resp = [0u8; 1];
@@ -727,7 +582,7 @@ impl FlashDevice {
     }
 
     fn log_start(&mut self) -> Result<()> {
-        self.transport.write_all(&[CMD_LOGCTL, 0x01])?;
+        self.transport.write_all(&logctl_command(true))?;
         let ack = self.read_ack("log start")?;
         if ack != 0x01 {
             bail!("LOGCTL start failed: unexpected response 0x{:02x}", ack);
@@ -736,7 +591,7 @@ impl FlashDevice {
     }
 
     fn log_stop(&mut self) -> Result<()> {
-        self.transport.write_all(&[CMD_LOGCTL, 0x00])?;
+        self.transport.write_all(&logctl_command(false))?;
         let ack = self.read_ack("log stop")?;
         if ack != 0x01 {
             bail!("LOGCTL stop failed: unexpected response 0x{:02x}", ack);
@@ -786,21 +641,8 @@ impl FlashDevice {
     }
 
     fn toctou_set(&mut self, index: u8, start: u32, mask: u32, replace: u32) -> Result<()> {
-        let buf = [
-            CMD_TOCTOU,
-            TOCTOU_SET,
-            index & 0x03,
-            ((start >> 16) & 0xFF) as u8,
-            ((start >> 8) & 0xFF) as u8,
-            (start & 0xFF) as u8,
-            ((mask >> 16) & 0xFF) as u8,
-            ((mask >> 8) & 0xFF) as u8,
-            (mask & 0xFF) as u8,
-            ((replace >> 16) & 0xFF) as u8,
-            ((replace >> 8) & 0xFF) as u8,
-            (replace & 0xFF) as u8,
-        ];
-        self.transport.write_all(&buf)?;
+        self.transport
+            .write_all(&toctou_set_command(index, start, mask, replace))?;
         let resp = self.read_ack("TOCTOU set")?;
         if resp != 0x01 {
             bail!("TOCTOU set failed: unexpected response 0x{:02x}", resp);
@@ -810,7 +652,7 @@ impl FlashDevice {
 
     fn toctou_arm(&mut self, index: u8) -> Result<()> {
         self.transport
-            .write_all(&[CMD_TOCTOU, TOCTOU_ARM, index & 0x03])?;
+            .write_all(&toctou_index_command(TOCTOU_ARM, index))?;
         let resp = self.read_ack("TOCTOU arm")?;
         if resp != 0x01 {
             bail!("TOCTOU arm failed: unexpected response 0x{:02x}", resp);
@@ -820,7 +662,7 @@ impl FlashDevice {
 
     fn toctou_disarm(&mut self, index: u8) -> Result<()> {
         self.transport
-            .write_all(&[CMD_TOCTOU, TOCTOU_DISARM, index & 0x03])?;
+            .write_all(&toctou_index_command(TOCTOU_DISARM, index))?;
         let resp = self.read_ack("TOCTOU disarm")?;
         if resp != 0x01 {
             bail!("TOCTOU disarm failed: unexpected response 0x{:02x}", resp);
@@ -830,7 +672,7 @@ impl FlashDevice {
 
     fn toctou_reset(&mut self, index: u8) -> Result<()> {
         self.transport
-            .write_all(&[CMD_TOCTOU, TOCTOU_RESET, index & 0x03])?;
+            .write_all(&toctou_index_command(TOCTOU_RESET, index))?;
         let resp = self.read_ack("TOCTOU reset")?;
         if resp != 0x01 {
             bail!("TOCTOU reset failed: unexpected response 0x{:02x}", resp);
@@ -851,14 +693,11 @@ impl FlashDevice {
     }
 
     fn write(&mut self, address: u32, data: &[u8]) -> Result<()> {
-        if address % 8 != 0 {
+        if !address.is_multiple_of(8) {
             bail!("Address must be 8-byte aligned for writes");
         }
 
-        let mut padded = data.to_vec();
-        if padded.len() % 8 != 0 {
-            padded.resize((padded.len() + 7) / 8 * 8, 0xFF);
-        }
+        let padded = padded_write_data(data);
 
         let mut addr = address;
         let mut offset = 0;
@@ -1055,12 +894,7 @@ enum ToctouAction {
 }
 
 fn parse_address(s: &str) -> Result<u32, String> {
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u32::from_str_radix(hex, 16).map_err(|e| e.to_string())
-    } else {
-        s.parse()
-            .map_err(|e: std::num::ParseIntError| e.to_string())
-    }
+    parse_u32(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,7 +914,7 @@ fn open_device(cli: &Cli) -> Result<FlashDevice> {
             return FlashDevice::open_ft245(cli.ft_serial.as_deref());
         }
         #[cfg(not(any(feature = "d2xx", feature = "ftdi")))]
-        bail!("--ft245 requires the 'd2xx' or 'ftdi' feature (build with --features d2xx, --features ftdi, or --no-default-features --features d2xx)");
+        bail!("--ft245 requires the 'd2xx' or 'ftdi' feature (build with --features d2xx or --features ftdi)");
     }
     FlashDevice::open_serial(&cli.port)
 }
@@ -1177,8 +1011,7 @@ fn cmd_read(cli: &Cli, address: u32, length: u32, output: Option<PathBuf>) -> Re
 }
 
 fn cmd_write(cli: &Cli, address: u32, data_hex: &str) -> Result<()> {
-    let data =
-        hex::decode(data_hex.replace(' ', "")).map_err(|e| anyhow!("Invalid hex string: {}", e))?;
+    let data = parse_hex_bytes(data_hex).map_err(|e| anyhow!("Invalid hex string: {}", e))?;
 
     if data.is_empty() {
         bail!("No data to write");
@@ -1186,10 +1019,7 @@ fn cmd_write(cli: &Cli, address: u32, data_hex: &str) -> Result<()> {
 
     let mut device = open_device(cli)?;
 
-    let mut padded = data.clone();
-    if padded.len() % 8 != 0 {
-        padded.resize((padded.len() + 7) / 8 * 8, 0xFF);
-    }
+    let padded = padded_write_data(&data);
 
     device.with_emulation_stopped(|device| device.write(address, &padded))?;
     println!("Wrote {} bytes to 0x{:08x}", data.len(), address);
@@ -1216,10 +1046,7 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
 
     let mut device = open_device(cli)?;
 
-    let mut padded = data.clone();
-    if padded.len() % 8 != 0 {
-        padded.resize((padded.len() + 7) / 8 * 8, 0xFF);
-    }
+    let padded = padded_write_data(&data);
 
     // Load is the one command whose natural end state is "ready to
     // serve", so the dance is stop -> write -> (verify) -> start.
@@ -1377,7 +1204,7 @@ fn cmd_configure(cli: &Cli, chip_db_path: &str, chip_name: &str) -> Result<()> {
     // Send to FPGA.  Must be stopped while CHIPCONFIG is processed,
     // otherwise spi_trx could read inconsistent cfg_* values mid-transfer.
     let mut device = open_device(cli)?;
-    device.with_emulation_stopped(|device| device.send_chip_config(chip, &sfdp_table))?;
+    device.with_emulation_stopped(|device| device.send_chip_config(chip))?;
 
     eprintln!("Configuration applied successfully.");
     Ok(())
@@ -1770,65 +1597,15 @@ fn cmd_hold(cli: &Cli, state: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// SPI opcode names for log display
-// ---------------------------------------------------------------------------
-
-fn spi_opcode_name(opcode: u8) -> &'static str {
-    match opcode {
-        0x01 => "WRITE_STATUS",
-        0x02 => "PAGE_PROGRAM",
-        0x03 => "READ",
-        0x04 => "WRITE_DISABLE",
-        0x05 => "READ_STATUS",
-        0x06 => "WRITE_ENABLE",
-        0x0B => "FAST_READ",
-        0x0C => "FAST_READ_4B",
-        0x12 => "PAGE_PROGRAM_4B",
-        0x13 => "READ_4B",
-        0x20 => "SECTOR_ERASE_4K",
-        0x21 => "SECTOR_ERASE_4K_4B",
-        0x35 => "READ_STATUS2",
-        0x3B => "DUAL_READ",
-        0x3C => "DUAL_READ_4B",
-        0x52 => "BLOCK_ERASE_32K",
-        0x5C => "BLOCK_ERASE_32K_4B",
-        0x5A => "READ_SFDP",
-        0x60 => "CHIP_ERASE",
-        0x6B => "QUAD_READ",
-        0x6C => "QUAD_READ_4B",
-        0x9E | 0x9F => "READ_JEDEC_ID",
-        0xB7 => "4BYTE_ENABLE",
-        0xBB => "DUAL_IO_READ",
-        0xBC => "DUAL_IO_READ_4B",
-        0xC7 => "CHIP_ERASE",
-        0xD8 => "BLOCK_ERASE_64K",
-        0xDC => "BLOCK_ERASE_64K_4B",
-        0xE9 => "4BYTE_DISABLE",
-        0xEB => "QUAD_IO_READ",
-        0xEC => "QUAD_IO_READ_4B",
-        _ => "UNKNOWN",
-    }
-}
-
-fn is_read_opcode(opcode: u8) -> bool {
-    matches!(
-        opcode,
-        0x03 | 0x0B | 0x0C | 0x13 | 0x3B | 0x3C | 0x5A | 0x6B | 0x6C | 0xBB | 0xBC | 0xEB | 0xEC
-    )
-}
-
-// ---------------------------------------------------------------------------
 // Monitor command -- real-time SPI bus logging with TOCTOU detection
 // ---------------------------------------------------------------------------
 
 fn cmd_monitor(cli: &Cli) -> Result<()> {
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     let mut device = open_device(cli)?;
 
-    // Set up Ctrl+C handler
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
@@ -1836,7 +1613,6 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
     })
     .context("Failed to set Ctrl+C handler")?;
 
-    // Enable logging
     device.log_start()?;
     eprintln!("Logging started. Press Ctrl+C to stop.\n");
     eprintln!(
@@ -1845,20 +1621,7 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
     );
     eprintln!("{}", "-".repeat(60));
 
-    // TOCTOU detection state: address range -> access count
-    // Key: (start_addr, opcode), Value: count
-    let mut access_map: HashMap<(u32, u8), u32> = HashMap::new();
-    let mut double_reads: Vec<(u32, u8)> = Vec::new();
-
-    // Log packet parser state
-    let mut pending = Vec::new();
-    let mut txn_count: u32 = 0;
-    let mut current_opcode: u8 = 0;
-    let mut current_addr: u32 = 0;
-
-    // Poll loop: ask the FPGA for log data every ~5ms.  Every poll
-    // response is self-delimited (ends with LOG_POLL_TERMINATOR) so
-    // there is no ambiguity between log bytes and protocol bytes.
+    let mut parser = LogParser::default();
     while running.load(Ordering::SeqCst) {
         let data = device.log_poll()?;
         if data.is_empty() {
@@ -1866,94 +1629,11 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
             continue;
         }
 
-        pending.extend_from_slice(&data);
-
-        // Parse complete packets from pending buffer
-        let mut pos = 0;
-        while pos < pending.len() {
-            let remaining = pending.len() - pos;
-            match pending[pos] {
-                LOG_CMD if remaining >= 2 => {
-                    let opcode = pending[pos + 1];
-                    current_opcode = opcode;
-                    txn_count += 1;
-                    print!(
-                        "{:<6} 0x{:02X} {:<13}",
-                        txn_count,
-                        opcode,
-                        spi_opcode_name(opcode)
-                    );
-                    pos += 2;
-                }
-                LOG_ADDR if remaining >= 5 => {
-                    let addr = ((pending[pos + 1] as u32) << 24)
-                        | ((pending[pos + 2] as u32) << 16)
-                        | ((pending[pos + 3] as u32) << 8)
-                        | (pending[pos + 4] as u32);
-                    current_addr = addr;
-                    if addr > 0xFFFFFF {
-                        print!(" 0x{:08X}", addr);
-                    } else {
-                        print!(" 0x{:06X}", addr);
-                    }
-
-                    // TOCTOU detection: track read accesses
-                    if is_read_opcode(current_opcode) {
-                        let key = (addr, current_opcode);
-                        let count = access_map.entry(key).or_insert(0);
-                        *count += 1;
-                        if *count == 2 {
-                            double_reads.push(key);
-                            print!("  ** DOUBLE READ (TOCTOU candidate)");
-                        } else if *count > 2 {
-                            print!("  ** READ #{}", count);
-                        }
-                    }
-                    println!();
-                    pos += 5;
-                }
-                LOG_END if remaining >= 4 => {
-                    let count = ((pending[pos + 1] as u32) << 16)
-                        | ((pending[pos + 2] as u32) << 8)
-                        | (pending[pos + 3] as u32);
-                    // +1 because the counter starts at 0 for the first byte
-                    let byte_count = count + 1;
-                    if byte_count > 1 {
-                        eprintln!(
-                            "       end: {} bytes from 0x{:06X}",
-                            byte_count, current_addr
-                        );
-                    }
-                    pos += 4;
-                }
-                LOG_TRAP if remaining >= 6 => {
-                    let index = pending[pos + 1];
-                    let addr = ((pending[pos + 2] as u32) << 16)
-                        | ((pending[pos + 3] as u32) << 8)
-                        | (pending[pos + 4] as u32);
-                    eprintln!(
-                        "  !! TOCTOU TRAP #{} FIRED at 0x{:06X} -- serving replacement data",
-                        index, addr
-                    );
-                    pos += 6; // type(1) + index(1) + addr(3) + pad(1)
-                }
-                0xA1..=0xAF => {
-                    // Known packet type but incomplete -- wait for more data
-                    break;
-                }
-                _ => {
-                    // Unknown byte, skip it
-                    pos += 1;
-                }
-            }
+        for event in parser.push(&data) {
+            print!("{}", format_log_event(&event));
         }
-        // Remove consumed bytes
-        pending.drain(..pos);
     }
 
-    // Stop logging and drain any residual log bytes.  Since logging
-    // and protocol responses travel separately now (no mux), the stop
-    // ACK is guaranteed to be the *only* reply to CMD_LOGCTL.
     eprintln!("\nStopping...");
     device.log_stop()?;
     let remaining = device.log_poll()?;
@@ -1961,23 +1641,10 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
         eprintln!("(drained {} residual log bytes)", remaining.len());
     }
 
-    // Print TOCTOU summary
-    if !double_reads.is_empty() {
-        eprintln!("\n--- TOCTOU Detection Summary ---");
-        eprintln!("{} address(es) read more than once:\n", double_reads.len());
-        for (addr, opcode) in &double_reads {
-            let count = access_map[&(*addr, *opcode)];
-            eprintln!(
-                "  0x{:06X}  ({})  read {} times",
-                addr,
-                spi_opcode_name(*opcode),
-                count
-            );
-        }
+    eprint!("{}", format_log_summary(&parser));
+    if !parser.double_reads().is_empty() {
         eprintln!("\nThese are potential TOCTOU attack targets.");
         eprintln!("Use 'toctou set' to configure traps for these addresses.");
-    } else {
-        eprintln!("\nNo double-reads detected.");
     }
 
     Ok(())
@@ -2123,22 +1790,5 @@ fn main() -> Result<()> {
         Commands::Start => cmd_start(&cli),
         Commands::Stop => cmd_stop(&cli),
         Commands::Status => cmd_status(&cli),
-    }
-}
-
-mod hex {
-    pub fn decode(s: impl AsRef<str>) -> Result<Vec<u8>, String> {
-        let s = s.as_ref();
-        if s.len() % 2 != 0 {
-            return Err("Hex string must have even length".to_string());
-        }
-
-        (0..s.len())
-            .step_by(2)
-            .map(|i| {
-                u8::from_str_radix(&s[i..i + 2], 16)
-                    .map_err(|e| format!("Invalid hex at position {}: {}", i, e))
-            })
-            .collect()
     }
 }
