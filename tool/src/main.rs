@@ -27,6 +27,7 @@ const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
 // ~20ms, well within budget.  Writes are unaffected (data flows
 // host-to-FPGA, SDRAM writes complete in microseconds).
 const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
+const SDRAM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
 const PROTOCOL_VERSION: u8 = 5;
 
@@ -43,9 +44,11 @@ const CMD_LOGCTL: u8 = 0x38; // Enable/disable SPI bus logging capture (protocol
 const CMD_TOCTOU: u8 = 0x39; // TOCTOU trap management (protocol v5+)
 const CMD_LOGPOLL: u8 = 0x3A; // Drain logger ring FIFO (protocol v5+)
 
-// CMD_LOGPOLL response terminator.  Everything the logger emits starts
-// with 0xA1-0xA4, so 0xA0 unambiguously signals end-of-poll.
+// CMD_LOGPOLL framing. Raw log bytes equal to 0xA0 or 0xA5 are escaped
+// by the FPGA as 0xA5 0x00 or 0xA5 0x05 respectively, leaving 0xA0 as an
+// unambiguous end-of-poll marker.
 const LOG_POLL_TERMINATOR: u8 = 0xA0;
+const LOG_POLL_ESCAPE: u8 = 0xA5;
 
 // TOCTOU sub-commands
 const TOCTOU_SET: u8 = 0x01;
@@ -272,12 +275,12 @@ impl Transport for Ft245Transport {
 // FT245 transport -- rs-ftdi backend (pure Rust, nusb)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "ftdi")]
+#[cfg(all(feature = "ftdi", not(feature = "d2xx")))]
 struct Ft245Transport {
     dev: ftdi::FtdiDevice,
 }
 
-#[cfg(feature = "ftdi")]
+#[cfg(all(feature = "ftdi", not(feature = "d2xx")))]
 impl Ft245Transport {
     fn open(serial: Option<&str>) -> Result<Self> {
         // Open the FT2232H Channel A.  The EEPROM must already be
@@ -337,7 +340,7 @@ impl Ft245Transport {
     }
 }
 
-#[cfg(feature = "ftdi")]
+#[cfg(all(feature = "ftdi", not(feature = "d2xx")))]
 impl Transport for Ft245Transport {
     fn write_all(&mut self, data: &[u8]) -> Result<()> {
         self.dev.write_all(data).map_err(|e| anyhow!(e))?;
@@ -373,6 +376,22 @@ struct FlashDevice {
     read_block_size: usize,
 }
 
+fn validate_sdram_range(address: u32, length: usize, what: &str) -> Result<()> {
+    let end = (address as u64)
+        .checked_add(length as u64)
+        .with_context(|| format!("{} range overflows address arithmetic", what))?;
+    if end > SDRAM_SIZE_BYTES {
+        bail!(
+            "{} range 0x{:08x}..0x{:08x} exceeds {} MiB SDRAM backing store",
+            what,
+            address,
+            end,
+            SDRAM_SIZE_BYTES / (1024 * 1024)
+        );
+    }
+    Ok(())
+}
+
 impl FlashDevice {
     fn open_serial(port_name: &str) -> Result<Self> {
         Ok(Self {
@@ -391,9 +410,7 @@ impl FlashDevice {
 
     fn get_version(&mut self) -> Result<u8> {
         self.transport.write_all(&[CMD_VERSION])?;
-        let mut buf = [0u8; 1];
-        self.transport.read_exact(&mut buf)?;
-        Ok(buf[0])
+        self.read_ack("version")
     }
 
     /// Read one response byte, transparently skipping stray 0x00 bytes
@@ -526,6 +543,8 @@ impl FlashDevice {
             bail!("Length must be a multiple of 8");
         }
 
+        validate_sdram_range(address, length, "read")?;
+
         let addr_units = address / 8;
         let len_units = length / 8;
 
@@ -556,6 +575,8 @@ impl FlashDevice {
         if data.len() % 8 != 0 {
             bail!("Data length must be a multiple of 8");
         }
+
+        validate_sdram_range(address, data.len(), "write")?;
 
         let addr_units = address / 8;
         let len_units = data.len() / 8;
@@ -643,6 +664,13 @@ impl FlashDevice {
         if sfdp_len > 128 {
             bail!("SFDP table too large: {} bytes (max 128)", sfdp_len);
         }
+        if chip.total_size as u64 > SDRAM_SIZE_BYTES {
+            bail!(
+                "chip size {} bytes exceeds {} MiB SDRAM backing store",
+                chip.total_size,
+                SDRAM_SIZE_BYTES / (1024 * 1024)
+            );
+        }
 
         // Build the full command in one buffer to avoid USB transfer gaps
         let mut buf = Vec::with_capacity(9 + sfdp_len);
@@ -671,8 +699,8 @@ impl FlashDevice {
     /// the target flash and silencing it so NORbert can respond instead.
     /// Mutually exclusive with quad I/O.
     ///
-    /// Protocol (CMD_HOLDCTL = 0x34):
-    ///   Byte 0: 0x34
+    /// Protocol (CMD_HOLDCTL = 0x37):
+    ///   Byte 0: 0x37
     ///   Byte 1: 0x01 = assert hold, 0x00 = release hold
     ///   Response: 0x01 on success.
     fn set_hold(&mut self, enable: bool) -> Result<()> {
@@ -720,23 +748,34 @@ impl FlashDevice {
     ///
     /// Protocol (CMD_LOGPOLL = 0x3A):
     ///   Host:  0x3A
-    ///   FPGA:  [log byte]* 0xA0
-    /// The response ends when 0xA0 is seen.  The FPGA caps each poll at
-    /// 255 data bytes; any remaining log data is picked up on the next
-    /// poll.
+    ///   FPGA:  [escaped log byte]* 0xA0
+    /// The response ends when an unescaped 0xA0 is seen.  Raw payload
+    /// 0xA0 is encoded as 0xA5 0x00; raw 0xA5 is encoded as 0xA5 0x05.
+    /// The FPGA caps each poll at 255 raw data bytes; any remaining log
+    /// data is picked up on the next poll.
     fn log_poll(&mut self) -> Result<Vec<u8>> {
         self.transport.write_all(&[CMD_LOGPOLL])?;
         let mut out = Vec::with_capacity(256);
         loop {
             let mut byte = [0u8; 1];
             self.transport.read_exact(&mut byte)?;
-            if byte[0] == LOG_POLL_TERMINATOR {
-                return Ok(out);
+            match byte[0] {
+                LOG_POLL_TERMINATOR => return Ok(out),
+                LOG_POLL_ESCAPE => {
+                    let mut code = [0u8; 1];
+                    self.transport.read_exact(&mut code)?;
+                    match code[0] {
+                        0x00 => out.push(LOG_POLL_TERMINATOR),
+                        0x05 => out.push(LOG_POLL_ESCAPE),
+                        other => bail!("LOGPOLL: invalid escape code 0x{:02x}", other),
+                    }
+                }
+                b => out.push(b),
             }
-            out.push(byte[0]);
             // Safety net: cap log poll responses so a misbehaving
             // device cannot lock the tool in this loop.  Should never
-            // trip given the FPGA's LOG_POLL_MAX = 255 + terminator.
+            // trip given the FPGA's LOG_POLL_MAX = 255 raw bytes plus
+            // escapes and terminator.
             if out.len() > 1024 {
                 bail!(
                     "log poll overran 1024 bytes without terminator; last byte 0x{:02x}",
@@ -762,10 +801,9 @@ impl FlashDevice {
             (replace & 0xFF) as u8,
         ];
         self.transport.write_all(&buf)?;
-        let mut resp = [0u8; 1];
-        self.transport.read_exact(&mut resp)?;
-        if resp[0] != 0x01 {
-            bail!("TOCTOU set failed: unexpected response 0x{:02x}", resp[0]);
+        let resp = self.read_ack("TOCTOU set")?;
+        if resp != 0x01 {
+            bail!("TOCTOU set failed: unexpected response 0x{:02x}", resp);
         }
         Ok(())
     }
@@ -773,10 +811,9 @@ impl FlashDevice {
     fn toctou_arm(&mut self, index: u8) -> Result<()> {
         self.transport
             .write_all(&[CMD_TOCTOU, TOCTOU_ARM, index & 0x03])?;
-        let mut resp = [0u8; 1];
-        self.transport.read_exact(&mut resp)?;
-        if resp[0] != 0x01 {
-            bail!("TOCTOU arm failed: unexpected response 0x{:02x}", resp[0]);
+        let resp = self.read_ack("TOCTOU arm")?;
+        if resp != 0x01 {
+            bail!("TOCTOU arm failed: unexpected response 0x{:02x}", resp);
         }
         Ok(())
     }
@@ -784,13 +821,9 @@ impl FlashDevice {
     fn toctou_disarm(&mut self, index: u8) -> Result<()> {
         self.transport
             .write_all(&[CMD_TOCTOU, TOCTOU_DISARM, index & 0x03])?;
-        let mut resp = [0u8; 1];
-        self.transport.read_exact(&mut resp)?;
-        if resp[0] != 0x01 {
-            bail!(
-                "TOCTOU disarm failed: unexpected response 0x{:02x}",
-                resp[0]
-            );
+        let resp = self.read_ack("TOCTOU disarm")?;
+        if resp != 0x01 {
+            bail!("TOCTOU disarm failed: unexpected response 0x{:02x}", resp);
         }
         Ok(())
     }
@@ -798,28 +831,25 @@ impl FlashDevice {
     fn toctou_reset(&mut self, index: u8) -> Result<()> {
         self.transport
             .write_all(&[CMD_TOCTOU, TOCTOU_RESET, index & 0x03])?;
-        let mut resp = [0u8; 1];
-        self.transport.read_exact(&mut resp)?;
-        if resp[0] != 0x01 {
-            bail!("TOCTOU reset failed: unexpected response 0x{:02x}", resp[0]);
+        let resp = self.read_ack("TOCTOU reset")?;
+        if resp != 0x01 {
+            bail!("TOCTOU reset failed: unexpected response 0x{:02x}", resp);
         }
         Ok(())
     }
 
     fn toctou_reset_all(&mut self) -> Result<()> {
         self.transport.write_all(&[CMD_TOCTOU, TOCTOU_RESET_ALL])?;
-        let mut resp = [0u8; 1];
-        self.transport.read_exact(&mut resp)?;
-        if resp[0] != 0x01 {
+        let resp = self.read_ack("TOCTOU reset-all")?;
+        if resp != 0x01 {
             bail!(
                 "TOCTOU reset-all failed: unexpected response 0x{:02x}",
-                resp[0]
+                resp
             );
         }
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn write(&mut self, address: u32, data: &[u8]) -> Result<()> {
         if address % 8 != 0 {
             bail!("Address must be 8-byte aligned for writes");
@@ -1050,7 +1080,7 @@ fn open_device(cli: &Cli) -> Result<FlashDevice> {
             return FlashDevice::open_ft245(cli.ft_serial.as_deref());
         }
         #[cfg(not(any(feature = "d2xx", feature = "ftdi")))]
-        bail!("--ft245 requires the 'd2xx' or 'ftdi' feature (build with --features d2xx or --features ftdi)");
+        bail!("--ft245 requires the 'd2xx' or 'ftdi' feature (build with --features d2xx, --features ftdi, or --no-default-features --features d2xx)");
     }
     FlashDevice::open_serial(&cli.port)
 }
@@ -1161,7 +1191,7 @@ fn cmd_write(cli: &Cli, address: u32, data_hex: &str) -> Result<()> {
         padded.resize((padded.len() + 7) / 8 * 8, 0xFF);
     }
 
-    device.with_emulation_stopped(|device| device.write_block(address, &padded))?;
+    device.with_emulation_stopped(|device| device.write(address, &padded))?;
     println!("Wrote {} bytes to 0x{:08x}", data.len(), address);
     Ok(())
 }
@@ -1392,7 +1422,7 @@ fn cmd_probe(cli: &Cli) -> Result<()> {
 
     // Test bytes: mix of valid commands, diagnostics, and non-commands
     let probes: Vec<(u8, &str, Option<u8>)> = vec![
-        (0x30, "CMD_VERSION", Some(0x02)),
+        (0x30, "CMD_VERSION", Some(PROTOCOL_VERSION)),
         (0x00, "NOP / zero", None),
         (0x55, "non-command 0x55", None),
         (0xAA, "non-command 0xAA", None),
@@ -1545,7 +1575,7 @@ fn cmd_probe(cli: &Cli) -> Result<()> {
 
     // Test bytes
     let probes: Vec<(u8, &str, Option<u8>)> = vec![
-        (0x30, "CMD_VERSION", Some(0x02)),
+        (0x30, "CMD_VERSION", Some(PROTOCOL_VERSION)),
         (0x00, "NOP / zero", None),
         (0x55, "non-command 0x55", None),
         (0xAA, "non-command 0xAA", None),
@@ -1753,21 +1783,29 @@ fn spi_opcode_name(opcode: u8) -> &'static str {
         0x06 => "WRITE_ENABLE",
         0x0B => "FAST_READ",
         0x0C => "FAST_READ_4B",
+        0x12 => "PAGE_PROGRAM_4B",
         0x13 => "READ_4B",
         0x20 => "SECTOR_ERASE_4K",
+        0x21 => "SECTOR_ERASE_4K_4B",
         0x35 => "READ_STATUS2",
         0x3B => "DUAL_READ",
+        0x3C => "DUAL_READ_4B",
         0x52 => "BLOCK_ERASE_32K",
+        0x5C => "BLOCK_ERASE_32K_4B",
         0x5A => "READ_SFDP",
         0x60 => "CHIP_ERASE",
         0x6B => "QUAD_READ",
+        0x6C => "QUAD_READ_4B",
         0x9E | 0x9F => "READ_JEDEC_ID",
         0xB7 => "4BYTE_ENABLE",
         0xBB => "DUAL_IO_READ",
+        0xBC => "DUAL_IO_READ_4B",
         0xC7 => "CHIP_ERASE",
         0xD8 => "BLOCK_ERASE_64K",
+        0xDC => "BLOCK_ERASE_64K_4B",
         0xE9 => "4BYTE_DISABLE",
         0xEB => "QUAD_IO_READ",
+        0xEC => "QUAD_IO_READ_4B",
         _ => "UNKNOWN",
     }
 }
@@ -1775,7 +1813,7 @@ fn spi_opcode_name(opcode: u8) -> &'static str {
 fn is_read_opcode(opcode: u8) -> bool {
     matches!(
         opcode,
-        0x03 | 0x0B | 0x0C | 0x13 | 0x3B | 0x5A | 0x6B | 0xBB | 0xEB
+        0x03 | 0x0B | 0x0C | 0x13 | 0x3B | 0x3C | 0x5A | 0x6B | 0x6C | 0xBB | 0xBC | 0xEB | 0xEC
     )
 }
 

@@ -58,9 +58,9 @@ fn write_sfdp_header(table: &mut [u8; SFDP_TABLE_SIZE]) {
 fn write_param_header(table: &mut [u8; SFDP_TABLE_SIZE]) {
     table[0x08] = 0x00; // Parameter ID LSB (BFPT = 0xFF00)
     table[0x09] = 0x06; // Parameter minor revision
-    table[0x0A] = BFPT_DWORDS; // Length in DWORDs
-    table[0x0B] = 0x01; // Parameter major revision
-                        // Table pointer (24-bit little-endian)
+    table[0x0A] = 0x01; // Parameter major revision
+    table[0x0B] = BFPT_DWORDS; // Length in DWORDs
+                               // Table pointer (24-bit little-endian)
     table[0x0C] = BFPT_OFFSET as u8;
     table[0x0D] = (BFPT_OFFSET >> 8) as u8;
     table[0x0E] = (BFPT_OFFSET >> 16) as u8;

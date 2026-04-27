@@ -157,10 +157,16 @@ module sdram(
     //   [21:9]  = row (13 bits)
     //   [8:7]   = bank (2 bits)
     //   [6:0]   = column burst index (col[8:2])
-    wire spi_chip_sel  = spi_addr[22];
-    wire [12:0] spi_row  = spi_addr[21:9];
-    wire [1:0]  spi_bank = spi_addr[8:7];
-    wire [8:0]  spi_col  = {spi_addr[6:0], 2'b00};  // Burst-4 aligned
+    // Latch the multi-bit SPI address in the system clock domain when the
+    // synchronized activate request is accepted, then use only the latched
+    // value for ACTIVATE/READ.  spi_trx holds spi_addr stable across the
+    // request handshake; this avoids using a live cross-domain bus later in
+    // the SDRAM command sequence.
+    reg [22:0] spi_addr_latched;
+    wire spi_chip_sel  = spi_addr_latched[22];
+    wire [12:0] spi_row  = spi_addr_latched[21:9];
+    wire [1:0]  spi_bank = spi_addr_latched[8:7];
+    wire [8:0]  spi_col  = {spi_addr_latched[6:0], 2'b00};  // Burst-4 aligned
 
     // Serial/glue path: 25-bit address = {chip, row, bank, col}
     //   [24]     = chip select
@@ -222,6 +228,7 @@ module sdram(
             spi_cmd_activate_ack <= 0;
             spi_cmd_read_ack <= 0;
             spi_activate_done <= 0;
+            spi_addr_latched <= 0;
         end
         else begin
             refreshcount <= refreshcount + 1;
@@ -451,15 +458,16 @@ module sdram(
                     cmdtarget <= tRCD;
                     spi_cmd_activate_ack <= 1;
                     spi_activate_done <= 1;
+                    spi_addr_latched <= spi_addr;
 
                     // ACTIVATE command
-                    cs_o <= spi_chip_sel;
+                    cs_o <= spi_addr[22];
                     ras_o <= 0;
                     cas_o <= 1;
                     we_o <= 1;
                     dqm_o <= 2'b11;
-                    ba_o <= spi_bank;
-                    a_o <= spi_row;
+                    ba_o <= spi_addr[8:7];
+                    a_o <= spi_addr[21:9];
                 end
                 else if (spi_cmd_read_buf[1] && !spi_cmd_read_ack && spi_activate_done) begin
                     // SPI fast-path read

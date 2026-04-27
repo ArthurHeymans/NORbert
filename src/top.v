@@ -128,21 +128,16 @@ module top(
     
     // SPI input signals
     //
-    // spi_cs_pin is debounced in the system clock domain to reject short
-    // glitches caused by Simultaneous Switching Output (SSO) ground bounce.
-    // When all 4 quad IO pins (IO0-IO3) transition HIGH->LOW simultaneously
-    // during the quad address phase (e.g. address nibble 0000 following
-    // 1111), the shared PMOD ground bounces and briefly pulls spi_cs_pin
-    // above the FPGA's VIH threshold.  Without debouncing, the async
-    // reset_cs flip-flop in spi_trx interprets this as a CS deassertion
-    // and resets the SPI state machine mid-transaction.  The 4-cycle
-    // filter (~33ns at 120 MHz) rejects these nanosecond-scale bounces
-    // while preserving responsiveness to real CS edges.
+    // Keep the debounced CS path feeding spi_trx.  It rejects short CS
+    // glitches caused by SSO/ground-bounce during quad transfers; removing
+    // it can reset the SPI state machine mid-transaction.  Top-level output
+    // enables are additionally gated with the raw CS pin below so the FPGA
+    // still releases the bus immediately when the real CS deasserts.
     reg [3:0] spi_cs_filter = 4'hF;
     reg spi_cs_debounced = 1;
     always @(posedge clk) begin
         spi_cs_filter <= {spi_cs_filter[2:0], spi_cs_pin};
-        if (&spi_cs_filter)        spi_cs_debounced <= 1;  // all 1s: CS released
+        if (&spi_cs_filter)         spi_cs_debounced <= 1;  // all 1s: CS released
         else if (~(|spi_cs_filter)) spi_cs_debounced <= 0;  // all 0s: CS asserted
     end
     wire spi_cs_in = spi_cs_debounced;
@@ -161,7 +156,7 @@ module top(
     wire spi_debug_out;
     
     // IO0 (MOSI pin): input normally, output during dual/quad read data phase
-    wire spi_active_out = !spi_cs_in && spi_power_in;
+    wire spi_active_out = !spi_cs_pin && spi_power_in;
     assign spi_mosi_pin = (spi_io0_oe && spi_active_out) ? spi_io0_out : 1'bz;
     wire spi_io0_in = spi_mosi_pin;
     
@@ -322,17 +317,27 @@ module top(
     // them into the system clock domain with edge detection in glue.
     // -----------------------------------------------------------
     
-    reg [1:0] log_addr_valid_sys;
+    reg log_addr_toggle_spi = 0;
+    reg [31:0] log_addr_hold_spi = 0;
+    always @(posedge spi_clk_in) begin
+        if (log_addr_valid) begin
+            log_addr_hold_spi <= log_addr_out;
+            log_addr_toggle_spi <= !log_addr_toggle_spi;
+        end
+    end
+
+    reg [2:0] log_addr_toggle_sys;
     reg [1:0] spi_active_sys;
     reg [31:0] log_addr_latched;
     
     always @(posedge clk) begin
-        log_addr_valid_sys <= {log_addr_valid_sys[0], log_addr_valid};
-        spi_active_sys     <= {spi_active_sys[0], spi_active};
-        // Latch addr when valid fires (stable for multiple sys clocks)
-        if (log_addr_valid && !log_addr_valid_sys[0])
-            log_addr_latched <= log_addr_out;
+        log_addr_toggle_sys <= {log_addr_toggle_sys[1:0], log_addr_toggle_spi};
+        spi_active_sys      <= {spi_active_sys[0], spi_active};
+        if (log_addr_toggle_sys[2] != log_addr_toggle_sys[1])
+            log_addr_latched <= log_addr_hold_spi;
     end
+
+    wire log_addr_valid_pulse_sys = log_addr_toggle_sys[2] != log_addr_toggle_sys[1];
     
     // -----------------------------------------------------------
     // TOCTOU Address Redirect Mux
@@ -599,7 +604,7 @@ module top(
         .log_fifo_read_strobe(log_fifo_read_strobe),
 
 
-        .log_addr_valid_sync(log_addr_valid_sys[1]),
+        .log_addr_valid_sync(log_addr_valid_pulse_sys),
         .log_addr_sync(log_addr_latched[23:0]),
         .spi_active_sync(spi_active_sys[1]),
 

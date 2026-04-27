@@ -43,7 +43,7 @@ module spi_trx(
     output reg [1:0] write_type,  // 00=page program, 01=erase, 10=AAI RMW
     output reg [22:0] write_addr,     // 23-bit burst address
     output reg [22:0] write_len,
-    input wire write_done,
+    input wire write_done,       // Toggles once per completed write/erase
     
     output reg write_buf_strobe,
     output reg [7:0] write_buf_offset,
@@ -125,24 +125,32 @@ module spi_trx(
         CMD_WRITEENABLE     = 8'h06,
         CMD_FASTREAD        = 8'h0B,
         CMD_FASTREAD_4B     = 8'h0C,
+        CMD_PAGEPROGRAM_4B  = 8'h12,
         CMD_READ_4B         = 8'h13,
+        CMD_DUALREAD_4B     = 8'h3C,  // Dual Output Read with 4-byte address
         CMD_SECTORERASE_4K  = 8'h20,
+        CMD_SECTORERASE_4K_4B = 8'h21,
         CMD_READSTATUS2     = 8'h35,  // Read Status Register 2
         CMD_DUALREAD        = 8'h3B,  // Dual Output Read (1-1-2)
         CMD_BLOCKERASE_32K  = 8'h52,
+        CMD_BLOCKERASE_32K_4B = 8'h5C,
         CMD_CHIPERASE1      = 8'h60,
         CMD_QUADREAD        = 8'h6B,  // Quad Output Read (1-1-4)
+        CMD_QUADREAD_4B     = 8'h6C,  // Quad Output Read with 4-byte address
         CMD_READID1         = 8'h9E,
         CMD_READSFDP        = 8'h5A,  // Read SFDP table
         CMD_READID2         = 8'h9F,
         CMD_4BYTEENABLE     = 8'hB7,
         CMD_DUALIOREAD      = 8'hBB,  // Dual I/O Read (1-2-2)
+        CMD_DUALIOREAD_4B   = 8'hBC,  // Dual I/O Read with 4-byte address
         CMD_CHIPERASE2      = 8'hC7,
         CMD_BLOCKERASE_64K  = 8'hD8,
+        CMD_BLOCKERASE_64K_4B = 8'hDC,
         CMD_EWSR            = 8'h50,  // Enable Write Status Register (SST)
         CMD_AAI_WORD        = 8'hAD,  // AAI Word Program (SST)
         CMD_4BYTEDISABLE    = 8'hE9,
         CMD_QUADIOREAD      = 8'hEB,  // Quad I/O Read (1-4-4)
+        CMD_QUADIOREAD_4B   = 8'hEC,  // Quad I/O Read with 4-byte address
         CMD_LOG             = 8'hF2;
     
     // State machine states
@@ -190,17 +198,18 @@ module spi_trx(
     reg [7:0] status_reg = 8'b00000000;
     reg [7:0] status_reg2 = 8'h02;     // QE bit (bit 1) default enabled
     
-    // Synchronize write_done from system clock domain
-    reg [2:0] write_done_sync;
-    
-    always @(posedge clk) begin
-        write_done_sync <= {write_done_sync[1:0], write_done};
-    end
-    
-    wire write_busy_clr = write_done_sync[2];
+    // Synchronize write_done from the system clock domain into spi_clk.
+    // glue.v toggles write_done once per completed program/erase, so the
+    // event is preserved even if spi_clk is stopped while the write runs.
+    reg [2:0] write_done_sync = 0;
+    wire write_busy_clr = write_done_sync[1] ^ write_done_sync[2];
+
+    reg status_read_sel2 = 0;
 
     // Main SPI state machine
     always @(posedge spi_clk) begin
+        write_done_sync <= {write_done_sync[1:0], write_done};
+
         if (is_selected) begin
             fresh_read <= 0;
             
@@ -229,6 +238,7 @@ module spi_trx(
                 is_quad_read <= 0;
                 is_sfdp_read <= 0;
                 is_aai <= 0;
+                status_read_sel2 <= 0;
                 mode_count <= 0;
                 
                 log_strobe <= 0;
@@ -271,12 +281,14 @@ module spi_trx(
                         
                     CMD_READSTATUS: begin
                         state <= STA_READSTATUS;
+                        status_read_sel2 <= 0;
                         spi_io1_oe_ff <= 1;
                         miso_byte <= status_reg;
                     end
                     
                     CMD_READSTATUS2: begin
                         state <= STA_READSTATUS;
+                        status_read_sel2 <= 1;
                         spi_io1_oe_ff <= 1;
                         miso_byte <= status_reg2;
                     end
@@ -307,11 +319,11 @@ module spi_trx(
                     end
                     
                     CMD_4BYTEENABLE: begin
-                        if (status_reg[1] && cfg_4byte) addr_4byte <= 1;
+                        if (cfg_4byte) addr_4byte <= 1;
                     end
                     
                     CMD_4BYTEDISABLE: begin
-                        if (status_reg[1] && cfg_4byte) addr_4byte <= 0;
+                        if (cfg_4byte) addr_4byte <= 0;
                     end
                         
                     CMD_READ: begin
@@ -341,59 +353,66 @@ module spi_trx(
                     end
                     
                     // Dual Output Read (1-1-2): cmd(1), addr(1), 8 dummy, data(2)
-                    CMD_DUALREAD: begin
+                    CMD_DUALREAD,
+                    CMD_DUALREAD_4B: begin
                         state <= STA_ADDR_READ;
-                        addr_count <= addr_4byte ? 31 : 23;
+                        addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_DUALREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                         is_fast_read <= 1;   // Uses same dummy phase
                         is_dual_read <= 1;
                     end
                     
                     // Dual I/O Read (1-2-2): cmd(1), addr(2), mode+dummy(2), data(2)
-                    CMD_DUALIOREAD: begin
+                    CMD_DUALIOREAD,
+                    CMD_DUALIOREAD_4B: begin
                         state <= STA_ADDR_READ_DUAL;
-                        addr_count <= addr_4byte ? 31 : 23;
+                        addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_DUALIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                         is_dual_read <= 1;
                     end
                     
                     // Quad Output Read (1-1-4): cmd(1), addr(1), 8 dummy, data(4)
-                    CMD_QUADREAD: begin
+                    CMD_QUADREAD,
+                    CMD_QUADREAD_4B: begin
                         if (status_reg2[1]) begin  // QE required
                             state <= STA_ADDR_READ;
-                            addr_count <= addr_4byte ? 31 : 23;
+                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                             is_fast_read <= 1;   // Uses same dummy phase
                             is_quad_read <= 1;
                         end
                     end
                     
                     // Quad I/O Read (1-4-4): cmd(1), addr(4), mode+dummy(4), data(4)
-                    CMD_QUADIOREAD: begin
+                    CMD_QUADIOREAD,
+                    CMD_QUADIOREAD_4B: begin
                         if (status_reg2[1]) begin  // QE required
                             state <= STA_ADDR_READ_QUAD;
-                            addr_count <= addr_4byte ? 31 : 23;
+                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                             is_quad_read <= 1;
                         end
                     end
 
-                    CMD_SECTORERASE_4K: begin
+                    CMD_SECTORERASE_4K,
+                    CMD_SECTORERASE_4K_4B: begin
                         if (status_reg[1]) begin
                             state <= STA_ADDR_ERASE;
-                            addr_count <= addr_4byte ? 31 : 23;
+                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_SECTORERASE_4K_4B) ? 31 : (addr_4byte ? 31 : 23);
                             write_len <= 23'h001FF; // 4KB = 512 × 8-byte bursts - 1
                         end
                     end
                     
-                    CMD_BLOCKERASE_32K: begin
+                    CMD_BLOCKERASE_32K,
+                    CMD_BLOCKERASE_32K_4B: begin
                         if (status_reg[1]) begin
                             state <= STA_ADDR_ERASE;
-                            addr_count <= addr_4byte ? 31 : 23;
+                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_BLOCKERASE_32K_4B) ? 31 : (addr_4byte ? 31 : 23);
                             write_len <= 23'h00FFF; // 32KB = 4096 × 8-byte bursts - 1
                         end
                     end
                     
-                    CMD_BLOCKERASE_64K: begin
+                    CMD_BLOCKERASE_64K,
+                    CMD_BLOCKERASE_64K_4B: begin
                         if (status_reg[1]) begin
                             state <= STA_ADDR_ERASE;
-                            addr_count <= addr_4byte ? 31 : 23;
+                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_BLOCKERASE_64K_4B) ? 31 : (addr_4byte ? 31 : 23);
                             write_len <= 23'h01FFF; // 64KB = 8192 × 8-byte bursts - 1
                         end
                     end
@@ -411,10 +430,11 @@ module spi_trx(
                         end
                     end
                     
-                    CMD_PAGEPROGRAM: begin
+                    CMD_PAGEPROGRAM,
+                    CMD_PAGEPROGRAM_4B: begin
                         if (status_reg[1]) begin
                             state <= STA_ADDR_WRITE;
-                            addr_count <= addr_4byte ? 31 : 23;
+                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_PAGEPROGRAM_4B) ? 31 : (addr_4byte ? 31 : 23);
                             write_len <= 23'h0001F; // 256 byte page = 32 × 8-byte bursts - 1
                         end
                     end
@@ -483,7 +503,7 @@ module spi_trx(
                     log_byte_count <= 0;
                 end
                 else if ((state == STA_READSTATUS) && (bit_count_in == 0)) begin
-                    miso_byte <= status_reg;
+                    miso_byte <= status_read_sel2 ? status_reg2 : status_reg;
                 end
                 else if (state == STA_ADDR_READ) begin
                     // Receiving address bytes for read (single-bit, 1 bit/clock)

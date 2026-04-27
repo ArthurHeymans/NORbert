@@ -19,6 +19,7 @@ add_file src/pll.v
 
 # Add constraints
 add_file tangprimer25k.cst
+add_file tangprimer25k.sdc
 
 # Set top module
 set_option -top_module top
