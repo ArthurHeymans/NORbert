@@ -1,0 +1,208 @@
+// Sanyo SPI Flash Chips
+// Ported from flashprog/flashchips.c
+
+(
+    vendor: "Sanyo",
+    manufacturer_id: 0x62,
+    chips: [
+        (
+            name: "LE25FU106B",
+            device_id: 0x001D,
+            total_size: KiB(128),
+            features: (wrsr_wren: true),
+            voltage: (min: 2300, max: 3600),
+            erase_blocks: [
+                (opcode: 0xD8, regions: [(size: KiB(32), count: 4)]),
+                (opcode: 0xC7, regions: [(size: KiB(128), count: 1)]),
+            ],
+        ),
+        (
+            name: "LE25FU206",
+            device_id: 0x0044,
+            total_size: KiB(256),
+            features: (wrsr_wren: true),
+            voltage: (min: 2300, max: 3600),
+            erase_blocks: [
+                (opcode: 0xD7, regions: [(size: KiB(4), count: 64)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 4)]),
+                (opcode: 0xC7, regions: [(size: KiB(256), count: 1)]),
+            ],
+        ),
+        (
+            name: "LE25FU206A",
+            device_id: 0x0612,
+            total_size: KiB(256),
+            features: (),
+            voltage: (min: 2300, max: 3600),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 64)]),
+                (opcode: 0xD7, regions: [(size: KiB(4), count: 64)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 4)]),
+                (opcode: 0x60, regions: [(size: KiB(256), count: 1)]),
+                (opcode: 0xC7, regions: [(size: KiB(256), count: 1)]),
+            ],
+        ),
+        (
+            name: "LE25FU406B",
+            device_id: 0x001E,
+            total_size: KiB(512),
+            features: (wrsr_wren: true),
+            voltage: (min: 2300, max: 3600),
+            erase_blocks: [
+                (opcode: 0xD7, regions: [(size: KiB(4), count: 128)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 8)]),
+                (opcode: 0xC7, regions: [(size: KiB(512), count: 1)]),
+            ],
+            tested: (probe: Ok, read: Ok, erase: Ok, write: Ok),
+        ),
+        (
+            name: "LE25FU406C/LE25U40CMC",
+            device_id: 0x0613,
+            total_size: KiB(512),
+            features: (wrsr_wren: true),
+            voltage: (min: 2300, max: 3600),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 128)]),
+                (opcode: 0xD7, regions: [(size: KiB(4), count: 128)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 8)]),
+                (opcode: 0x60, regions: [(size: KiB(512), count: 1)]),
+                (opcode: 0xC7, regions: [(size: KiB(512), count: 1)]),
+            ],
+            tested: (probe: Ok, read: Ok, erase: Ok, write: Ok),
+        ),
+        (
+            name: "LE25FW106",
+            device_id: 0x0015,
+            total_size: KiB(128),
+            features: (wrsr_wren: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0xD7, regions: [(size: KiB(2), count: 64)]),
+                (opcode: 0xD8, regions: [(size: KiB(32), count: 4)]),
+                (opcode: 0xC7, regions: [(size: KiB(128), count: 1)]),
+            ],
+            tested: (probe: Ok, read: Ok, erase: Ok, write: Ok),
+        ),
+        (
+            name: "LE25FW203A",
+            device_id: 0x1600,
+            total_size: KiB(256),
+            features: (),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0xDB, regions: [(size: B(256), count: 1024)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 4)]),
+                (opcode: 0xC7, regions: [(size: KiB(256), count: 1)]),
+            ],
+        ),
+        (
+            name: "LE25FW403A",
+            device_id: 0x1100,
+            total_size: KiB(512),
+            features: (),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0xDB, regions: [(size: B(256), count: 2048)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 8)]),
+                (opcode: 0xC7, regions: [(size: KiB(512), count: 1)]),
+            ],
+        ),
+        (
+            name: "LE25FW406A",
+            device_id: 0x001A,
+            total_size: KiB(512),
+            features: (wrsr_wren: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0xD7, regions: [(size: KiB(4), count: 128)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 8)]),
+                (opcode: 0xC7, regions: [(size: KiB(512), count: 1)]),
+            ],
+            tested: (probe: Ok, read: Ok, erase: Ok, write: Ok),
+        ),
+        (
+            name: "LE25FW418A",
+            device_id: 0x0010,
+            total_size: KiB(512),
+            features: (wrsr_wren: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0xD7, regions: [(size: KiB(4), count: 128)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 8)]),
+                (opcode: 0xC7, regions: [(size: KiB(512), count: 1)]),
+            ],
+        ),
+        (
+            name: "LE25FW806",
+            device_id: 0x0026,
+            total_size: MiB(1),
+            features: (wrsr_wren: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 256)]),
+                (opcode: 0xD7, regions: [(size: KiB(4), count: 256)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 16)]),
+                (opcode: 0xC7, regions: [(size: MiB(1), count: 1)]),
+            ],
+        ),
+        (
+            name: "LE25FW808",
+            device_id: 0x0020,
+            total_size: MiB(1),
+            features: (wrsr_wren: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0xD7, regions: [(size: KiB(8), count: 128)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 16)]),
+                (opcode: 0xC7, regions: [(size: MiB(1), count: 1)]),
+            ],
+        ),
+
+        // SST25WF020A / SST25WF040B / SST25WF080B
+        //
+        // Despite the SST brand name, these chips report SANYO_ID (0x62) as
+        // their JEDEC manufacturer byte.  They use standard 256-byte page
+        // program (unlike the older SST25VFxxxB AAI chips) and WREN before WRSR.
+        // Source: flashprog flashchips.c, manufacture_id = SANYO_ID.
+        (
+            name: "SST25WF020A",
+            device_id: 0x1612,
+            total_size: KiB(256),
+            features: (wrsr_wren: true),
+            voltage: (min: 1650, max: 1950),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 64)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 4)]),
+                (opcode: 0x60, regions: [(size: KiB(256), count: 1)]),
+                (opcode: 0xC7, regions: [(size: KiB(256), count: 1)]),
+            ],
+        ),
+        (
+            name: "SST25WF040B",
+            device_id: 0x1613,
+            total_size: KiB(512),
+            features: (wrsr_wren: true),
+            voltage: (min: 1650, max: 1950),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 128)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 8)]),
+                (opcode: 0x60, regions: [(size: KiB(512), count: 1)]),
+                (opcode: 0xC7, regions: [(size: KiB(512), count: 1)]),
+            ],
+        ),
+        (
+            name: "SST25WF080B",
+            device_id: 0x1614,
+            total_size: MiB(1),
+            features: (wrsr_wren: true),
+            voltage: (min: 1650, max: 1950),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 256)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 16)]),
+                (opcode: 0x60, regions: [(size: MiB(1), count: 1)]),
+                (opcode: 0xC7, regions: [(size: MiB(1), count: 1)]),
+            ],
+            tested: (probe: Ok, read: Ok, erase: Ok, write: Ok),
+        ),
+    ],
+)

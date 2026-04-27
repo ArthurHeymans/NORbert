@@ -59,6 +59,19 @@ make tool
 
 This builds `spi-flash-tool` at `tool/target/release/spi-flash-tool`.
 
+### WebUI
+
+NORbert also has a browser WebUI built with Rust/WASM and Trunk:
+
+```
+cd tool
+trunk serve --release
+```
+
+Open the served page in a Chromium-based desktop browser. The WebUI uses WebSerial to connect to the NORbert UART and covers the CLI operations that are available over UART: version/status, start/stop, #HOLD control, read/dump, write/load/verify, chip configuration from the embedded rflasher chip database, SPI bus monitoring, and TOCTOU trap control. The browser's WebSerial chooser replaces `ports`; FT245 FIFO access still requires the native CLI.
+
+GitHub Pages builds publish the WebUI and copy the CI-built `spi_flash.fs` bitstream into the Pages bundle for download/programming with `openFPGALoader`.
+
 ## Usage
 
 Load a firmware image into NORbert's SDRAM, then let your target SPI master read it back as if it were a real flash chip.

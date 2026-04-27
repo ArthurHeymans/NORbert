@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NORbert WebUI</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #101418;
+      color: #e8eef2;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    #norbert_canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .loading {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-content: center;
+      text-align: center;
+      background: #101418;
+      z-index: 10;
+    }
+    .loading-card {
+      max-width: 560px;
+      padding: 2rem;
+      border: 1px solid #2b3942;
+      border-radius: 12px;
+      background: #172029;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+    }
+    .warning {
+      margin-top: 1rem;
+      padding: 0.75rem;
+      border-radius: 8px;
+      background: #3a2f0b;
+      color: #ffdf7a;
+    }
+    .error {
+      margin-top: 1rem;
+      padding: 0.75rem;
+      border-radius: 8px;
+      background: #3a1111;
+      color: #ff9a9a;
+    }
+  </style>
+  <link data-trunk rel="rust" data-bin="norbert-web" data-cargo-no-default-features data-cargo-features="web" data-wasm-opt="z" />
+</head>
+<body>
+  <div class="loading" id="loading">
+    <div class="loading-card">
+      <h1>NORbert WebUI</h1>
+      <p>Loading WebAssembly UI…</p>
+      <noscript>
+        <div class="error">JavaScript is required for the WebUI.</div>
+      </noscript>
+      <div class="warning" id="browser-warning" style="display: none;">
+        WebSerial is not available in this browser. Use Chrome, Edge, or another Chromium-based desktop browser over HTTPS or localhost.
+      </div>
+    </div>
+  </div>
+  <canvas id="norbert_canvas"></canvas>
+  <script>
+    if (!("serial" in navigator)) {
+      document.getElementById("browser-warning").style.display = "block";
+    }
+  </script>
+</body>
+</html>

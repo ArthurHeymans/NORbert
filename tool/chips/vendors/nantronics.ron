@@ -1,0 +1,81 @@
+// Nantronics SPI Flash Chips
+// Ported from flashprog/flashchips.c
+
+(
+    vendor: "Nantronics",
+    manufacturer_id: 0xD5,
+    chips: [
+        (
+            name: "N25S10",
+            device_id: 0x3011,
+            total_size: KiB(128),
+            features: (wrsr_wren: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 32)]),
+                (opcode: 0xD7, regions: [(size: KiB(4), count: 32)]),
+                (opcode: 0x52, regions: [(size: KiB(32), count: 4)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 2)]),
+                (opcode: 0x60, regions: [(size: KiB(128), count: 1)]),
+                (opcode: 0xC7, regions: [(size: KiB(128), count: 1)]),
+            ],
+        ),
+        (
+            name: "N25S16",
+            device_id: 0x3015,
+            total_size: MiB(2),
+            features: (wrsr_wren: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 512)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 32)]),
+                (opcode: 0x60, regions: [(size: MiB(2), count: 1)]),
+                (opcode: 0xC7, regions: [(size: MiB(2), count: 1)]),
+            ],
+        ),
+        (
+            name: "N25S20",
+            device_id: 0x3012,
+            total_size: KiB(256),
+            features: (wrsr_wren: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 64)]),
+                (opcode: 0xD7, regions: [(size: KiB(4), count: 64)]),
+                (opcode: 0x52, regions: [(size: KiB(32), count: 8)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 4)]),
+                (opcode: 0x60, regions: [(size: KiB(256), count: 1)]),
+                (opcode: 0xC7, regions: [(size: KiB(256), count: 1)]),
+            ],
+        ),
+        (
+            name: "N25S40",
+            device_id: 0x3013,
+            total_size: KiB(512),
+            features: (wrsr_wren: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 128)]),
+                (opcode: 0xD7, regions: [(size: KiB(4), count: 128)]),
+                (opcode: 0x52, regions: [(size: KiB(32), count: 16)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 8)]),
+                (opcode: 0x60, regions: [(size: KiB(512), count: 1)]),
+                (opcode: 0xC7, regions: [(size: KiB(512), count: 1)]),
+            ],
+        ),
+        (
+            name: "N25S80",
+            device_id: 0x3014,
+            total_size: MiB(1),
+            features: (wrsr_wren: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 256)]),
+                (opcode: 0x52, regions: [(size: KiB(32), count: 32)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 16)]),
+                (opcode: 0x60, regions: [(size: MiB(1), count: 1)]),
+                (opcode: 0xC7, regions: [(size: MiB(1), count: 1)]),
+            ],
+        ),
+    ],
+)

@@ -1,0 +1,100 @@
+// XMC (acquired by Micron) SPI Flash Chips
+// Ported from flashprog/flashchips.c
+
+(
+    vendor: "XMC",
+    manufacturer_id: 0x20,
+    chips: [
+        // XM25QH series - 3.3V with QPI support
+        (
+            name: "XM25QH64C",
+            device_id: 0x4017,
+            total_size: MiB(8),
+            features: (wrsr_wren: true, fast_read: true, quad_io: true, qpi: true, otp: true, status_reg_2: true, status_reg_3: true, qe_sr2: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 2048)]),
+                (opcode: 0x52, regions: [(size: KiB(32), count: 256)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 128)]),
+                (opcode: 0x60, regions: [(size: MiB(8), count: 1)]),
+                (opcode: 0xC7, regions: [(size: MiB(8), count: 1)]),
+            ],
+        ),
+        (
+            name: "XM25QH128C",
+            device_id: 0x4018,
+            total_size: MiB(16),
+            features: (wrsr_wren: true, fast_read: true, quad_io: true, qpi: true, otp: true, status_reg_2: true, status_reg_3: true, qe_sr2: true, wp_tb: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 4096)]),
+                (opcode: 0x52, regions: [(size: KiB(32), count: 512)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 256)]),
+                (opcode: 0x60, regions: [(size: MiB(16), count: 1)]),
+                (opcode: 0xC7, regions: [(size: MiB(16), count: 1)]),
+            ],
+        ),
+        (
+            name: "XM25QH256C",
+            device_id: 0x4019,
+            total_size: MiB(32),
+            features: (wrsr_wren: true, fast_read: true, quad_io: true, qpi: true, otp: true, four_byte_addr: true, four_byte_enter: true, status_reg_2: true, status_reg_3: true, qe_sr2: true, wp_tb: true),
+            voltage: (min: 2700, max: 3600),
+            erase_blocks: [
+                (opcode: 0x21, regions: [(size: KiB(4), count: 8192)]),
+                (opcode: 0x20, regions: [(size: KiB(4), count: 8192)]),
+                (opcode: 0x52, regions: [(size: KiB(32), count: 1024)]),
+                (opcode: 0xDC, regions: [(size: KiB(64), count: 512)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 512)]),
+                (opcode: 0x60, regions: [(size: MiB(32), count: 1)]),
+                (opcode: 0xC7, regions: [(size: MiB(32), count: 1)]),
+            ],
+        ),
+
+        // XM25QU series - 1.8V with QPI support
+        (
+            name: "XM25QU64C",
+            device_id: 0x4117,
+            total_size: MiB(8),
+            features: (wrsr_wren: true, fast_read: true, quad_io: true, qpi: true, otp: true, status_reg_2: true, status_reg_3: true, qe_sr2: true),
+            voltage: (min: 1650, max: 1950),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 2048)]),
+                (opcode: 0x52, regions: [(size: KiB(32), count: 256)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 128)]),
+                (opcode: 0x60, regions: [(size: MiB(8), count: 1)]),
+                (opcode: 0xC7, regions: [(size: MiB(8), count: 1)]),
+            ],
+        ),
+        (
+            name: "XM25QU128C",
+            device_id: 0x4118,
+            total_size: MiB(16),
+            features: (wrsr_wren: true, fast_read: true, quad_io: true, qpi: true, otp: true, status_reg_2: true, status_reg_3: true, qe_sr2: true),
+            voltage: (min: 1650, max: 1950),
+            erase_blocks: [
+                (opcode: 0x20, regions: [(size: KiB(4), count: 4096)]),
+                (opcode: 0x52, regions: [(size: KiB(32), count: 512)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 256)]),
+                (opcode: 0x60, regions: [(size: MiB(16), count: 1)]),
+                (opcode: 0xC7, regions: [(size: MiB(16), count: 1)]),
+            ],
+        ),
+        (
+            name: "XM25QU256C",
+            device_id: 0x4119,
+            total_size: MiB(32),
+            features: (wrsr_wren: true, fast_read: true, quad_io: true, qpi: true, otp: true, four_byte_addr: true, four_byte_enter: true, status_reg_2: true, status_reg_3: true, qe_sr2: true),
+            voltage: (min: 1650, max: 1950),
+            erase_blocks: [
+                (opcode: 0x21, regions: [(size: KiB(4), count: 8192)]),
+                (opcode: 0x20, regions: [(size: KiB(4), count: 8192)]),
+                (opcode: 0x52, regions: [(size: KiB(32), count: 1024)]),
+                (opcode: 0xDC, regions: [(size: KiB(64), count: 512)]),
+                (opcode: 0xD8, regions: [(size: KiB(64), count: 512)]),
+                (opcode: 0x60, regions: [(size: MiB(32), count: 1)]),
+                (opcode: 0xC7, regions: [(size: MiB(32), count: 1)]),
+            ],
+        ),
+    ],
+)
