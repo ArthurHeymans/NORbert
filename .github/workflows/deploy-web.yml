@@ -31,7 +31,7 @@ jobs:
         run: cargo install trunk --locked
       - name: Build WebUI with Trunk
         working-directory: tool
-        run: trunk build --release
+        run: trunk build --release --public-url "/${{ github.event.repository.name }}/"
       - uses: DeterminateSystems/nix-installer-action@v22
       - uses: DeterminateSystems/magic-nix-cache-action@v13
       - name: Allow bubblewrap user namespaces

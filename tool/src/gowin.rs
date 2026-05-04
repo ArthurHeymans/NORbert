@@ -714,6 +714,19 @@ impl GowinProgrammer {
         }
         let jedec = (u32::from(id[0]) << 16) | (u32::from(id[1]) << 8) | u32::from(id[2]);
 
+        let data_len = u32::try_from(data.len())
+            .map_err(|_| "bitstream is too large for 24-bit SPI flash addressing".to_string())?;
+        let data_end = options
+            .offset
+            .checked_add(data_len)
+            .ok_or("flash write range overflows address arithmetic")?;
+        if data_end > 0x01_00_00_00 {
+            return Err(format!(
+                "flash write range 0x{:06x}..0x{:06x} exceeds 24-bit SPI flash addressing",
+                options.offset, data_end
+            ));
+        }
+
         let status = self.spi_read_status().await?;
         if (status & FLASH_BP_MASK) != 0 {
             if !options.unprotect {
@@ -731,7 +744,10 @@ impl GowinProgrammer {
                 .await?;
         } else {
             let start = options.offset & !0xfff;
-            let end = (options.offset + data.len() as u32 + 0xfff) & !0xfff;
+            let end = data_end
+                .checked_add(0xfff)
+                .ok_or("flash erase range overflows address arithmetic")?
+                & !0xfff;
             let total = (end - start) as usize;
             let mut erased = 0usize;
             for addr in (start..end).step_by(0x1000) {
@@ -749,8 +765,12 @@ impl GowinProgrammer {
             }
         }
 
-        for (page_index, chunk) in data.chunks(256).enumerate() {
-            let addr = options.offset + (page_index * 256) as u32;
+        let mut written = 0usize;
+        while written < data.len() {
+            let addr = options.offset + written as u32;
+            let page_remaining = 256 - (addr as usize & 0xff);
+            let chunk_len = page_remaining.min(data.len() - written);
+            let chunk = &data[written..written + chunk_len];
             let mut payload = Vec::with_capacity(3 + chunk.len());
             payload.extend_from_slice(&addr24(addr));
             payload.extend_from_slice(chunk);
@@ -758,10 +778,10 @@ impl GowinProgrammer {
             self.spi_transfer(FLASH_PP, &payload, 0).await?;
             self.spi_wait(FLASH_RDSR, FLASH_RDSR_WIP, 0, 1000, "page program")
                 .await?;
-            let done = ((page_index + 1) * 256).min(data.len());
+            written += chunk_len;
             progress(ProgramProgress {
                 stage: "Writing flash",
-                done,
+                done: written,
                 total: data.len(),
             });
             sleep_ms(0).await;
@@ -1227,12 +1247,12 @@ impl FtdiJtag {
         let mut remaining = cycles;
         let mut cmd = Vec::new();
         while remaining >= 8 {
-            let bytes = (remaining / 8).min(65_536) as u16;
-            let field = bytes - 1;
+            let bytes = (remaining / 8).min(65_536);
+            let field = (bytes - 1) as u16;
             cmd.push(mpsse::CLK_BYTES);
             cmd.push(field as u8);
             cmd.push((field >> 8) as u8);
-            remaining -= u32::from(bytes) * 8;
+            remaining -= bytes * 8;
         }
         if remaining > 0 {
             cmd.push(mpsse::CLK_BITS);

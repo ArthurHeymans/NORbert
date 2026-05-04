@@ -166,9 +166,25 @@ impl FlashDevice {
 
     async fn get_version(&mut self) -> Result<u8, String> {
         self.transport.write_all(&[CMD_VERSION]).await?;
-        let mut buf = [0u8; 1];
-        self.transport.read_exact(&mut buf).await?;
-        Ok(buf[0])
+
+        // Opening a serial adapter can leave modem-status zeros or line-glitch
+        // 0xff bytes queued ahead of the FPGA's reply.  Consume that leading
+        // junk here so the real version byte is not misreported and subsequent
+        // commands do not see the version response shifted into their ACK slot.
+        let mut skipped = 0u32;
+        loop {
+            let mut buf = [0u8; 1];
+            self.transport.read_exact(&mut buf).await?;
+            match buf[0] {
+                0x00 | 0xff => {
+                    skipped += 1;
+                    if skipped > 8 {
+                        return Err("version: too many 0x00/0xff bytes before reply".to_string());
+                    }
+                }
+                version => return Ok(version),
+            }
+        }
     }
 
     async fn read_ack(&mut self, context: &str) -> Result<u8, String> {
@@ -176,12 +192,14 @@ impl FlashDevice {
         loop {
             let mut resp = [0u8; 1];
             self.transport.read_exact(&mut resp).await?;
-            if resp[0] != 0x00 {
-                return Ok(resp[0]);
-            }
-            skipped += 1;
-            if skipped > 8 {
-                return Err(format!("{context}: too many 0x00 bytes before ACK"));
+            match resp[0] {
+                0x00 | 0xff => {
+                    skipped += 1;
+                    if skipped > 8 {
+                        return Err(format!("{context}: too many 0x00/0xff bytes before ACK"));
+                    }
+                }
+                ack => return Ok(ack),
             }
         }
     }
