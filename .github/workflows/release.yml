@@ -1,0 +1,61 @@
+name: Release artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: read-all
+
+jobs:
+  artifacts:
+    name: Build release artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: tool -> tool/target
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libudev-dev libftdi1-dev
+      - name: Build CLI
+        run: cargo build --manifest-path tool/Cargo.toml --release
+      - name: Install Trunk
+        run: cargo install trunk --locked
+      - name: Build WebUI
+        working-directory: tool
+        run: trunk build --release
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+      - name: Allow bubblewrap user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+      - name: Build FPGA bitstream
+        run: nix develop --command make build
+      - name: Package artifacts
+        run: |
+          cp impl/pnr/spi_flash.fs tool/dist/spi_flash.fs
+          tar -C tool/dist -czf norbert-webui.tar.gz .
+          cp tool/target/release/spi-flash-tool spi-flash-tool-x86_64-linux
+          cp impl/pnr/spi_flash.fs spi_flash.fs
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" --generate-notes
+          fi
+          gh release upload "$TAG_NAME" \
+            spi_flash.fs \
+            spi-flash-tool-x86_64-linux \
+            norbert-webui.tar.gz \
+            --clobber

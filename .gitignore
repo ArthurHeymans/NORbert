@@ -1,2 +1,4 @@
 impl/
+tool/dist/
 tool/target/
+tool/target-nix*/

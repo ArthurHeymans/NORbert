@@ -25,7 +25,7 @@ CST_FILE = tangprimer25k.cst
 # Gowin IDE output
 BITSTREAM = impl/pnr/spi_flash.fs
 
-.PHONY: all build lint prog flash clean tool tool-d2xx ftdi-setup help
+.PHONY: all build lint prog flash clean tool tool-d2xx web web-serve ftdi-setup help
 
 all: build
 
@@ -66,6 +66,15 @@ tool-d2xx:
 	cargo build --release --manifest-path tool/Cargo.toml --no-default-features --features d2xx
 	@echo "Tool built (D2XX backend): tool/target/release/spi-flash-tool"
 
+# Build the browser WebUI (requires trunk and the wasm32-unknown-unknown target)
+web:
+	cd tool && trunk build --release
+	@echo "WebUI built: tool/dist"
+
+web-serve:
+	cd tool && trunk serve --release
+	@echo "WebUI served at http://localhost:8080"
+
 help:
 	@echo "Tang Primer 25K SPI Flash Emulator"
 	@echo ""
@@ -75,5 +84,6 @@ help:
 	@echo "  make lint    - Lint Verilog with yosys"
 	@echo "  make tool    - Build spi-flash-tool (rs-ftdi backend, default)"
 	@echo "  make tool-d2xx - Build spi-flash-tool (D2XX backend)"
+	@echo "  make web     - Build browser WebUI"
 	@echo "  make ftdi-setup - Program FT2232H EEPROM for 245 FIFO"
 	@echo "  make clean   - Clean build artifacts"

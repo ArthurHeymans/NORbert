@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions: read-all
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust CLI and WebUI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: tool -> tool/target
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libudev-dev libftdi1-dev
+      - name: Check formatting
+        run: cargo fmt --manifest-path tool/Cargo.toml --all -- --check
+      - name: Clippy CLI
+        run: cargo clippy --manifest-path tool/Cargo.toml --no-default-features --features cli --all-targets -- -D warnings
+      - name: Clippy WebUI
+        run: cargo clippy --manifest-path tool/Cargo.toml --target wasm32-unknown-unknown --no-default-features --features web --bin norbert-web -- -D warnings
+      - name: Test CLI library code
+        run: cargo test --manifest-path tool/Cargo.toml --no-default-features --features cli
+      - name: Build CLI (UART-only)
+        run: cargo build --manifest-path tool/Cargo.toml --release --no-default-features --features cli
+      - name: Build CLI (default FT245 backend)
+        run: cargo build --manifest-path tool/Cargo.toml --release
+      - name: Build WebUI crate
+        run: cargo build --manifest-path tool/Cargo.toml --target wasm32-unknown-unknown --release --no-default-features --features web --bin norbert-web
+
+  webui:
+    name: Trunk WebUI bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: tool -> tool/target
+      - name: Install Trunk
+        run: cargo install trunk --locked
+      - name: Build WebUI bundle
+        working-directory: tool
+        run: trunk build --release
+      - name: Upload WebUI artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: norbert-webui
+          path: tool/dist
+          if-no-files-found: error
+
+  bitstream:
+    name: FPGA bitstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+      - name: Allow bubblewrap user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+      - name: Build FPGA bitstream
+        run: nix develop --command make build
+      - name: Upload bitstream artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: norbert-spi-flash-bitstream
+          path: impl/pnr/spi_flash.fs
+          if-no-files-found: error

@@ -141,10 +141,13 @@
             # FTDI EEPROM programming (FT2232H async 245 setup)
             libftdi1
 
-            # Rust toolchain for spi-flash-tool
+            # Rust toolchain for spi-flash-tool and WebUI
             cargo
             rustc
             pkg-config
+            trunk
+            wasm-bindgen-cli
+            binaryen
             udev
           ];
 
@@ -160,6 +163,7 @@
             echo "  gtkwave          - Waveform viewer"
             echo "  ftdi_eeprom      - FT2232H EEPROM programmer"
             echo "  cargo            - Rust build tool"
+            echo "  trunk            - Rust/WASM WebUI build tool"
             echo ""
             echo "Build commands:"
             echo "  make build       - Synthesize with gw_sh (CLI)"
