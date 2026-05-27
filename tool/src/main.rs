@@ -7,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serialport::SerialPort;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 #[cfg(any(feature = "d2xx", feature = "ftdi"))]
@@ -536,10 +536,10 @@ impl FlashDevice {
         if length == 0 || length > BLOCK_SIZE {
             bail!("Invalid length: must be 1-{}", BLOCK_SIZE);
         }
-        if address % 8 != 0 {
+        if !address.is_multiple_of(8) {
             bail!("Address must be 8-byte aligned");
         }
-        if length % 8 != 0 {
+        if !length.is_multiple_of(8) {
             bail!("Length must be a multiple of 8");
         }
 
@@ -569,10 +569,10 @@ impl FlashDevice {
         if data.is_empty() || data.len() > BLOCK_SIZE {
             bail!("Invalid data length: must be 1-{}", BLOCK_SIZE);
         }
-        if address % 8 != 0 {
+        if !address.is_multiple_of(8) {
             bail!("Address must be 8-byte aligned");
         }
-        if data.len() % 8 != 0 {
+        if !data.len().is_multiple_of(8) {
             bail!("Data length must be a multiple of 8");
         }
 
@@ -851,19 +851,19 @@ impl FlashDevice {
     }
 
     fn write(&mut self, address: u32, data: &[u8]) -> Result<()> {
-        if address % 8 != 0 {
+        if !address.is_multiple_of(8) {
             bail!("Address must be 8-byte aligned for writes");
         }
 
         let mut padded = data.to_vec();
-        if padded.len() % 8 != 0 {
-            padded.resize((padded.len() + 7) / 8 * 8, 0xFF);
+        if !padded.len().is_multiple_of(8) {
+            padded.resize(padded.len().div_ceil(8) * 8, 0xFF);
         }
 
         let mut addr = address;
         let mut offset = 0;
 
-        let total_blocks = (padded.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let total_blocks = padded.len().div_ceil(BLOCK_SIZE);
         let mut block_num = 0;
         while offset < padded.len() {
             let chunk_len = std::cmp::min(BLOCK_SIZE, padded.len() - offset);
@@ -1188,7 +1188,7 @@ fn cmd_write(cli: &Cli, address: u32, data_hex: &str) -> Result<()> {
 
     let mut padded = data.clone();
     if padded.len() % 8 != 0 {
-        padded.resize((padded.len() + 7) / 8 * 8, 0xFF);
+        padded.resize(padded.len().div_ceil(8) * 8, 0xFF);
     }
 
     device.with_emulation_stopped(|device| device.write(address, &padded))?;
@@ -1218,7 +1218,7 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
 
     let mut padded = data.clone();
     if padded.len() % 8 != 0 {
-        padded.resize((padded.len() + 7) / 8 * 8, 0xFF);
+        padded.resize(padded.len().div_ceil(8) * 8, 0xFF);
     }
 
     // Load is the one command whose natural end state is "ready to
@@ -1233,7 +1233,7 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
 
         let mut addr = address;
         let mut offset = 0;
-        let total_blocks = (padded.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let total_blocks = padded.len().div_ceil(BLOCK_SIZE);
         let mut block_num = 0;
 
         while offset < padded.len() {
@@ -1310,15 +1310,15 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
     })
 }
 
-fn cmd_dump(cli: &Cli, file: &PathBuf, address: u32, length: u32) -> Result<()> {
-    cmd_read(cli, address, length, Some(file.clone()))
+fn cmd_dump(cli: &Cli, file: &Path, address: u32, length: u32) -> Result<()> {
+    cmd_read(cli, address, length, Some(file.to_path_buf()))
 }
 
 fn cmd_configure(cli: &Cli, chip_db_path: &str, chip_name: &str) -> Result<()> {
     // Expand ~ in path
-    let expanded = if chip_db_path.starts_with("~/") {
+    let expanded = if let Some(stripped) = chip_db_path.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        format!("{}/{}", home, &chip_db_path[2..])
+        format!("{}/{}", home, stripped)
     } else {
         chip_db_path.to_string()
     };
@@ -1430,10 +1430,7 @@ fn cmd_probe(cli: &Cli) -> Result<()> {
     ];
 
     println!("FT245 probe (D2XX): send 1 byte, wait 200ms, read back\n");
-    println!(
-        "{:<30} {:>4}   {:>8}  {}",
-        "Test", "Sent", "Expected", "Response"
-    );
+    println!("{:<30} {:>4}   {:>8}  Response", "Test", "Sent", "Expected");
     println!("{}", "-".repeat(70));
 
     for (byte, label, expected) in &probes {
@@ -1583,10 +1580,7 @@ fn cmd_probe(cli: &Cli) -> Result<()> {
     ];
 
     println!("FT245 probe (rs-ftdi): send 1 byte, wait 200ms, read back\n");
-    println!(
-        "{:<30} {:>4}   {:>8}  {}",
-        "Test", "Sent", "Expected", "Response"
-    );
+    println!("{:<30} {:>4}   {:>8}  Response", "Test", "Sent", "Expected");
     println!("{}", "-".repeat(70));
 
     for (byte, label, expected) in &probes {
@@ -1666,7 +1660,7 @@ fn cmd_probe(cli: &Cli) -> Result<()> {
         println!("Sent {:?}: (no response)", multi);
     } else {
         let hex_str: Vec<String> = buf[..got].iter().map(|b| format!("0x{:02X}", b)).collect();
-        let is_echo = &buf[..got] == &multi[..got];
+        let is_echo = buf[..got] == multi[..got];
         println!(
             "Sent {} bytes: {:02X?}\nGot  {} bytes: [{}]{}",
             multi.len(),
@@ -1839,10 +1833,7 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
     // Enable logging
     device.log_start()?;
     eprintln!("Logging started. Press Ctrl+C to stop.\n");
-    eprintln!(
-        "{:<6} {:<18} {:<10} {}",
-        "TXN#", "COMMAND", "ADDRESS", "INFO"
-    );
+    eprintln!("{:<6} {:<18} {:<10} INFO", "TXN#", "COMMAND", "ADDRESS");
     eprintln!("{}", "-".repeat(60));
 
     // TOCTOU detection state: address range -> access count
