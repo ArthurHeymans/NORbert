@@ -37,6 +37,7 @@ nix develop    # or let direnv handle it
 This provides the Gowin IDE (Education Edition), yosys, openFPGALoader, verilator, and the Rust toolchain.
 
 Without Nix, you'll need:
+
 - [Gowin IDE Education Edition](https://www.gowinsemi.com/en/support/home/) v1.9.11.03 (`gw_sh` on PATH)
 - [openFPGALoader](https://github.com/trabucayre/openFPGALoader)
 - [yosys](https://github.com/YosysHQ/yosys) (optional, for linting)
@@ -233,6 +234,9 @@ src/
   fifo.v       Synchronous FIFO (first-word-fall-through)
   util.v       Clock divider, PWM, synchronizers
   pll.v        PLL: 50MHz -> 120MHz with phase-shifted outputs
+pico-firmware/
+  protocol/    no_std postcard RPC wire types for the Pico bridge
+  firmware/    Embassy RP2040 USB + W5500 bridge firmware
 tool/
   src/main.rs  Host-side CLI (Rust) for loading/dumping/monitoring/TOCTOU over UART or FT245
   src/chip.rs  Chip definition loading from rflasher RON database

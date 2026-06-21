@@ -1,0 +1,16 @@
+[package]
+name = "norbert-pico-protocol"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Postcard-framed RPC protocol for the NORbert Pico bridge"
+
+[features]
+default = []
+defmt = ["dep:defmt", "heapless/defmt-03"]
+
+[dependencies]
+defmt = { workspace = true, optional = true }
+heapless = { workspace = true, features = ["serde"] }
+postcard = { workspace = true }
+serde = { workspace = true }
