@@ -111,11 +111,7 @@
             echo "Setup complete!"
           fi
 
-          unset QT_QPA_PLATFORMTHEME QT_STYLE_OVERRIDE
-          export QT_QPA_PLATFORM=offscreen
-          export QT_XCB_GL_INTEGRATION=none
-
-          exec ${gowinFhs}/bin/gowin-fhs -c "cd '$(pwd)' && QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH='$WORKSPACE_DIR/IDE/lib':\"$LD_LIBRARY_PATH\" '$WORKSPACE_DIR/IDE/bin/gw_sh' $*"
+          exec ${gowinFhs}/bin/gowin-fhs -c "cd '$(pwd)' &&  LD_LIBRARY_PATH='$WORKSPACE_DIR/IDE/lib':\"$LD_LIBRARY_PATH\" '$WORKSPACE_DIR/IDE/bin/gw_sh' $*"
         '';
       in
       {
