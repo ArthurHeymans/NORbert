@@ -242,7 +242,7 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     // ------------------------------------------------------------------
     let mut dw10: u32 = 0x01; // multiplier = 2*(1+1) = 4x
                               // Type 1 (4KB):  ~45ms  -> 16ms * 3 = 48ms  -> unit=01, count=2
-    if erase_ops.len() > 0 {
+    if !erase_ops.is_empty() {
         dw10 |= ((0x01 << 5) | 2) << 4; // 0x22 << 4
     }
     // Type 2 (32KB): ~120ms -> 16ms * 8 = 128ms -> unit=01, count=7
