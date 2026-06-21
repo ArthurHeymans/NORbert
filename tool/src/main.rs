@@ -1,17 +1,18 @@
 mod chip;
 mod sfdp;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use nusb::MaybeFuture;
+use nusb::transfer::{Bulk, In, Out};
 use serialport::SerialPort;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
-#[cfg(any(feature = "d2xx", feature = "ftdi"))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const BAUD_RATE: u32 = 2_000_000;
 // Max bursts per command: 16-bit len field (v3), 8 bytes per burst.
@@ -68,6 +69,10 @@ const LOG_TRAP: u8 = 0xA4;
 const FTDI_VID: u16 = 0x0403;
 #[cfg(any(feature = "d2xx", feature = "ftdi"))]
 const FT2232H_PID: u16 = 0x6010;
+
+// Raspberry Pi Pico bridge USB identifiers (firmware/src/main.rs).
+const PICO_USB_VID: u16 = 0x1209;
+const PICO_USB_PID: u16 = 0x4e42;
 
 // ---------------------------------------------------------------------------
 // Transport trait -- abstracts UART serial vs FT245 FIFO
@@ -368,12 +373,496 @@ impl Transport for Ft245Transport {
 }
 
 // ---------------------------------------------------------------------------
+// Pico USB bridge transport -- postcard RPC over vendor bulk endpoints
+// ---------------------------------------------------------------------------
+
+struct PicoUsbTransport {
+    reader: nusb::io::EndpointRead<Bulk>,
+    writer: nusb::io::EndpointWrite<Bulk>,
+    seq: u32,
+    pending: VecDeque<u8>,
+    read_cache: VecDeque<CachedRead>,
+    last_read_next: Option<(u32, usize)>,
+    read_ahead: usize,
+    trace_timing: bool,
+}
+
+struct CachedRead {
+    address: u32,
+    length: usize,
+    data: Vec<u8>,
+}
+
+struct PicoRpcToken {
+    seq: u32,
+    request_name: &'static str,
+    t0: Instant,
+    t_encode: Instant,
+    t_write: Instant,
+}
+
+impl PicoUsbTransport {
+    fn open() -> Result<Self> {
+        let info = nusb::list_devices()
+            .wait()
+            .context("Failed to list USB devices")?
+            .find(|dev| dev.vendor_id() == PICO_USB_VID && dev.product_id() == PICO_USB_PID)
+            .ok_or_else(|| {
+                anyhow!(
+                    "NORbert Pico bridge USB device {:04x}:{:04x} not found",
+                    PICO_USB_VID,
+                    PICO_USB_PID
+                )
+            })?;
+
+        let mut attempts = 0;
+        let interface = loop {
+            attempts += 1;
+            let device = match info.open().wait() {
+                Ok(device) => device,
+                Err(error) => {
+                    if attempts >= 10 {
+                        return Err(anyhow!(error).context("Failed to open NORbert Pico bridge"));
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
+
+            match device.claim_interface(0).wait() {
+                Ok(interface) => break interface,
+                Err(error) => {
+                    if attempts >= 10 {
+                        return Err(
+                            anyhow!(error).context("Failed to claim NORbert Pico USB interface 0")
+                        );
+                    }
+                    // Linux/nusb can leave the interface busy briefly after a
+                    // previous tool process exits or is interrupted.
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        };
+
+        let writer = interface
+            .endpoint::<Bulk, Out>(0x01)
+            .context("Pico USB OUT endpoint 0x01 not found")?
+            .writer(norbert_pico_protocol::MAX_FRAME)
+            .with_num_transfers(4);
+        let reader = interface
+            .endpoint::<Bulk, In>(0x81)
+            .context("Pico USB IN endpoint 0x81 not found")?
+            .reader(norbert_pico_protocol::MAX_FRAME)
+            .with_num_transfers(4)
+            .with_read_timeout(Duration::from_secs(5));
+
+        let read_ahead = std::env::var("NORBERT_PICO_READAHEAD")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 16);
+
+        Ok(Self {
+            reader,
+            writer,
+            seq: 1,
+            pending: VecDeque::new(),
+            read_cache: VecDeque::new(),
+            last_read_next: None,
+            read_ahead,
+            trace_timing: std::env::var_os("NORBERT_PICO_TRACE_TIMING").is_some(),
+        })
+    }
+
+    fn rpc(
+        &mut self,
+        request: norbert_pico_protocol::Request,
+    ) -> Result<norbert_pico_protocol::Response> {
+        let token = self.send_rpc(request)?;
+        self.writer.flush()?;
+        self.recv_rpc(token)
+    }
+
+    fn send_rpc(&mut self, request: norbert_pico_protocol::Request) -> Result<PicoRpcToken> {
+        let seq = self.seq;
+        self.seq = self.seq.wrapping_add(1);
+
+        let request_name = pico_request_name(&request);
+        let frame = norbert_pico_protocol::HostFrame { seq, request };
+        let mut out = [0u8; norbert_pico_protocol::MAX_FRAME];
+        let t0 = Instant::now();
+        let len = norbert_pico_protocol::encode_host_frame(&frame, out.as_mut_slice())
+            .map_err(|e| anyhow!("Failed to encode Pico RPC frame: {:?}", e))?;
+        let t_encode = Instant::now();
+        self.writer.write_all(&out[..len])?;
+        let t_write = Instant::now();
+        Ok(PicoRpcToken {
+            seq,
+            request_name,
+            t0,
+            t_encode,
+            t_write,
+        })
+    }
+
+    fn recv_rpc(&mut self, token: PicoRpcToken) -> Result<norbert_pico_protocol::Response> {
+        let mut prefix = [0u8; 2];
+        self.reader.read_exact(&mut prefix)?;
+        let t_prefix = Instant::now();
+        let body_len = norbert_pico_protocol::frame_len(prefix);
+        if body_len > norbert_pico_protocol::MAX_FRAME_BODY {
+            bail!("Pico RPC response too large: {} bytes", body_len);
+        }
+        let mut body = [0u8; norbert_pico_protocol::MAX_FRAME_BODY];
+        self.reader.read_exact(&mut body[..body_len])?;
+        let t_body = Instant::now();
+        let response = norbert_pico_protocol::decode_device_body(&body[..body_len])
+            .map_err(|e| anyhow!("Failed to decode Pico RPC response: {:?}", e))?;
+        let t_decode = Instant::now();
+        if self.trace_timing {
+            eprintln!(
+                "pico-rpc {}: encode={:?} usb-out={:?} wait-first-in={:?} usb-in={:?} decode={:?} total={:?} body={body_len}",
+                token.request_name,
+                token.t_encode.duration_since(token.t0),
+                token.t_write.duration_since(token.t_encode),
+                t_prefix.duration_since(token.t_write),
+                t_body.duration_since(t_prefix),
+                t_decode.duration_since(t_body),
+                t_decode.duration_since(token.t0),
+            );
+        }
+        if response.seq != token.seq {
+            bail!(
+                "Pico RPC sequence mismatch: sent {}, got {}",
+                token.seq,
+                response.seq
+            );
+        }
+
+        match response.response {
+            norbert_pico_protocol::Response::Error(e) => {
+                bail!("Pico bridge returned error: {:?}", e)
+            }
+            response => Ok(response),
+        }
+    }
+
+    fn queue_response(&mut self, bytes: &[u8]) {
+        self.pending.clear();
+        self.pending.extend(bytes.iter().copied());
+    }
+
+    fn queue_pico_read(&mut self, address: u32, length: usize) -> Result<()> {
+        if let Some(cached) = self.read_cache.front() {
+            if cached.address == address && cached.length == length {
+                let cached = self.read_cache.pop_front().expect("front checked");
+                self.queue_response(cached.data.as_slice());
+                self.last_read_next = next_pico_read(address, length);
+                return Ok(());
+            }
+        }
+
+        let sequential = self.last_read_next == Some((address, length));
+        self.read_cache.clear();
+        let mut count = if sequential && length == norbert_pico_protocol::MAX_CHUNK {
+            self.read_ahead
+        } else {
+            1
+        };
+        count = count.min(max_read_ahead_within_sdram(address, length));
+        count = count.max(1);
+
+        let mut tokens = Vec::with_capacity(count);
+        for index in 0..count {
+            let read_address = address + (index * length) as u32;
+            tokens.push((
+                read_address,
+                self.send_rpc(norbert_pico_protocol::Request::RamRead {
+                    address: read_address,
+                    length: length as u16,
+                })?,
+            ));
+        }
+        self.writer.flush()?;
+
+        for (read_address, token) in tokens {
+            match self.recv_rpc(token)? {
+                norbert_pico_protocol::Response::Data(bytes) => {
+                    self.read_cache.push_back(CachedRead {
+                        address: read_address,
+                        length,
+                        data: bytes.as_slice().to_vec(),
+                    });
+                }
+                other => bail!("read: unexpected Pico response: {:?}", other),
+            }
+        }
+
+        let Some(cached) = self.read_cache.pop_front() else {
+            bail!("read: no Pico data returned");
+        };
+        self.queue_response(cached.data.as_slice());
+        self.last_read_next = next_pico_read(address, length);
+        Ok(())
+    }
+
+    fn queue_ack_response(
+        &mut self,
+        response: norbert_pico_protocol::Response,
+        context: &str,
+    ) -> Result<()> {
+        match response {
+            norbert_pico_protocol::Response::Ack => {
+                self.queue_response(&[0x01]);
+                Ok(())
+            }
+            other => bail!("{}: unexpected Pico response: {:?}", context, other),
+        }
+    }
+
+    fn handle_command(&mut self, data: &[u8]) -> Result<()> {
+        let Some((&cmd, rest)) = data.split_first() else {
+            return Ok(());
+        };
+
+        if cmd != CMD_READ {
+            self.read_cache.clear();
+            self.last_read_next = None;
+        }
+
+        match cmd {
+            CMD_VERSION => match self.rpc(norbert_pico_protocol::Request::FpgaVersion)? {
+                norbert_pico_protocol::Response::FpgaVersion(version) => {
+                    self.queue_response(&[version]);
+                    Ok(())
+                }
+                other => bail!("version: unexpected Pico response: {:?}", other),
+            },
+            CMD_READ => {
+                if rest.len() != 5 {
+                    bail!("read: malformed command length {}", data.len());
+                }
+                let addr_units =
+                    u32::from(rest[0]) << 16 | u32::from(rest[1]) << 8 | u32::from(rest[2]);
+                let len_units = usize::from(rest[3]) << 8 | usize::from(rest[4]);
+                let length = len_units * 8;
+                if length > norbert_pico_protocol::MAX_CHUNK {
+                    bail!("read: Pico bridge chunk too large: {} bytes", length);
+                }
+                self.queue_pico_read(addr_units * 8, length)
+            }
+            CMD_WRITE => {
+                if rest.len() < 5 {
+                    bail!("write: malformed command length {}", data.len());
+                }
+                let addr_units =
+                    u32::from(rest[0]) << 16 | u32::from(rest[1]) << 8 | u32::from(rest[2]);
+                let len_units = usize::from(rest[3]) << 8 | usize::from(rest[4]);
+                let length = len_units * 8;
+                let payload = &rest[5..];
+                if payload.len() != length {
+                    bail!(
+                        "write: command declared {} bytes but carried {}",
+                        length,
+                        payload.len()
+                    );
+                }
+                let mut rpc_data = heapless::Vec::<u8, { norbert_pico_protocol::MAX_CHUNK }>::new();
+                rpc_data.extend_from_slice(payload).map_err(|_| {
+                    anyhow!(
+                        "write: Pico bridge chunk too large: {} bytes",
+                        payload.len()
+                    )
+                })?;
+                let response = self.rpc(norbert_pico_protocol::Request::RamWrite {
+                    address: addr_units * 8,
+                    data: rpc_data,
+                })?;
+                self.queue_ack_response(response, "write")
+            }
+            CMD_CHIPCONFIG => {
+                if rest.len() < 8 {
+                    bail!("chip-config: malformed command length {}", data.len());
+                }
+                let sfdp_len = usize::from(rest[7]);
+                if rest.len() != 8 + sfdp_len {
+                    bail!(
+                        "chip-config: declared SFDP {} bytes but command length is {}",
+                        sfdp_len,
+                        data.len()
+                    );
+                }
+                let mut sfdp = heapless::Vec::<u8, 128>::new();
+                sfdp.extend_from_slice(&rest[8..])
+                    .map_err(|_| anyhow!("chip-config: SFDP too large: {} bytes", sfdp_len))?;
+                let erase =
+                    u32::from(rest[4] & 0x7f) << 16 | u32::from(rest[5]) << 8 | u32::from(rest[6]);
+                let response = self.rpc(norbert_pico_protocol::Request::ChipConfig(
+                    norbert_pico_protocol::ChipConfig {
+                        jedec_id: [rest[0], rest[1], rest[2]],
+                        supports_4byte_address: (rest[3] & 0x01) != 0,
+                        chip_erase_bursts: erase,
+                        sfdp,
+                    },
+                ))?;
+                self.queue_ack_response(response, "chip-config")
+            }
+            CMD_START => {
+                let response = self.rpc(norbert_pico_protocol::Request::Start)?;
+                self.queue_ack_response(response, "start")
+            }
+            CMD_STOP => {
+                let response = self.rpc(norbert_pico_protocol::Request::Stop)?;
+                self.queue_ack_response(response, "stop")
+            }
+            CMD_STATUS => match self.rpc(norbert_pico_protocol::Request::Status)? {
+                norbert_pico_protocol::Response::Status { running } => {
+                    self.queue_response(&[if running { 0x01 } else { 0x02 }]);
+                    Ok(())
+                }
+                other => bail!("status: unexpected Pico response: {:?}", other),
+            },
+            CMD_HOLDCTL => {
+                if rest.len() != 1 {
+                    bail!("hold: malformed command length {}", data.len());
+                }
+                let response = self.rpc(norbert_pico_protocol::Request::Hold {
+                    asserted: rest[0] != 0,
+                })?;
+                self.queue_ack_response(response, "hold")
+            }
+            CMD_LOGCTL => {
+                if rest.len() != 1 {
+                    bail!("log-control: malformed command length {}", data.len());
+                }
+                let response = self.rpc(norbert_pico_protocol::Request::LogControl {
+                    enabled: rest[0] != 0,
+                })?;
+                self.queue_ack_response(response, "log-control")
+            }
+            CMD_LOGPOLL => match self.rpc(norbert_pico_protocol::Request::LogPoll)? {
+                norbert_pico_protocol::Response::Log(bytes) => {
+                    self.pending.clear();
+                    self.pending.extend(bytes.iter().copied());
+                    self.pending.push_back(LOG_POLL_TERMINATOR);
+                    Ok(())
+                }
+                other => bail!("log-poll: unexpected Pico response: {:?}", other),
+            },
+            CMD_TOCTOU => {
+                let request = parse_pico_toctou(rest)?;
+                let response = self.rpc(norbert_pico_protocol::Request::Toctou(request))?;
+                self.queue_ack_response(response, "toctou")
+            }
+            other => bail!("Unsupported Pico bridge command 0x{:02x}", other),
+        }
+    }
+}
+
+impl Transport for PicoUsbTransport {
+    fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        self.handle_command(data)
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        if self.pending.len() < buf.len() {
+            bail!(
+                "Pico bridge response underflow: need {} bytes, have {}",
+                buf.len(),
+                self.pending.len()
+            );
+        }
+        for byte in buf.iter_mut() {
+            *byte = self.pending.pop_front().expect("length checked above");
+        }
+        Ok(())
+    }
+}
+
+fn next_pico_read(address: u32, length: usize) -> Option<(u32, usize)> {
+    address
+        .checked_add(length as u32)
+        .map(|next_address| (next_address, length))
+}
+
+fn max_read_ahead_within_sdram(address: u32, length: usize) -> usize {
+    if length == 0 {
+        return 0;
+    }
+    let remaining = SDRAM_SIZE_BYTES.saturating_sub(u64::from(address));
+    (remaining / length as u64) as usize
+}
+
+fn pico_request_name(request: &norbert_pico_protocol::Request) -> &'static str {
+    match request {
+        norbert_pico_protocol::Request::BridgeVersion => "BridgeVersion",
+        norbert_pico_protocol::Request::FpgaVersion => "FpgaVersion",
+        norbert_pico_protocol::Request::Status => "Status",
+        norbert_pico_protocol::Request::Start => "Start",
+        norbert_pico_protocol::Request::Stop => "Stop",
+        norbert_pico_protocol::Request::Hold { .. } => "Hold",
+        norbert_pico_protocol::Request::LogControl { .. } => "LogControl",
+        norbert_pico_protocol::Request::LogPoll => "LogPoll",
+        norbert_pico_protocol::Request::RamRead { .. } => "RamRead",
+        norbert_pico_protocol::Request::RamWrite { .. } => "RamWrite",
+        norbert_pico_protocol::Request::ChipConfig(_) => "ChipConfig",
+        norbert_pico_protocol::Request::Toctou(_) => "Toctou",
+        norbert_pico_protocol::Request::Stats => "Stats",
+    }
+}
+
+fn parse_pico_toctou(data: &[u8]) -> Result<norbert_pico_protocol::ToctouRequest> {
+    let Some((&subcmd, rest)) = data.split_first() else {
+        bail!("toctou: missing subcommand");
+    };
+    match subcmd {
+        TOCTOU_SET => {
+            if rest.len() != 10 {
+                bail!("toctou set: malformed command length {}", data.len() + 1);
+            }
+            Ok(norbert_pico_protocol::ToctouRequest::Set {
+                index: rest[0],
+                start: u24(&rest[1..4]),
+                mask: u24(&rest[4..7]),
+                replace: u24(&rest[7..10]),
+            })
+        }
+        TOCTOU_ARM => one_index_toctou(rest, |index| norbert_pico_protocol::ToctouRequest::Arm {
+            index,
+        }),
+        TOCTOU_DISARM => one_index_toctou(rest, |index| {
+            norbert_pico_protocol::ToctouRequest::Disarm { index }
+        }),
+        TOCTOU_RESET => one_index_toctou(rest, |index| {
+            norbert_pico_protocol::ToctouRequest::Reset { index }
+        }),
+        TOCTOU_RESET_ALL => Ok(norbert_pico_protocol::ToctouRequest::ResetAll),
+        other => bail!("toctou: unknown subcommand 0x{:02x}", other),
+    }
+}
+
+fn one_index_toctou(
+    data: &[u8],
+    make: impl FnOnce(u8) -> norbert_pico_protocol::ToctouRequest,
+) -> Result<norbert_pico_protocol::ToctouRequest> {
+    if data.len() != 1 {
+        bail!("toctou index command: malformed length {}", data.len());
+    }
+    Ok(make(data[0]))
+}
+
+fn u24(bytes: &[u8]) -> u32 {
+    u32::from(bytes[0]) << 16 | u32::from(bytes[1]) << 8 | u32::from(bytes[2])
+}
+
+// ---------------------------------------------------------------------------
 // FlashDevice -- protocol implementation over any transport
 // ---------------------------------------------------------------------------
 
 struct FlashDevice {
     transport: Box<dyn Transport>,
     read_block_size: usize,
+    write_block_size: usize,
 }
 
 fn validate_sdram_range(address: u32, length: usize, what: &str) -> Result<()> {
@@ -397,6 +886,7 @@ impl FlashDevice {
         Ok(Self {
             transport: Box::new(SerialTransport::open(port_name)?),
             read_block_size: UART_READ_BLOCK_SIZE,
+            write_block_size: BLOCK_SIZE,
         })
     }
 
@@ -405,6 +895,15 @@ impl FlashDevice {
         Ok(Self {
             transport: Box::new(Ft245Transport::open(serial)?),
             read_block_size: BLOCK_SIZE,
+            write_block_size: BLOCK_SIZE,
+        })
+    }
+
+    fn open_pico_usb() -> Result<Self> {
+        Ok(Self {
+            transport: Box::new(PicoUsbTransport::open()?),
+            read_block_size: norbert_pico_protocol::MAX_CHUNK,
+            write_block_size: norbert_pico_protocol::MAX_CHUNK,
         })
     }
 
@@ -566,8 +1065,8 @@ impl FlashDevice {
     }
 
     fn write_block(&mut self, address: u32, data: &[u8]) -> Result<()> {
-        if data.is_empty() || data.len() > BLOCK_SIZE {
-            bail!("Invalid data length: must be 1-{}", BLOCK_SIZE);
+        if data.is_empty() || data.len() > self.write_block_size {
+            bail!("Invalid data length: must be 1-{}", self.write_block_size);
         }
         if !address.is_multiple_of(8) {
             bail!("Address must be 8-byte aligned");
@@ -863,10 +1362,11 @@ impl FlashDevice {
         let mut addr = address;
         let mut offset = 0;
 
-        let total_blocks = padded.len().div_ceil(BLOCK_SIZE);
+        let wbs = self.write_block_size;
+        let total_blocks = padded.len().div_ceil(wbs);
         let mut block_num = 0;
         while offset < padded.len() {
-            let chunk_len = std::cmp::min(BLOCK_SIZE, padded.len() - offset);
+            let chunk_len = std::cmp::min(wbs, padded.len() - offset);
             self.write_block(addr, &padded[offset..offset + chunk_len])
                 .with_context(|| {
                     format!(
@@ -898,6 +1398,10 @@ struct Cli {
     /// Use FT2232H FT245 async FIFO instead of UART
     #[arg(long)]
     ft245: bool,
+
+    /// Use the Raspberry Pi Pico USB bridge instead of direct UART/FT245
+    #[arg(long, conflicts_with = "ft245")]
+    pico_usb: bool,
 
     /// FT2232H serial number (for --ft245, when multiple devices are connected)
     #[arg(long)]
@@ -1068,6 +1572,11 @@ fn parse_address(s: &str) -> Result<u32, String> {
 // ---------------------------------------------------------------------------
 
 fn open_device(cli: &Cli) -> Result<FlashDevice> {
+    if cli.pico_usb {
+        eprintln!("Opening NORbert Pico USB bridge...");
+        return FlashDevice::open_pico_usb();
+    }
+
     if cli.ft245 {
         #[cfg(any(feature = "d2xx", feature = "ftdi"))]
         {
@@ -1080,7 +1589,9 @@ fn open_device(cli: &Cli) -> Result<FlashDevice> {
             return FlashDevice::open_ft245(cli.ft_serial.as_deref());
         }
         #[cfg(not(any(feature = "d2xx", feature = "ftdi")))]
-        bail!("--ft245 requires the 'd2xx' or 'ftdi' feature (build with --features d2xx, --features ftdi, or --no-default-features --features d2xx)");
+        bail!(
+            "--ft245 requires the 'd2xx' or 'ftdi' feature (build with --features d2xx, --features ftdi, or --no-default-features --features d2xx)"
+        );
     }
     FlashDevice::open_serial(&cli.port)
 }
@@ -1205,7 +1716,13 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
         bail!("File is empty");
     }
 
-    let transport_name = if cli.ft245 { "FT245" } else { "UART" };
+    let transport_name = if cli.pico_usb {
+        "Pico USB"
+    } else if cli.ft245 {
+        "FT245"
+    } else {
+        "UART"
+    };
     println!(
         "Loading {} ({} bytes) to 0x{:08x} via {}",
         file.display(),
@@ -1233,11 +1750,12 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
 
         let mut addr = address;
         let mut offset = 0;
-        let total_blocks = padded.len().div_ceil(BLOCK_SIZE);
+        let wbs = device.write_block_size;
+        let total_blocks = padded.len().div_ceil(wbs);
         let mut block_num = 0;
 
         while offset < padded.len() {
-            let chunk_len = std::cmp::min(BLOCK_SIZE, padded.len() - offset);
+            let chunk_len = std::cmp::min(wbs, padded.len() - offset);
             device
                 .write_block(addr, &padded[offset..offset + chunk_len])
                 .with_context(|| {
@@ -1817,8 +2335,8 @@ fn is_read_opcode(opcode: u8) -> bool {
 
 fn cmd_monitor(cli: &Cli) -> Result<()> {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let mut device = open_device(cli)?;
 

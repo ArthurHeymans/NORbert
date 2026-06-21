@@ -46,11 +46,11 @@ module ft245(
     // Timing parameters (120MHz clock, ~8.3ns per cycle)
     // All delays include margin above FT2232H datasheet minimums.
     // -----------------------------------------------------------------
-    localparam [3:0]
-        DELAY_RD_DATA  = 4'd7,  // RD# active to data valid (~58ns, min 50ns)
-        DELAY_RD_RECOV = 4'd10, // RD# recovery + sync pipeline (~83ns, extra margin)
-        DELAY_WR_PULSE = 4'd7,  // WR# active pulse width (~58ns, min 50ns)
-        DELAY_WR_RECOV = 4'd5;  // WR# recovery + sync pipeline (~42ns)
+    localparam [10:0]
+        DELAY_RD_DATA  = 11'd240, // RD# active to data valid (~2us, Pico bridge margin)
+        DELAY_RD_RECOV = 11'd20,  // RD# recovery + sync pipeline (~167ns)
+        DELAY_WR_PULSE = 11'd40,  // WR# active pulse width (~333ns, Pico bridge margin)
+        DELAY_WR_RECOV = 11'd20;  // WR# recovery + sync pipeline (~167ns)
 
     // -----------------------------------------------------------------
     // Synchronize FT2232H status inputs into system clock domain.
@@ -76,13 +76,15 @@ module ft245(
     // TX pending buffer -- captures txd_strobe from glue
     // -----------------------------------------------------------------
     reg tx_pending;
+    reg txd_strobe_d;
     reg [7:0] tx_byte;
+    wire txd_strobe_rise = txd_strobe && !txd_strobe_d;
     assign txd_ready = !tx_pending;
 
     // -----------------------------------------------------------------
     // Delay counter
     // -----------------------------------------------------------------
-    reg [3:0] delay_cnt;
+    reg [10:0] delay_cnt;
 
     // -----------------------------------------------------------------
     // State machine
@@ -107,14 +109,22 @@ module ft245(
             ft_wr_n    <= 1;
             data_oe    <= 0;
             data_out   <= 0;
-            tx_pending <= 0;
-            tx_byte    <= 0;
-            rxd        <= 0;
-            delay_cnt  <= 0;
+            tx_pending   <= 0;
+            txd_strobe_d <= 0;
+            tx_byte      <= 0;
+            rxd          <= 0;
+            delay_cnt    <= 0;
         end
         else begin
-            // Latch TX request from glue
-            if (txd_strobe && !tx_pending) begin
+            txd_strobe_d <= txd_strobe;
+
+            // Latch one TX request per logical strobe.  The Pico bridge can
+            // hold a single FT245 write cycle much longer than a real
+            // FT2232H.  If txd_strobe is treated as a level, the same glue
+            // response can be re-latched after tx_pending clears and then be
+            // delivered again on the next Pico read.  Edge-detecting keeps
+            // one glue strobe == one FT245 byte.
+            if (txd_strobe_rise && !tx_pending) begin
                 tx_pending <= 1;
                 tx_byte    <= txd;
             end

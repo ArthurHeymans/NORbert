@@ -131,10 +131,10 @@ IO_PORT "ft_data[3]" IO_TYPE=LVCMOS33 DRIVE=8;
 
 // --- PMOD 3 bottom row: FT245 data[7:4] ---
 
-IO_LOC "ft_data[6]" G5;
-IO_LOC "ft_data[5]" G8;
-IO_LOC "ft_data[4]" H7;
-IO_LOC "ft_data[7]" J5;
+IO_LOC "ft_data[7]" G5;
+IO_LOC "ft_data[6]" G8;
+IO_LOC "ft_data[5]" H7;
+IO_LOC "ft_data[4]" J5;
 IO_PORT "ft_data[4]" IO_TYPE=LVCMOS33 DRIVE=8;
 IO_PORT "ft_data[5]" IO_TYPE=LVCMOS33 DRIVE=8;
 IO_PORT "ft_data[6]" IO_TYPE=LVCMOS33 DRIVE=8;

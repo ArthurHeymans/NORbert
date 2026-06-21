@@ -8,6 +8,10 @@
       url = "github:Blue-Berry/gowin-eda.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -16,6 +20,7 @@
       nixpkgs,
       flake-utils,
       gowin-eda,
+      fenix,
     }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (
       system:
@@ -27,6 +32,19 @@
 
         # Gowin EDA Education edition from gowin-eda.nix
         gowinEda = gowin-eda.packages.${system}.default;
+
+        # Rust toolchain for both the host spi-flash-tool and the RP2040 Pico
+        # firmware.  The Pico firmware targets Cortex-M0+ and needs the
+        # thumbv6m-none-eabi standard library available in the dev shell, not a
+        # rustup-installed side effect.
+        picoRustToolchain = fenix.packages.${system}.combine [
+          fenix.packages.${system}.stable.cargo
+          fenix.packages.${system}.stable.clippy
+          fenix.packages.${system}.stable.rust-src
+          fenix.packages.${system}.stable.rustc
+          fenix.packages.${system}.stable.rustfmt
+          fenix.packages.${system}.targets.thumbv6m-none-eabi.stable.rust-std
+        ];
 
         # Create a gw_sh wrapper using the same FHS approach
         gowinSrc = pkgs.stdenv.mkDerivation {
@@ -94,8 +112,24 @@
               gst_all_1.gst-plugins-base
               bash
               coreutils
+              udev
             ];
           runScript = "bash";
+        };
+
+        norbertUdevRules = pkgs.writeTextFile {
+          name = "norbert-udev-rules";
+          destination = "/etc/udev/rules.d/99-norbert.rules";
+          text = ''
+            # NORbert Pico USB bridge
+            SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="4e42", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+            # Raspberry Pi Debug Probe (CMSIS-DAP)
+            SUBSYSTEM=="usb", ATTR{idVendor}=="2e8a", ATTR{idProduct}=="000c", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+            # Tang Primer / FT2232H JTAG+FIFO adapter
+            SUBSYSTEM=="usb", ATTR{idVendor}=="0403", ATTR{idProduct}=="6010", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+          '';
         };
 
         # Wrapper script for gw_sh (command-line synthesis)
@@ -112,13 +146,29 @@
           fi
 
           unset QT_QPA_PLATFORMTHEME QT_STYLE_OVERRIDE
-          export QT_QPA_PLATFORM=offscreen
-          export QT_XCB_GL_INTEGRATION=none
 
-          exec ${gowinFhs}/bin/gowin-fhs -c "cd '$(pwd)' && QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH='$WORKSPACE_DIR/IDE/lib':\"$LD_LIBRARY_PATH\" '$WORKSPACE_DIR/IDE/bin/gw_sh' $*"
+          # Gowin's "CLI" still initializes Qt/OpenGL.  Running it directly on
+          # the pi/headless X display aborts with "Could not initialize GLX", so
+          # give it a tiny software-rendered X server and force the xcb backend.
+          export QT_QPA_PLATFORM=xcb
+          export QT_XCB_GL_INTEGRATION=none
+          export QT_OPENGL=software
+          export LIBGL_ALWAYS_SOFTWARE=1
+          export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+
+          quoted_args=""
+          for arg in "$@"; do
+            printf -v quoted_arg ' %q' "$arg"
+            quoted_args+="$quoted_arg"
+          done
+
+          exec ${pkgs.xvfb-run}/bin/xvfb-run -a -s "-screen 0 1280x1024x24 +extension GLX +render" \
+            ${gowinFhs}/bin/gowin-fhs -c "cd '$(pwd)' && env QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=none QT_OPENGL=software LIBGL_ALWAYS_SOFTWARE=1 MESA_LOADER_DRIVER_OVERRIDE=llvmpipe LD_LIBRARY_PATH='$WORKSPACE_DIR/IDE/lib':\"\$LD_LIBRARY_PATH\" '$WORKSPACE_DIR/IDE/bin/gw_sh'$quoted_args"
         '';
       in
       {
+        packages.udev-rules = norbertUdevRules;
+
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             # Gowin IDE (CLI synthesis)
@@ -141,12 +191,17 @@
             # FTDI EEPROM programming (FT2232H async 245 setup)
             libftdi1
 
-            # Rust toolchain for spi-flash-tool
-            cargo
-            rustc
+            # Rust toolchain for spi-flash-tool and pico-firmware
+            picoRustToolchain
             pkg-config
+            probe-rs-tools
+            systemd # udev
             udev
           ];
+
+          # Cargo-built tools dynamically link libudev via rusb/serialport.
+          # Keep the released binary runnable from inside nix develop.
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.udev ];
 
           shellHook = ''
             echo "Tang Primer 25K SPI Flash Emulator Development Environment"
@@ -161,6 +216,17 @@
             echo "  ftdi_eeprom      - FT2232H EEPROM programmer"
             echo "  cargo            - Rust build tool"
             echo ""
+            if [ -e /dev/bus/usb ]; then
+              pico_usb_dev=$(for d in /sys/bus/usb/devices/*; do
+                [ -f "$d/idVendor" ] || continue
+                [ "$(cat "$d/idVendor")" = "1209" ] || continue
+                [ "$(cat "$d/idProduct")" = "4e42" ] || continue
+                printf '/dev/bus/usb/%03d/%03d\n' "$(cat "$d/busnum")" "$(cat "$d/devnum")"
+              done | head -n1)
+              if [ -n "$pico_usb_dev" ] && [ ! -w "$pico_usb_dev" ]; then
+                echo "Warning: $pico_usb_dev is not writable; install .#udev-rules for --pico-usb access."
+              fi
+            fi
             echo "Build commands:"
             echo "  make build       - Synthesize with gw_sh (CLI)"
             echo "  make prog        - Program FPGA (volatile)"
@@ -171,5 +237,12 @@
           '';
         };
       }
-    );
+    )
+    // {
+      nixosModules.default =
+        { pkgs, ... }:
+        {
+          services.udev.packages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.udev-rules ];
+        };
+    };
 }

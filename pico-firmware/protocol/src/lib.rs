@@ -65,7 +65,10 @@ pub enum Request {
     /// Read a chunk of SDRAM-backed flash contents from the FPGA.
     RamRead { address: u32, length: u16 },
     /// Write a chunk of SDRAM-backed flash contents to the FPGA.
-    RamWrite { address: u32, data: Vec<u8, MAX_CHUNK> },
+    RamWrite {
+        address: u32,
+        data: Vec<u8, MAX_CHUNK>,
+    },
     /// Apply a chip identity/SFDP table to the FPGA.
     ChipConfig(ChipConfig),
     /// Manage one of the FPGA TOCTOU traps.

@@ -4,7 +4,7 @@ Embassy/Rust firmware for a Raspberry Pi Pico bridge that speaks a native
 postcard-framed RPC protocol over both:
 
 - USB vendor bulk endpoints, with WinUSB descriptors for Windows hosts
-- TCP port `24500` over a W5500 using `embassy-net-wiznet`
+- optional TCP port `24500` over a W5500 using `embassy-net-wiznet`
 
 The Pico then presents an FT245-style asynchronous FIFO bus to the existing
 NORbert FPGA gateware, so the FPGA byte protocol remains unchanged.
@@ -75,35 +75,26 @@ locked in `Cargo.lock`; use `--locked` for reproducible builds.  In particular,
 `heapless` 0.9.x and `embedded-hal-bus` 0.3.x require Rust 1.87+ and 1.81+
 respectively.
 
-Install the RP2040 Rust target, then build from this directory:
+Enter the repository dev shell, which includes a Fenix Rust toolchain with the
+RP2040 `thumbv6m-none-eabi` target, then build from this directory:
 
 ```sh
-rustup target add thumbv6m-none-eabi
+nix develop
+cd pico-firmware
 cargo check -p norbert-pico-firmware --locked
 cargo build -p norbert-pico-firmware --release --locked
 ```
 
-This environment currently has a Nix-provided Rust toolchain without the
-`thumbv6m-none-eabi` target installed via rustup, so protocol host checks are
-the primary validation available here.
+The default firmware is USB-only and does not touch the W5500 pins, so it runs
+on boards without a W5500 fitted.  Build with Ethernet support only when the
+W5500 is present:
 
-## Dependency notes
-
-- Workspace crates use Rust edition 2024.
-- Direct dependencies are declared at the newest compatible stable versions used
-  for this no-std Embassy/RP2040 firmware, with exact transitive versions
-  recorded in `Cargo.lock`.
-- `zerocopy` is kept at 0.8.52, the latest stable release.  Cargo advertises
-  0.9.0-alpha.0 as newer, but it is a pre-release and is intentionally not used
-  for firmware bring-up.
-- `zerocopy` is used only for fixed-width byte-order fields (`u16` frame
-  lengths and FPGA command length fields).  The 24-bit FPGA addresses remain
-  explicit byte pushes because `zerocopy` has no native U24 scalar, and the
-  postcard bodies remain serde/postcard encoded.
+```sh
+cargo build -p norbert-pico-firmware --release --locked --features ethernet
+```
 
 ## FT245 backend status
 
-The firmware includes a conservative SIO FT245-device-side backend for bring-up.
-It preserves the same public `Ft245Bus` API that the RPC layer uses. The next
-performance step is to replace the per-byte SIO strobes with a PIO/DMA backend
-behind the same API; that should not require changes to USB/TCP/postcard code.
+The firmware uses an RP2040 PIO/DMA FT245-device-side backend.  It preserves the
+same public `Ft245Bus` API that the RPC layer uses while handling the FPGA's
+short asynchronous FIFO strobes without CPU polling.

@@ -7,34 +7,51 @@ mod ft245_bus;
 use bridge::Bridge;
 use defmt::{info, unwrap, warn};
 use embassy_executor::Spawner;
+#[cfg(feature = "ethernet")]
 use embassy_futures::yield_now;
+#[cfg(feature = "ethernet")]
 use embassy_net::tcp::TcpSocket;
+#[cfg(feature = "ethernet")]
 use embassy_net::{Stack, StackResources};
+#[cfg(feature = "ethernet")]
 use embassy_net_wiznet::chip::W5500;
+#[cfg(feature = "ethernet")]
 use embassy_net_wiznet::{Device, Runner, State};
+#[cfg(feature = "ethernet")]
 use embassy_rp::clocks::RoscRng;
+#[cfg(feature = "ethernet")]
 use embassy_rp::gpio::{Input, Level, Output, Pull};
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, SPI0, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, PIO0, USB};
+#[cfg(feature = "ethernet")]
+use embassy_rp::peripherals::{PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, SPI0};
+use embassy_rp::pio::InterruptHandler as PioInterruptHandler;
+#[cfg(feature = "ethernet")]
 use embassy_rp::spi::{Async, Config as SpiConfig, Spi};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_rp::{bind_interrupts, dma};
+#[cfg(feature = "ethernet")]
 use embassy_time::{Delay, Duration};
 use embassy_usb::driver::{Endpoint, EndpointIn, EndpointOut};
 use embassy_usb::msos::{self, windows_version};
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
+#[cfg(feature = "ethernet")]
 use embedded_hal_bus::spi::ExclusiveDevice;
+#[cfg(feature = "ethernet")]
 use embedded_io_async::Write;
 use ft245_bus::Ft245Bus;
+#[cfg(feature = "ethernet")]
+use norbert_pico_protocol::TCP_PORT;
 use norbert_pico_protocol::{
-    decode_host_body, encode_device_frame, frame_len, DeviceFrame, ErrorCode, Response,
-    MAX_FRAME_BODY, TCP_PORT,
+    DeviceFrame, ErrorCode, MAX_FRAME_BODY, Response, decode_host_body, encode_device_frame,
+    frame_len,
 };
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
-    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>, dma::InterruptHandler<DMA_CH2>, dma::InterruptHandler<DMA_CH3>;
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
 });
 
 const USB_VID: u16 = 0x1209;
@@ -46,6 +63,7 @@ async fn usb_task(mut usb: UsbDevice<'static, Driver<'static, USB>>) -> ! {
     usb.run().await
 }
 
+#[cfg(feature = "ethernet")]
 #[embassy_executor::task]
 async fn ethernet_task(
     runner: Runner<
@@ -59,13 +77,44 @@ async fn ethernet_task(
     runner.run().await
 }
 
+#[cfg(feature = "ethernet")]
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, Device<'static>>) -> ! {
     runner.run().await
 }
 
+#[cfg(feature = "ethernet")]
 #[embassy_executor::task]
-async fn tcp_rpc_task(stack: Stack<'static>, bridge: &'static Bridge<'static>) -> ! {
+#[allow(clippy::too_many_arguments)]
+async fn ethernet_init_task(
+    spawner: Spawner,
+    bridge: &'static Bridge<'static>,
+    spi0: embassy_rp::Peri<'static, SPI0>,
+    dma0: embassy_rp::Peri<'static, DMA_CH0>,
+    dma1: embassy_rp::Peri<'static, DMA_CH1>,
+    miso: embassy_rp::Peri<'static, PIN_16>,
+    cs: embassy_rp::Peri<'static, PIN_17>,
+    clk: embassy_rp::Peri<'static, PIN_18>,
+    mosi: embassy_rp::Peri<'static, PIN_19>,
+    reset: embassy_rp::Peri<'static, PIN_20>,
+    int: embassy_rp::Peri<'static, PIN_21>,
+    seed: u64,
+) -> ! {
+    match init_w5500_stack(
+        &spawner, spi0, dma0, dma1, miso, cs, clk, mosi, reset, int, seed,
+    )
+    .await
+    {
+        Some(stack) => tcp_rpc_server(stack, bridge).await,
+        None => loop {
+            warn!("W5500 unavailable; USB RPC remains active");
+            embassy_time::Timer::after(Duration::from_secs(5)).await;
+        },
+    }
+}
+
+#[cfg(feature = "ethernet")]
+async fn tcp_rpc_server(stack: Stack<'static>, bridge: &'static Bridge<'static>) -> ! {
     let mut rx_buffer = [0u8; 4096];
     let mut tx_buffer = [0u8; 4096];
     let mut body = [0u8; MAX_FRAME_BODY];
@@ -111,18 +160,31 @@ async fn tcp_rpc_task(stack: Stack<'static>, bridge: &'static Bridge<'static>) -
 async fn main(spawner: Spawner) {
     info!("NORbert Pico bridge starting");
     let p = embassy_rp::init(Default::default());
+    #[cfg(feature = "ethernet")]
     let mut rng = RoscRng;
 
     let ft245 = Ft245Bus::new(
-        p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3, p.PIN_4, p.PIN_5, p.PIN_6, p.PIN_7, p.PIN_8,
-        p.PIN_9, p.PIN_10, p.PIN_11,
+        p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3, p.PIN_4, p.PIN_5, p.PIN_6, p.PIN_7, p.PIN_8, p.PIN_9,
+        p.PIN_10, p.PIN_11, p.PIO0, p.DMA_CH2, p.DMA_CH3,
     );
     static BRIDGE: StaticCell<Bridge<'static>> = StaticCell::new();
     let bridge = BRIDGE.init(Bridge::new(ft245));
 
-    let stack = init_w5500_stack(&spawner, p.SPI0, p.DMA_CH0, p.DMA_CH1, p.PIN_16, p.PIN_17,
-        p.PIN_18, p.PIN_19, p.PIN_20, p.PIN_21, rng.next_u64()).await;
-    spawner.spawn(unwrap!(tcp_rpc_task(stack, bridge)));
+    #[cfg(feature = "ethernet")]
+    spawner.spawn(unwrap!(ethernet_init_task(
+        spawner,
+        bridge,
+        p.SPI0,
+        p.DMA_CH0,
+        p.DMA_CH1,
+        p.PIN_16,
+        p.PIN_17,
+        p.PIN_18,
+        p.PIN_19,
+        p.PIN_20,
+        p.PIN_21,
+        rng.next_u64(),
+    )));
 
     let driver = Driver::new(p.USB, Irqs);
     let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
@@ -166,8 +228,10 @@ async fn main(spawner: Spawner) {
     let usb = builder.build();
     spawner.spawn(unwrap!(usb_task(usb)));
 
-    let mut rx = UsbFrameRx::new();
-    let mut out = [0u8; norbert_pico_protocol::MAX_FRAME];
+    static USB_RX: StaticCell<UsbFrameRx> = StaticCell::new();
+    static USB_OUT: StaticCell<[u8; norbert_pico_protocol::MAX_FRAME]> = StaticCell::new();
+    let rx = USB_RX.init(UsbFrameRx::new());
+    let out = USB_OUT.init([0u8; norbert_pico_protocol::MAX_FRAME]);
     loop {
         usb_out.wait_enabled().await;
         info!("USB RPC connected");
@@ -186,33 +250,45 @@ async fn main(spawner: Spawner) {
             let Some(packet) = packet.get(..n) else {
                 break;
             };
-            match rx.push(packet) {
-                Ok(frame) => {
-                    let Some(body) = frame else {
-                        continue;
-                    };
-                    let len = handle_rpc_body(bridge, body, out.as_mut_slice()).await;
-                    let Some(response) = out.get(..len) else {
-                        break;
-                    };
-                    if let Err(e) = write_usb_chunks(&mut usb_in, response).await {
-                        warn!("USB IN failed: {:?}", e);
+            if let Err(error) = rx.push(packet) {
+                let len = encode_error(0, error, out.as_mut_slice());
+                if let Some(response) = out.get(..len) {
+                    let _ = write_usb_chunks(&mut usb_in, response).await;
+                }
+                rx.clear();
+                continue;
+            }
+
+            loop {
+                let frame = match rx.frame() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let len = encode_error(0, error, out.as_mut_slice());
+                        if let Some(response) = out.get(..len) {
+                            let _ = write_usb_chunks(&mut usb_in, response).await;
+                        }
+                        rx.clear();
                         break;
                     }
-                    rx.consume();
+                };
+                let Some(body) = frame else {
+                    break;
+                };
+                let len = handle_rpc_body(bridge, body, out.as_mut_slice()).await;
+                let Some(response) = out.get(..len) else {
+                    break;
+                };
+                if let Err(e) = write_usb_chunks(&mut usb_in, response).await {
+                    warn!("USB IN failed: {:?}", e);
+                    break;
                 }
-                Err(error) => {
-                    let len = encode_error(0, error, out.as_mut_slice());
-                    if let Some(response) = out.get(..len) {
-                        let _ = write_usb_chunks(&mut usb_in, response).await;
-                    }
-                    rx.clear();
-                }
+                rx.consume();
             }
         }
     }
 }
 
+#[cfg(feature = "ethernet")]
 #[allow(clippy::too_many_arguments)]
 async fn init_w5500_stack(
     spawner: &Spawner,
@@ -226,7 +302,7 @@ async fn init_w5500_stack(
     reset: embassy_rp::Peri<'static, PIN_20>,
     int: embassy_rp::Peri<'static, PIN_21>,
     seed: u64,
-) -> Stack<'static> {
+) -> Option<Stack<'static>> {
     let mut spi_cfg = SpiConfig::default();
     spi_cfg.frequency = 50_000_000;
     let spi = Spi::new(spi0, clk, mosi, miso, dma0, dma1, Irqs, spi_cfg);
@@ -237,15 +313,22 @@ async fn init_w5500_stack(
     static WIZ_STATE: StaticCell<State<8, 8>> = StaticCell::new();
     let state = WIZ_STATE.init(State::<8, 8>::new());
     let mac_addr = [0x02, 0x4e, 0x4f, 0x52, 0x42, 0x54];
-    let (device, runner) = embassy_net_wiznet::new(
-        mac_addr,
-        state,
-        unwrap!(ExclusiveDevice::new(spi, cs, Delay)),
-        w5500_int,
-        w5500_reset,
-    )
-    .await
-    .unwrap();
+    let spi_device = match ExclusiveDevice::new(spi, cs, Delay) {
+        Ok(device) => device,
+        Err(_) => {
+            warn!("Failed to create W5500 SPI device");
+            return None;
+        }
+    };
+
+    let (device, runner) =
+        match embassy_net_wiznet::new(mac_addr, state, spi_device, w5500_int, w5500_reset).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("W5500 init failed");
+                return None;
+            }
+        };
     spawner.spawn(unwrap!(ethernet_task(runner)));
 
     static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
@@ -260,9 +343,10 @@ async fn init_w5500_stack(
     info!("Waiting for DHCP");
     let cfg = wait_for_config(stack).await;
     info!("W5500 IPv4 address: {:?}", cfg.address.address());
-    stack
+    Some(stack)
 }
 
+#[cfg(feature = "ethernet")]
 async fn wait_for_config(stack: Stack<'static>) -> embassy_net::StaticConfigV4 {
     loop {
         if let Some(config) = stack.config_v4() {
@@ -272,11 +356,7 @@ async fn wait_for_config(stack: Stack<'static>) -> embassy_net::StaticConfigV4 {
     }
 }
 
-async fn handle_rpc_body(
-    bridge: &'static Bridge<'static>,
-    body: &[u8],
-    out: &mut [u8],
-) -> usize {
+async fn handle_rpc_body(bridge: &'static Bridge<'static>, body: &[u8], out: &mut [u8]) -> usize {
     let response = match decode_host_body(body) {
         Ok(frame) => bridge.handle(frame).await,
         Err(error) => DeviceFrame {
@@ -299,6 +379,7 @@ fn encode_error(seq: u32, error: ErrorCode, out: &mut [u8]) -> usize {
     encode_device_frame(&frame, out).unwrap_or(0)
 }
 
+#[cfg(feature = "ethernet")]
 async fn read_tcp_frame_body(
     socket: &mut TcpSocket<'_>,
     body: &mut [u8],
@@ -318,7 +399,11 @@ async fn read_tcp_frame_body(
     Ok(len)
 }
 
-async fn read_exact_tcp(socket: &mut TcpSocket<'_>, mut out: &mut [u8]) -> Result<usize, ErrorCode> {
+#[cfg(feature = "ethernet")]
+async fn read_exact_tcp(
+    socket: &mut TcpSocket<'_>,
+    mut out: &mut [u8],
+) -> Result<usize, ErrorCode> {
     let original_len = out.len();
     while !out.is_empty() {
         match socket.read(out).await {
@@ -374,7 +459,7 @@ impl UsbFrameRx {
         self.expected = None;
     }
 
-    fn push(&mut self, data: &[u8]) -> Result<Option<&[u8]>, ErrorCode> {
+    fn push(&mut self, data: &[u8]) -> Result<(), ErrorCode> {
         if self.used + data.len() > self.buf.len() {
             return Err(ErrorCode::FrameTooLarge);
         }
@@ -384,7 +469,32 @@ impl UsbFrameRx {
         };
         dst.copy_from_slice(data);
         self.used = end;
+        self.update_expected()
+    }
 
+    fn frame(&mut self) -> Result<Option<&[u8]>, ErrorCode> {
+        self.update_expected()?;
+        match self.expected {
+            Some(expected) if self.used >= expected => Ok(self.buf.get(2..expected)),
+            _ => Ok(None),
+        }
+    }
+
+    fn consume(&mut self) {
+        let Some(expected) = self.expected else {
+            self.clear();
+            return;
+        };
+        if self.used < expected {
+            self.clear();
+            return;
+        }
+        self.buf.copy_within(expected..self.used, 0);
+        self.used -= expected;
+        self.expected = None;
+    }
+
+    fn update_expected(&mut self) -> Result<(), ErrorCode> {
         if self.expected.is_none() && self.used >= 2 {
             let Some(prefix) = self.buf.get(..2) else {
                 return Err(ErrorCode::FrameTooLarge);
@@ -398,17 +508,6 @@ impl UsbFrameRx {
             }
             self.expected = Some(body_len + 2);
         }
-
-        match self.expected {
-            Some(expected) if self.used >= expected => Ok(self.buf.get(2..expected)),
-            _ => Ok(None),
-        }
-    }
-
-    fn consume(&mut self) {
-        // Current host protocol is request/response: exactly one frame is
-        // processed at a time.  Drop any pipelined bytes rather than risking
-        // request reordering against the single FPGA byte-protocol bus.
-        self.clear();
+        Ok(())
     }
 }

@@ -2,8 +2,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use heapless::Vec;
 use norbert_pico_protocol::{
-    BridgeStats, BridgeVersion, ChipConfig, DeviceFrame, ErrorCode, HostFrame, Request, Response,
-    ToctouRequest, BRIDGE_PROTOCOL_VERSION, MAX_CHUNK,
+    BRIDGE_PROTOCOL_VERSION, BridgeStats, BridgeVersion, ChipConfig, DeviceFrame, ErrorCode,
+    FPGA_PROTOCOL_VERSION, HostFrame, MAX_CHUNK, Request, Response, ToctouRequest,
 };
 use zerocopy::byteorder::big_endian::U16 as BeU16;
 
@@ -77,11 +77,23 @@ impl<'d> Bridge<'d> {
             }
             Request::FpgaVersion => {
                 let mut bus = self.bus.lock().await;
+                bus.drain_rx().await;
                 bus.write_all(&[CMD_VERSION]).await?;
-                let mut version = [0u8; 1];
-                bus.read_exact(&mut version).await?;
-                let [version] = version;
-                Ok(Response::FpgaVersion(version))
+                for _ in 0..8 {
+                    let mut version = [0u8; 1];
+                    bus.read_exact(&mut version).await?;
+                    let [version] = version;
+                    if version == FPGA_PROTOCOL_VERSION {
+                        bus.drain_rx().await;
+                        return Ok(Response::FpgaVersion(version));
+                    }
+                    if version != 0x01 && version != 0x02 {
+                        bus.drain_rx().await;
+                        return Ok(Response::FpgaVersion(version));
+                    }
+                }
+                bus.drain_rx().await;
+                Err(ErrorCode::FpgaTimeout)
             }
             Request::Status => {
                 let status = self.fpga_status().await?;
@@ -124,12 +136,28 @@ impl<'d> Bridge<'d> {
 
     async fn fpga_status(&self) -> Result<bool, ErrorCode> {
         let mut bus = self.bus.lock().await;
+        bus.drain_rx().await;
         bus.write_all(&[CMD_STATUS]).await?;
-        match bus.read_nonzero_ack().await? {
-            0x01 => Ok(true),
-            0x02 => Ok(false),
-            other => Err(ErrorCode::FpgaRejected(other)),
+        for _ in 0..8 {
+            let status = bus.read_nonzero_ack().await?;
+            match status {
+                0x01 => {
+                    bus.drain_rx().await;
+                    return Ok(true);
+                }
+                0x02 => {
+                    bus.drain_rx().await;
+                    return Ok(false);
+                }
+                FPGA_PROTOCOL_VERSION => continue,
+                other => {
+                    bus.drain_rx().await;
+                    return Err(ErrorCode::FpgaRejected(other));
+                }
+            }
         }
+        bus.drain_rx().await;
+        Err(ErrorCode::FpgaTimeout)
     }
 
     async fn ram_read(&self, address: u32, length: u16) -> Result<Response, ErrorCode> {
@@ -174,9 +202,11 @@ impl<'d> Bridge<'d> {
         ];
 
         let mut bus = self.bus.lock().await;
+        bus.drain_rx().await;
         bus.write_all(&header).await?;
         bus.write_all(data).await?;
         let ack = bus.read_nonzero_ack().await?;
+        bus.drain_rx().await;
         if ack != 0x01 {
             return Err(ErrorCode::FpgaRejected(ack));
         }
@@ -191,7 +221,9 @@ impl<'d> Bridge<'d> {
         let flags = u8::from(config.supports_4byte_address);
         let erase = config.chip_erase_bursts;
         let mut command = Vec::<u8, 137>::new();
-        command.push(CMD_CHIPCONFIG).map_err(|_| ErrorCode::BadArgument)?;
+        command
+            .push(CMD_CHIPCONFIG)
+            .map_err(|_| ErrorCode::BadArgument)?;
         command
             .extend_from_slice(config.jedec_id.as_slice())
             .map_err(|_| ErrorCode::BadArgument)?;
@@ -215,6 +247,7 @@ impl<'d> Bridge<'d> {
 
     async fn log_poll(&self) -> Result<Response, ErrorCode> {
         let mut bus = self.bus.lock().await;
+        bus.drain_rx().await;
         bus.write_all(&[CMD_LOGPOLL]).await?;
 
         let mut out = Vec::<u8, 256>::new();
@@ -227,12 +260,15 @@ impl<'d> Bridge<'d> {
             }
             out.push(byte).map_err(|_| ErrorCode::FrameTooLarge)?;
         }
+        bus.drain_rx().await;
         Ok(Response::Log(out))
     }
 
     async fn toctou(&self, request: ToctouRequest) -> Result<Response, ErrorCode> {
         let mut command = Vec::<u8, 12>::new();
-        command.push(CMD_TOCTOU).map_err(|_| ErrorCode::BadArgument)?;
+        command
+            .push(CMD_TOCTOU)
+            .map_err(|_| ErrorCode::BadArgument)?;
         match request {
             ToctouRequest::Set {
                 index,
@@ -243,7 +279,9 @@ impl<'d> Bridge<'d> {
                 if index > 3 || start > 0xFF_FFFF || mask > 0xFF_FFFF || replace > 0xFF_FFFF {
                     return Err(ErrorCode::BadArgument);
                 }
-                command.push(TOCTOU_SET).map_err(|_| ErrorCode::BadArgument)?;
+                command
+                    .push(TOCTOU_SET)
+                    .map_err(|_| ErrorCode::BadArgument)?;
                 command.push(index).map_err(|_| ErrorCode::BadArgument)?;
                 push_u24(&mut command, start)?;
                 push_u24(&mut command, mask)?;
@@ -277,7 +315,11 @@ fn be_u16_bytes(value: u16) -> [u8; 2] {
     BeU16::new(value).to_bytes()
 }
 
-fn push_index<const N: usize>(out: &mut Vec<u8, N>, subcmd: u8, index: u8) -> Result<(), ErrorCode> {
+fn push_index<const N: usize>(
+    out: &mut Vec<u8, N>,
+    subcmd: u8,
+    index: u8,
+) -> Result<(), ErrorCode> {
     if index > 3 {
         return Err(ErrorCode::BadArgument);
     }

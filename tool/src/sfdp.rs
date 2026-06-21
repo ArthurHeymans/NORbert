@@ -46,10 +46,10 @@ fn write_sfdp_header(table: &mut [u8; SFDP_TABLE_SIZE]) {
     table[1] = 0x46; // 'F'
     table[2] = 0x44; // 'D'
     table[3] = 0x50; // 'P'
-                     // SFDP revision 1.6 (JESD216B)
+    // SFDP revision 1.6 (JESD216B)
     table[4] = 0x06; // Minor revision
     table[5] = 0x01; // Major revision
-                     // Number of parameter headers minus 1 (just BFPT)
+    // Number of parameter headers minus 1 (just BFPT)
     table[6] = 0x00;
     table[7] = 0xFF; // Unused
 }
@@ -60,7 +60,7 @@ fn write_param_header(table: &mut [u8; SFDP_TABLE_SIZE]) {
     table[0x09] = 0x06; // Parameter minor revision
     table[0x0A] = 0x01; // Parameter major revision
     table[0x0B] = BFPT_DWORDS; // Length in DWORDs
-                               // Table pointer (24-bit little-endian)
+    // Table pointer (24-bit little-endian)
     table[0x0C] = BFPT_OFFSET as u8;
     table[0x0D] = (BFPT_OFFSET >> 8) as u8;
     table[0x0E] = (BFPT_OFFSET >> 16) as u8;
@@ -241,7 +241,7 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     // [31:25] Type 4 typical time
     // ------------------------------------------------------------------
     let mut dw10: u32 = 0x01; // multiplier = 2*(1+1) = 4x
-                              // Type 1 (4KB):  ~45ms  -> 16ms * 3 = 48ms  -> unit=01, count=2
+    // Type 1 (4KB):  ~45ms  -> 16ms * 3 = 48ms  -> unit=01, count=2
     if !erase_ops.is_empty() {
         dw10 |= ((0x01 << 5) | 2) << 4; // 0x22 << 4
     }
