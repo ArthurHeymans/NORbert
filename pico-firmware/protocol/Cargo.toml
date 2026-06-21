@@ -7,10 +7,11 @@ description = "Postcard-framed RPC protocol for the NORbert Pico bridge"
 
 [features]
 default = []
-defmt = ["dep:defmt", "heapless/defmt-03"]
+defmt = ["dep:defmt", "heapless/defmt"]
 
 [dependencies]
 defmt = { workspace = true, optional = true }
 heapless = { workspace = true, features = ["serde"] }
 postcard = { workspace = true }
 serde = { workspace = true }
+zerocopy = { workspace = true }

@@ -50,7 +50,10 @@ postcard(HostFrame | DeviceFrame)
 ```
 
 This same framing is used on USB bulk and TCP, so host code can share one
-codec and swap transports.
+codec and swap transports.  The fixed-width length prefix uses `zerocopy`'s
+byteorder-aware `U16` type.  The postcard body remains serde/postcard-owned
+rather than reinterpreted with `zerocopy`, because it is a variable-length
+schema-bearing message.
 
 ## FPGA command coverage
 
@@ -67,17 +70,36 @@ The RPC layer currently exposes:
 
 ## Build
 
+Use a Rust 2024-compatible toolchain.  The dependency graph is resolved and
+locked in `Cargo.lock`; use `--locked` for reproducible builds.  In particular,
+`heapless` 0.9.x and `embedded-hal-bus` 0.3.x require Rust 1.87+ and 1.81+
+respectively.
+
 Install the RP2040 Rust target, then build from this directory:
 
 ```sh
 rustup target add thumbv6m-none-eabi
-cargo check -p norbert-pico-firmware
-cargo build -p norbert-pico-firmware --release
+cargo check -p norbert-pico-firmware --locked
+cargo build -p norbert-pico-firmware --release --locked
 ```
 
 This environment currently has a Nix-provided Rust toolchain without the
-`thumbv6m-none-eabi` target installed via rustup, so only the protocol crate was
-checked here.
+`thumbv6m-none-eabi` target installed via rustup, so protocol host checks are
+the primary validation available here.
+
+## Dependency notes
+
+- Workspace crates use Rust edition 2024.
+- Direct dependencies are declared at the newest compatible stable versions used
+  for this no-std Embassy/RP2040 firmware, with exact transitive versions
+  recorded in `Cargo.lock`.
+- `zerocopy` is kept at 0.8.52, the latest stable release.  Cargo advertises
+  0.9.0-alpha.0 as newer, but it is a pre-release and is intentionally not used
+  for firmware bring-up.
+- `zerocopy` is used only for fixed-width byte-order fields (`u16` frame
+  lengths and FPGA command length fields).  The 24-bit FPGA addresses remain
+  explicit byte pushes because `zerocopy` has no native U24 scalar, and the
+  postcard bodies remain serde/postcard encoded.
 
 ## FT245 backend status
 

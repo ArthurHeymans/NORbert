@@ -5,6 +5,7 @@ use norbert_pico_protocol::{
     BridgeStats, BridgeVersion, ChipConfig, DeviceFrame, ErrorCode, HostFrame, Request, Response,
     ToctouRequest, BRIDGE_PROTOCOL_VERSION, MAX_CHUNK,
 };
+use zerocopy::byteorder::big_endian::U16 as BeU16;
 
 use crate::ft245_bus::Ft245Bus;
 
@@ -114,7 +115,7 @@ impl<'d> Bridge<'d> {
             }
             Request::LogPoll => self.log_poll().await,
             Request::RamRead { address, length } => self.ram_read(address, length).await,
-            Request::RamWrite { address, data } => self.ram_write(address, &data).await,
+            Request::RamWrite { address, data } => self.ram_write(address, data.as_slice()).await,
             Request::ChipConfig(config) => self.chip_config(&config).await,
             Request::Toctou(request) => self.toctou(request).await,
             Request::Stats => self.stats().await,
@@ -137,14 +138,14 @@ impl<'d> Bridge<'d> {
             return Err(ErrorCode::BadArgument);
         }
         let addr_units = address / 8;
-        let len_units = (len / 8) as u16;
+        let [len_hi, len_lo] = be_u16_bytes((len / 8) as u16);
         let command = [
             CMD_READ,
             ((addr_units >> 16) & 0xFF) as u8,
             ((addr_units >> 8) & 0xFF) as u8,
             (addr_units & 0xFF) as u8,
-            (len_units >> 8) as u8,
-            len_units as u8,
+            len_hi,
+            len_lo,
         ];
 
         let mut data = Vec::<u8, MAX_CHUNK>::new();
@@ -162,14 +163,14 @@ impl<'d> Bridge<'d> {
             return Err(ErrorCode::BadArgument);
         }
         let addr_units = address / 8;
-        let len_units = (data.len() / 8) as u16;
+        let [len_hi, len_lo] = be_u16_bytes((data.len() / 8) as u16);
         let header = [
             CMD_WRITE,
             ((addr_units >> 16) & 0xFF) as u8,
             ((addr_units >> 8) & 0xFF) as u8,
             (addr_units & 0xFF) as u8,
-            (len_units >> 8) as u8,
-            len_units as u8,
+            len_hi,
+            len_lo,
         ];
 
         let mut bus = self.bus.lock().await;
@@ -192,19 +193,20 @@ impl<'d> Bridge<'d> {
         let mut command = Vec::<u8, 137>::new();
         command.push(CMD_CHIPCONFIG).map_err(|_| ErrorCode::BadArgument)?;
         command
-            .extend_from_slice(&config.jedec_id)
+            .extend_from_slice(config.jedec_id.as_slice())
             .map_err(|_| ErrorCode::BadArgument)?;
         command.push(flags).map_err(|_| ErrorCode::BadArgument)?;
+        let erase_and_sfdp_len = [
+            ((erase >> 16) & 0x7F) as u8,
+            ((erase >> 8) & 0xFF) as u8,
+            (erase & 0xFF) as u8,
+            config.sfdp.len() as u8,
+        ];
         command
-            .extend_from_slice(&[
-                ((erase >> 16) & 0x7F) as u8,
-                ((erase >> 8) & 0xFF) as u8,
-                (erase & 0xFF) as u8,
-                config.sfdp.len() as u8,
-            ])
+            .extend_from_slice(erase_and_sfdp_len.as_slice())
             .map_err(|_| ErrorCode::BadArgument)?;
         command
-            .extend_from_slice(&config.sfdp)
+            .extend_from_slice(config.sfdp.as_slice())
             .map_err(|_| ErrorCode::BadArgument)?;
 
         self.bus.lock().await.command_ack(&command).await?;
@@ -271,6 +273,10 @@ impl<'d> Bridge<'d> {
     }
 }
 
+fn be_u16_bytes(value: u16) -> [u8; 2] {
+    BeU16::new(value).to_bytes()
+}
+
 fn push_index<const N: usize>(out: &mut Vec<u8, N>, subcmd: u8, index: u8) -> Result<(), ErrorCode> {
     if index > 3 {
         return Err(ErrorCode::BadArgument);
@@ -280,10 +286,11 @@ fn push_index<const N: usize>(out: &mut Vec<u8, N>, subcmd: u8, index: u8) -> Re
 }
 
 fn push_u24<const N: usize>(out: &mut Vec<u8, N>, value: u32) -> Result<(), ErrorCode> {
-    out.extend_from_slice(&[
+    let bytes = [
         ((value >> 16) & 0xFF) as u8,
         ((value >> 8) & 0xFF) as u8,
         (value & 0xFF) as u8,
-    ])
-    .map_err(|_| ErrorCode::BadArgument)
+    ];
+    out.extend_from_slice(bytes.as_slice())
+        .map_err(|_| ErrorCode::BadArgument)
 }

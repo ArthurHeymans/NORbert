@@ -2,6 +2,7 @@
 
 use heapless::Vec;
 use serde::{Deserialize, Serialize};
+use zerocopy::byteorder::little_endian::U16 as LeU16;
 
 /// Maximum user payload carried in one RPC frame.
 pub const MAX_CHUNK: usize = 1024;
@@ -214,13 +215,15 @@ fn encode_prefixed<T: Serialize>(value: &T, out: &mut [u8]) -> Result<usize, Err
         return Err(ErrorCode::EncodeFailed);
     }
 
-    let len = body_len as u16;
-    out[0] = len as u8;
-    out[1] = (len >> 8) as u8;
+    let len = LeU16::new(body_len as u16).to_bytes();
+    let Some(prefix) = out.get_mut(..2) else {
+        return Err(ErrorCode::EncodeFailed);
+    };
+    prefix.copy_from_slice(&len);
     Ok(body_len + 2)
 }
 
 /// Return the little-endian length prefix as a `usize`.
 pub fn frame_len(prefix: [u8; 2]) -> usize {
-    u16::from_le_bytes(prefix) as usize
+    LeU16::from(prefix).get() as usize
 }

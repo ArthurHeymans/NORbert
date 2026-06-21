@@ -854,9 +854,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
- "defmt 0.3.100",
  "hash32",
- "serde",
  "stable_deref_trait",
 ]
 
@@ -868,6 +866,7 @@ checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
 dependencies = [
  "defmt 1.1.0",
  "hash32",
+ "serde_core",
  "stable_deref_trait",
 ]
 
@@ -1044,11 +1043,12 @@ dependencies = [
  "embassy-usb",
  "embedded-hal-bus",
  "embedded-io-async 0.7.0",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "norbert-pico-protocol",
  "panic-probe",
  "portable-atomic",
  "static_cell",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1056,9 +1056,10 @@ name = "norbert-pico-protocol"
 version = "0.1.0"
 dependencies = [
  "defmt 1.1.0",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "postcard",
  "serde",
+ "zerocopy",
 ]
 
 [[package]]

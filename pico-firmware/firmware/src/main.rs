@@ -66,13 +66,13 @@ async fn net_task(mut runner: embassy_net::Runner<'static, Device<'static>>) -> 
 
 #[embassy_executor::task]
 async fn tcp_rpc_task(stack: Stack<'static>, bridge: &'static Bridge<'static>) -> ! {
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
-    let mut body = [0; MAX_FRAME_BODY];
-    let mut out = [0; norbert_pico_protocol::MAX_FRAME];
+    let mut rx_buffer = [0u8; 4096];
+    let mut tx_buffer = [0u8; 4096];
+    let mut body = [0u8; MAX_FRAME_BODY];
+    let mut out = [0u8; norbert_pico_protocol::MAX_FRAME];
 
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        let mut socket = TcpSocket::new(stack, rx_buffer.as_mut_slice(), tx_buffer.as_mut_slice());
         socket.set_timeout(Some(Duration::from_secs(30)));
 
         info!("Listening for NORbert RPC on TCP:{}", TCP_PORT);
@@ -83,7 +83,7 @@ async fn tcp_rpc_task(stack: Stack<'static>, bridge: &'static Bridge<'static>) -
         info!("TCP RPC client connected: {:?}", socket.remote_endpoint());
 
         loop {
-            let len = match read_tcp_frame_body(&mut socket, &mut body).await {
+            let len = match read_tcp_frame_body(&mut socket, body.as_mut_slice()).await {
                 Ok(0) => break,
                 Ok(len) => len,
                 Err(error) => {
@@ -95,7 +95,7 @@ async fn tcp_rpc_task(stack: Stack<'static>, bridge: &'static Bridge<'static>) -
             let Some(body) = body.get(..len) else {
                 break;
             };
-            let n = handle_rpc_body(bridge, body, &mut out).await;
+            let n = handle_rpc_body(bridge, body, out.as_mut_slice()).await;
             let Some(response) = out.get(..n) else {
                 break;
             };
@@ -137,13 +137,17 @@ async fn main(spawner: Spawner) {
     static MSOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
     static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 
+    let config_descriptor = CONFIG_DESCRIPTOR.init([0u8; 256]);
+    let bos_descriptor = BOS_DESCRIPTOR.init([0u8; 256]);
+    let msos_descriptor = MSOS_DESCRIPTOR.init([0u8; 256]);
+    let control_buf = CONTROL_BUF.init([0u8; 64]);
     let mut builder = Builder::new(
         driver,
         usb_config,
-        CONFIG_DESCRIPTOR.init([0; 256]),
-        BOS_DESCRIPTOR.init([0; 256]),
-        MSOS_DESCRIPTOR.init([0; 256]),
-        CONTROL_BUF.init([0; 64]),
+        config_descriptor.as_mut_slice(),
+        bos_descriptor.as_mut_slice(),
+        msos_descriptor.as_mut_slice(),
+        control_buf.as_mut_slice(),
     );
     builder.msos_descriptor(windows_version::WIN8_1, 0);
     builder.msos_feature(msos::CompatibleIdFeatureDescriptor::new("WINUSB", ""));
@@ -163,7 +167,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(unwrap!(usb_task(usb)));
 
     let mut rx = UsbFrameRx::new();
-    let mut out = [0; norbert_pico_protocol::MAX_FRAME];
+    let mut out = [0u8; norbert_pico_protocol::MAX_FRAME];
     loop {
         usb_out.wait_enabled().await;
         info!("USB RPC connected");
@@ -171,7 +175,7 @@ async fn main(spawner: Spawner) {
 
         loop {
             let mut packet = [0u8; 64];
-            let n = match usb_out.read(&mut packet).await {
+            let n = match usb_out.read(packet.as_mut_slice()).await {
                 Ok(n) => n,
                 Err(e) => {
                     warn!("USB OUT failed: {:?}", e);
@@ -187,7 +191,7 @@ async fn main(spawner: Spawner) {
                     let Some(body) = frame else {
                         continue;
                     };
-                    let len = handle_rpc_body(bridge, body, &mut out).await;
+                    let len = handle_rpc_body(bridge, body, out.as_mut_slice()).await;
                     let Some(response) = out.get(..len) else {
                         break;
                     };
@@ -198,7 +202,7 @@ async fn main(spawner: Spawner) {
                     rx.consume();
                 }
                 Err(error) => {
-                    let len = encode_error(0, error, &mut out);
+                    let len = encode_error(0, error, out.as_mut_slice());
                     if let Some(response) = out.get(..len) {
                         let _ = write_usb_chunks(&mut usb_in, response).await;
                     }
@@ -271,7 +275,7 @@ async fn wait_for_config(stack: Stack<'static>) -> embassy_net::StaticConfigV4 {
 async fn handle_rpc_body(
     bridge: &'static Bridge<'static>,
     body: &[u8],
-    out: &mut [u8; norbert_pico_protocol::MAX_FRAME],
+    out: &mut [u8],
 ) -> usize {
     let response = match decode_host_body(body) {
         Ok(frame) => bridge.handle(frame).await,
@@ -287,11 +291,7 @@ async fn handle_rpc_body(
     }
 }
 
-fn encode_error(
-    seq: u32,
-    error: ErrorCode,
-    out: &mut [u8; norbert_pico_protocol::MAX_FRAME],
-) -> usize {
+fn encode_error(seq: u32, error: ErrorCode, out: &mut [u8]) -> usize {
     let frame = DeviceFrame {
         seq,
         response: Response::Error(error),
@@ -301,7 +301,7 @@ fn encode_error(
 
 async fn read_tcp_frame_body(
     socket: &mut TcpSocket<'_>,
-    body: &mut [u8; MAX_FRAME_BODY],
+    body: &mut [u8],
 ) -> Result<usize, ErrorCode> {
     let mut prefix = [0u8; 2];
     if read_exact_tcp(socket, &mut prefix).await? == 0 {
@@ -363,7 +363,7 @@ struct UsbFrameRx {
 impl UsbFrameRx {
     fn new() -> Self {
         Self {
-            buf: [0; norbert_pico_protocol::MAX_FRAME],
+            buf: [0u8; norbert_pico_protocol::MAX_FRAME],
             used: 0,
             expected: None,
         }
