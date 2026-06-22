@@ -347,7 +347,7 @@ const fn pio_set_pins_instr(value: u8) -> u16 {
 }
 
 fn tx_settle_time(_bytes: usize) -> Duration {
-    Duration::from_micros(500)
+    Duration::from_micros(100)
 }
 
 fn transfer_timeout(bytes: usize) -> Duration {
