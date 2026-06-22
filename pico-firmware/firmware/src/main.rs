@@ -4,7 +4,7 @@
 mod bridge;
 mod ft245_bus;
 
-use bridge::Bridge;
+use bridge::{Bridge, CMD_WRITE_STREAM, legacy_read_command, stream_command};
 use defmt::{info, unwrap, warn};
 use embassy_executor::Spawner;
 #[cfg(feature = "ethernet")]
@@ -42,8 +42,8 @@ use ft245_bus::Ft245Bus;
 #[cfg(feature = "ethernet")]
 use norbert_pico_protocol::TCP_PORT;
 use norbert_pico_protocol::{
-    DeviceFrame, ErrorCode, MAX_FRAME_BODY, Response, decode_host_body, encode_device_frame,
-    frame_len,
+    DeviceFrame, ErrorCode, HostFrame, MAX_FRAME_BODY, Request, Response, decode_host_body,
+    encode_device_frame, frame_len,
 };
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -230,8 +230,10 @@ async fn main(spawner: Spawner) {
 
     static USB_RX: StaticCell<UsbFrameRx> = StaticCell::new();
     static USB_OUT: StaticCell<[u8; norbert_pico_protocol::MAX_FRAME]> = StaticCell::new();
+    static USB_STREAM: StaticCell<[u8; 16 * 1024]> = StaticCell::new();
     let rx = USB_RX.init(UsbFrameRx::new());
     let out = USB_OUT.init([0u8; norbert_pico_protocol::MAX_FRAME]);
+    let stream_buf = USB_STREAM.init([0u8; 16 * 1024]);
     loop {
         usb_out.wait_enabled().await;
         info!("USB RPC connected");
@@ -274,15 +276,43 @@ async fn main(spawner: Spawner) {
                 let Some(body) = frame else {
                     break;
                 };
-                let len = handle_rpc_body(bridge, body, out.as_mut_slice()).await;
-                let Some(response) = out.get(..len) else {
-                    break;
+                let stream_request = match decode_host_body(body) {
+                    Ok(
+                        frame @ HostFrame {
+                            request: Request::RamReadStream { .. } | Request::RamWriteStream { .. },
+                            ..
+                        },
+                    ) => Some(frame),
+                    _ => None,
                 };
-                if let Err(e) = write_usb_chunks(&mut usb_in, response).await {
-                    warn!("USB IN failed: {:?}", e);
-                    break;
+
+                if let Some(frame) = stream_request {
+                    rx.consume();
+                    if let Err(e) = handle_usb_stream_request(
+                        bridge,
+                        frame,
+                        out.as_mut_slice(),
+                        stream_buf.as_mut_slice(),
+                        rx,
+                        &mut usb_out,
+                        &mut usb_in,
+                    )
+                    .await
+                    {
+                        warn!("USB stream failed: {:?}", e);
+                        break;
+                    }
+                } else {
+                    let len = handle_rpc_body(bridge, body, out.as_mut_slice()).await;
+                    let Some(response) = out.get(..len) else {
+                        break;
+                    };
+                    if let Err(e) = write_usb_chunks(&mut usb_in, response).await {
+                        warn!("USB IN failed: {:?}", e);
+                        break;
+                    }
+                    rx.consume();
                 }
-                rx.consume();
             }
         }
     }
@@ -369,6 +399,136 @@ async fn handle_rpc_body(bridge: &'static Bridge<'static>, body: &[u8], out: &mu
         Ok(len) => len,
         Err(_) => encode_error(response.seq, ErrorCode::EncodeFailed, out),
     }
+}
+
+async fn handle_usb_stream_request<I: EndpointIn, O: EndpointOut>(
+    bridge: &'static Bridge<'static>,
+    frame: HostFrame,
+    out: &mut [u8],
+    stream_buf: &mut [u8],
+    rx: &mut UsbFrameRx,
+    usb_out: &mut O,
+    usb_in: &mut I,
+) -> Result<(), embassy_usb::driver::EndpointError> {
+    match frame.request {
+        Request::RamReadStream { address, length } => {
+            let command = match legacy_read_command(address, length) {
+                Ok(command) => command,
+                Err(error) => {
+                    write_usb_error(usb_in, frame.seq, error, out).await?;
+                    return Ok(());
+                }
+            };
+
+            let mut bus = bridge.bus.lock().await;
+            if let Err(error) = bus.write_all(&command).await {
+                write_usb_error(usb_in, frame.seq, error, out).await?;
+                return Ok(());
+            }
+
+            write_usb_response(usb_in, frame.seq, Response::Ack, out).await?;
+            let mut remaining = length as usize;
+            while remaining != 0 {
+                let n = core::cmp::min(remaining, stream_buf.len());
+                let Some(chunk) = stream_buf.get_mut(..n) else {
+                    break;
+                };
+                if bus.read_exact(chunk).await.is_err() {
+                    break;
+                }
+                write_usb_chunks(usb_in, chunk).await?;
+                remaining -= n;
+            }
+        }
+        Request::RamWriteStream { address, length } => {
+            let command = match stream_command(CMD_WRITE_STREAM, address, length) {
+                Ok(command) => command,
+                Err(error) => {
+                    write_usb_error(usb_in, frame.seq, error, out).await?;
+                    return Ok(());
+                }
+            };
+
+            let mut bus = bridge.bus.lock().await;
+            let result = async {
+                bus.write_all(&command).await?;
+                let mut remaining = length as usize;
+                while remaining != 0 {
+                    let target = core::cmp::min(remaining, stream_buf.len());
+                    let Some(raw_target) = stream_buf.get_mut(..target) else {
+                        return Err(ErrorCode::FrameTooLarge);
+                    };
+                    let mut filled = rx.take_raw(raw_target);
+                    while filled < target {
+                        let Some(dst) = stream_buf.get_mut(filled..target) else {
+                            return Err(ErrorCode::FrameTooLarge);
+                        };
+                        let n = read_usb_raw_chunk(usb_out, dst).await?;
+                        if n == 0 {
+                            return Err(ErrorCode::FpgaTimeout);
+                        }
+                        filled += n;
+                    }
+                    let Some(chunk) = stream_buf.get(..filled) else {
+                        return Err(ErrorCode::FrameTooLarge);
+                    };
+                    bus.write_all(chunk).await?;
+                    remaining -= filled;
+                }
+                let ack = bus.read_nonzero_ack().await?;
+                if ack == 0x01 {
+                    Ok(Response::Ack)
+                } else {
+                    Err(ErrorCode::FpgaRejected(ack))
+                }
+            }
+            .await;
+
+            match result {
+                Ok(response) => write_usb_response(usb_in, frame.seq, response, out).await?,
+                Err(error) => write_usb_error(usb_in, frame.seq, error, out).await?,
+            }
+        }
+        _ => write_usb_error(usb_in, frame.seq, ErrorCode::BadArgument, out).await?,
+    }
+    Ok(())
+}
+
+async fn read_usb_raw_chunk<O: EndpointOut>(
+    ep: &mut O,
+    out: &mut [u8],
+) -> Result<usize, ErrorCode> {
+    let n = core::cmp::min(64, out.len());
+    let Some(buf) = out.get_mut(..n) else {
+        return Err(ErrorCode::FrameTooLarge);
+    };
+    ep.read(buf).await.map_err(|_| ErrorCode::FpgaTimeout)
+}
+
+async fn write_usb_response<I: EndpointIn>(
+    ep: &mut I,
+    seq: u32,
+    response: Response,
+    out: &mut [u8],
+) -> Result<(), embassy_usb::driver::EndpointError> {
+    let frame = DeviceFrame { seq, response };
+    let len = match encode_device_frame(&frame, out) {
+        Ok(len) => len,
+        Err(_) => encode_error(seq, ErrorCode::EncodeFailed, out),
+    };
+    if let Some(response) = out.get(..len) {
+        write_usb_chunks(ep, response).await?;
+    }
+    Ok(())
+}
+
+async fn write_usb_error<I: EndpointIn>(
+    ep: &mut I,
+    seq: u32,
+    error: ErrorCode,
+    out: &mut [u8],
+) -> Result<(), embassy_usb::driver::EndpointError> {
+    write_usb_response(ep, seq, Response::Error(error), out).await
 }
 
 fn encode_error(seq: u32, error: ErrorCode, out: &mut [u8]) -> usize {
@@ -492,6 +652,21 @@ impl UsbFrameRx {
         self.buf.copy_within(expected..self.used, 0);
         self.used -= expected;
         self.expected = None;
+    }
+
+    fn take_raw(&mut self, out: &mut [u8]) -> usize {
+        let n = core::cmp::min(self.used, out.len());
+        let Some(src) = self.buf.get(..n) else {
+            return 0;
+        };
+        let Some(dst) = out.get_mut(..n) else {
+            return 0;
+        };
+        dst.copy_from_slice(src);
+        self.buf.copy_within(n..self.used, 0);
+        self.used -= n;
+        self.expected = None;
+        n
     }
 
     fn update_expected(&mut self) -> Result<(), ErrorCode> {

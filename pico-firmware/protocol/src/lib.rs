@@ -17,10 +17,10 @@ pub const MAX_FRAME: usize = MAX_FRAME_BODY + 2;
 pub const TCP_PORT: u16 = 24500;
 
 /// NORbert FPGA byte protocol expected by current gateware.
-pub const FPGA_PROTOCOL_VERSION: u8 = 5;
+pub const FPGA_PROTOCOL_VERSION: u8 = 6;
 
 /// Bridge firmware protocol version.
-pub const BRIDGE_PROTOCOL_VERSION: u16 = 1;
+pub const BRIDGE_PROTOCOL_VERSION: u16 = 2;
 
 /// One host-to-device RPC frame.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,6 +77,17 @@ pub enum Request {
         address: u32,
         data: Vec<u8, MAX_CHUNK>,
     },
+    /// Start an FPGA-side raw read stream.
+    ///
+    /// The postcard response acknowledges stream setup; `length` raw bytes
+    /// then follow on the USB bulk IN endpoint. This request is USB-only.
+    RamReadStream { address: u32, length: u32 },
+    /// Start an FPGA-side raw write stream.
+    ///
+    /// `length` raw bytes follow this request on the USB bulk OUT endpoint;
+    /// the postcard response is sent after the FPGA accepts the full stream.
+    /// This request is USB-only.
+    RamWriteStream { address: u32, length: u32 },
     /// Apply a chip identity/SFDP table to the FPGA.
     ChipConfig(ChipConfig),
     /// Manage one of the FPGA TOCTOU traps.

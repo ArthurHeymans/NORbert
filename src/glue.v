@@ -130,7 +130,9 @@ module glue(
         CMD_HOLDCTL      = 8'h37,  // Assert/release target flash #HOLD
         CMD_LOGCTL       = 8'h38,  // Enable/disable SPI bus logging capture
         CMD_TOCTOU       = 8'h39,  // TOCTOU trap management
-        CMD_LOGPOLL      = 8'h3A;  // Drain logger ring FIFO
+        CMD_LOGPOLL      = 8'h3A,  // Drain logger ring FIFO
+        CMD_READ_STREAM  = 8'h3B,  // Stream SDRAM bytes without per-block commands
+        CMD_WRITE_STREAM = 8'h3C;  // Stream SDRAM writes without per-block ACKs
 
     // Terminator byte appended to every CMD_LOGPOLL response.  Log data
     // bytes equal to the terminator or escape byte are byte-stuffed as
@@ -145,7 +147,7 @@ module glue(
     // poll.
     localparam [7:0] LOG_POLL_MAX = 8'd255;
 
-    localparam VERSION = 8'h05;  // Version 5: HOLDCTL + logging + TOCTOU
+    localparam VERSION = 8'h06;  // Version 6: FPGA-side read/write streams
 
     // TOCTOU sub-commands
     localparam
@@ -164,8 +166,12 @@ module glue(
     // At 120MHz, 2^16 = 65536 cycles = ~546us
     reg [16:0] serial_idle_count;
 
+    // Longer timeout for raw WRITE_STREAM payload gaps. The Pico may pause
+    // between USB and PIO bursts; abort only after ~140ms of no payload.
+    reg [24:0] stream_idle_count;
+
     reg [22:0] addr;       // 23-bit burst address
-    reg [15:0] len;        // 16-bit burst count (v3: 2 header bytes)
+    reg [23:0] len;        // Burst count (16-bit legacy, 24-bit stream)
 
     reg [2:0] read_state;
     reg [2:0] read_pos;
@@ -309,6 +315,7 @@ module glue(
             cmd <= CMD_NOP;
             in_count <= 0;
             serial_idle_count <= 0;
+            stream_idle_count <= 0;
             addr <= 0;
             len <= 0;
 
@@ -670,19 +677,33 @@ module glue(
             end
             
             // Serial protocol idle timeout: reset parser if stuck in
-            // multi-byte command header with no data for ~137us.
-            // Exclude active read/write operations: during reads the
-            // host sends nothing (waiting for response data), so the
-            // idle counter would fire and kill the transfer.
-            if (in_count != 0 && !rxd_strobe_buf && !read_state && !write_state) begin
-                serial_idle_count <= serial_idle_count + 1;
-                if (serial_idle_count[16]) begin
+            // a multi-byte command header with no data.  Exclude active
+            // read/write operations: during reads the host sends nothing
+            // (waiting for response data), so the idle counter would fire
+            // and kill the transfer. WRITE_STREAM payload mode gets a much
+            // longer timeout because the Pico forwards USB data in bursts.
+            if (cmd == CMD_WRITE_STREAM && in_count > 8'd6 && !rxd_strobe_buf && !write_state) begin
+                stream_idle_count <= stream_idle_count + 1;
+                if (stream_idle_count[24]) begin
                     in_count <= 0;
                     cmd <= CMD_NOP;
+                    write_strobe <= 0;
+                    write_state <= 0;
                 end
+                serial_idle_count <= 0;
             end
             else begin
-                serial_idle_count <= 0;
+                stream_idle_count <= 0;
+                if (in_count != 0 && !rxd_strobe_buf && !read_state && !write_state) begin
+                    serial_idle_count <= serial_idle_count + 1;
+                    if (serial_idle_count[16]) begin
+                        in_count <= 0;
+                        cmd <= CMD_NOP;
+                    end
+                end
+                else begin
+                    serial_idle_count <= 0;
+                end
             end
             
             // -----------------------------------------------------------
@@ -822,9 +843,13 @@ module glue(
                         end
                         else if (!spi_running) begin
                             if (rxd_data_buf == CMD_RAMREAD ||
-                                rxd_data_buf == CMD_RAMWRITE) begin
+                                rxd_data_buf == CMD_RAMWRITE ||
+                                rxd_data_buf == CMD_READ_STREAM ||
+                                rxd_data_buf == CMD_WRITE_STREAM) begin
                                 cmd <= rxd_data_buf;
                                 in_count <= 1;
+
+                                len <= 0;
 
                                 read_state <= 0;
                                 read_pos <= 0;
@@ -1003,19 +1028,34 @@ module glue(
                         end
                     end
                     else begin
-                        // RAMREAD / RAMWRITE handling (v3: 6-byte header)
-                        // Header: cmd, addr[2], addr[1], addr[0], len_hi, len_lo
+                        // RAMREAD / RAMWRITE legacy header:
+                        //   cmd, addr[2], addr[1], addr[0], len_hi, len_lo
+                        // Stream header:
+                        //   cmd, addr[2], addr[1], addr[0], len[2], len[1], len[0]
+                        // Length units are 8-byte SDRAM bursts.
                         if (in_count <= 3)
                             addr <= {addr[14:0], rxd_data_buf};
-                        else if (in_count == 4)
-                            len[15:8] <= rxd_data_buf;
-                        else if (in_count == 5)
-                            len[7:0] <= rxd_data_buf;
+                        else if (cmd == CMD_RAMREAD || cmd == CMD_RAMWRITE) begin
+                            if (in_count == 4)
+                                len[15:8] <= rxd_data_buf;
+                            else if (in_count == 5)
+                                len[7:0] <= rxd_data_buf;
+                        end
+                        else begin
+                            if (in_count == 4)
+                                len[23:16] <= rxd_data_buf;
+                            else if (in_count == 5)
+                                len[15:8] <= rxd_data_buf;
+                            else if (in_count == 6)
+                                len[7:0] <= rxd_data_buf;
+                        end
 
-                        if (cmd == CMD_RAMREAD && in_count == 5) begin
+                        if ((cmd == CMD_RAMREAD && in_count == 5) ||
+                            (cmd == CMD_READ_STREAM && in_count == 6)) begin
                             read_state <= 1;
                         end
-                        if (cmd == CMD_RAMWRITE && in_count > 5) begin
+                        if (((cmd == CMD_RAMWRITE) && (in_count > 5)) ||
+                            ((cmd == CMD_WRITE_STREAM) && (in_count > 6))) begin
                             write_buffer[write_pos*8 +: 8] <= rxd_data_buf;
                             
                             if (write_pos == 7) begin
@@ -1024,7 +1064,8 @@ module glue(
                             write_pos <= write_pos + 1;
                         end
 
-                        if (in_count <= 5)
+                        if (((cmd == CMD_RAMREAD || cmd == CMD_RAMWRITE) && (in_count <= 5)) ||
+                            ((cmd == CMD_READ_STREAM || cmd == CMD_WRITE_STREAM) && (in_count <= 6)))
                             in_count <= in_count + 1;
                     end
 

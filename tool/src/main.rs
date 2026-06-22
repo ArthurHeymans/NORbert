@@ -30,7 +30,7 @@ const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
 const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
 const SDRAM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
-const PROTOCOL_VERSION: u8 = 5;
+const PROTOCOL_VERSION: u8 = 6;
 
 // Protocol commands (shared between UART and FT245 transports)
 const CMD_VERSION: u8 = 0x30;
@@ -385,6 +385,7 @@ struct PicoUsbTransport {
     last_read_next: Option<(u32, usize)>,
     last_write_next: Option<(u32, usize)>,
     read_ahead: usize,
+    stream_enabled: bool,
     trace_timing: bool,
 }
 
@@ -453,7 +454,10 @@ impl PicoUsbTransport {
         let reader = interface
             .endpoint::<Bulk, In>(0x81)
             .context("Pico USB IN endpoint 0x81 not found")?
-            .reader(norbert_pico_protocol::MAX_FRAME)
+            // Use one full-speed packet per host transfer. Stream payloads
+            // are usually exact multiples of 64 bytes; a larger transfer
+            // buffer would wait forever for a short packet at stream end.
+            .reader(64)
             .with_num_transfers(4)
             .with_read_timeout(Duration::from_secs(5));
 
@@ -462,6 +466,7 @@ impl PicoUsbTransport {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(8)
             .clamp(1, 16);
+        let stream_enabled = std::env::var_os("NORBERT_PICO_NO_STREAM").is_none();
 
         Ok(Self {
             reader,
@@ -472,6 +477,7 @@ impl PicoUsbTransport {
             last_read_next: None,
             last_write_next: None,
             read_ahead,
+            stream_enabled,
             trace_timing: std::env::var_os("NORBERT_PICO_TRACE_TIMING").is_some(),
         })
     }
@@ -555,6 +561,10 @@ impl PicoUsbTransport {
     }
 
     fn queue_pico_read(&mut self, address: u32, length: usize) -> Result<()> {
+        if length > norbert_pico_protocol::MAX_CHUNK {
+            return self.queue_pico_stream_read(address, length);
+        }
+
         if let Some(cached) = self.read_cache.front()
             && cached.address == address
             && cached.length == length
@@ -609,6 +619,50 @@ impl PicoUsbTransport {
         Ok(())
     }
 
+    fn queue_pico_stream_read(&mut self, address: u32, length: usize) -> Result<()> {
+        self.read_cache.clear();
+        self.last_read_next = None;
+        if !self.stream_enabled {
+            bail!(
+                "read: Pico stream mode disabled and chunk is {} bytes",
+                length
+            );
+        }
+        let token = self.send_rpc(norbert_pico_protocol::Request::RamReadStream {
+            address,
+            length: length as u32,
+        })?;
+        self.writer.flush()?;
+        match self.recv_rpc(token)? {
+            norbert_pico_protocol::Response::Ack => {}
+            other => bail!("read-stream: unexpected Pico response: {:?}", other),
+        }
+        let mut data = vec![0u8; length];
+        self.reader.read_exact(&mut data)?;
+        self.queue_response(data.as_slice());
+        Ok(())
+    }
+
+    fn pico_stream_write(&mut self, address: u32, payload: &[u8]) -> Result<()> {
+        if !self.stream_enabled {
+            bail!(
+                "write: Pico stream mode disabled and chunk is {} bytes",
+                payload.len()
+            );
+        }
+        let token = self.send_rpc(norbert_pico_protocol::Request::RamWriteStream {
+            address,
+            length: payload.len() as u32,
+        })?;
+        self.writer.flush()?;
+        for chunk in payload.chunks(norbert_pico_protocol::MAX_FRAME) {
+            self.writer.write_all(chunk)?;
+        }
+        self.writer.flush()?;
+        let response = self.recv_rpc(token)?;
+        self.queue_ack_response(response, "write-stream")
+    }
+
     fn queue_ack_response(
         &mut self,
         response: norbert_pico_protocol::Response,
@@ -652,7 +706,7 @@ impl PicoUsbTransport {
                     u32::from(rest[0]) << 16 | u32::from(rest[1]) << 8 | u32::from(rest[2]);
                 let len_units = usize::from(rest[3]) << 8 | usize::from(rest[4]);
                 let length = len_units * 8;
-                if length > norbert_pico_protocol::MAX_CHUNK {
+                if length > norbert_pico_protocol::MAX_CHUNK && !self.stream_enabled {
                     bail!("read: Pico bridge chunk too large: {} bytes", length);
                 }
                 self.queue_pico_read(addr_units * 8, length)
@@ -673,6 +727,13 @@ impl PicoUsbTransport {
                         payload.len()
                     );
                 }
+                let address = addr_units * 8;
+                if payload.len() > norbert_pico_protocol::MAX_CHUNK {
+                    self.pico_stream_write(address, payload)?;
+                    self.last_write_next = next_pico_read(address, length);
+                    return Ok(());
+                }
+
                 let mut rpc_data = heapless::Vec::<u8, { norbert_pico_protocol::MAX_CHUNK }>::new();
                 rpc_data.extend_from_slice(payload).map_err(|_| {
                     anyhow!(
@@ -680,7 +741,6 @@ impl PicoUsbTransport {
                         payload.len()
                     )
                 })?;
-                let address = addr_units * 8;
                 let sequential = self.last_write_next == Some((address, length));
                 let response = if sequential {
                     self.rpc(norbert_pico_protocol::Request::RamWriteFast {
@@ -823,6 +883,8 @@ fn pico_request_name(request: &norbert_pico_protocol::Request) -> &'static str {
         norbert_pico_protocol::Request::RamRead { .. } => "RamRead",
         norbert_pico_protocol::Request::RamWrite { .. } => "RamWrite",
         norbert_pico_protocol::Request::RamWriteFast { .. } => "RamWriteFast",
+        norbert_pico_protocol::Request::RamReadStream { .. } => "RamReadStream",
+        norbert_pico_protocol::Request::RamWriteStream { .. } => "RamWriteStream",
         norbert_pico_protocol::Request::ChipConfig(_) => "ChipConfig",
         norbert_pico_protocol::Request::Toctou(_) => "Toctou",
         norbert_pico_protocol::Request::Stats => "Stats",
@@ -918,10 +980,33 @@ impl FlashDevice {
     }
 
     fn open_pico_usb() -> Result<Self> {
+        let stream_enabled = std::env::var_os("NORBERT_PICO_NO_STREAM").is_none();
+        let stream_block_size = if stream_enabled {
+            std::env::var("NORBERT_PICO_STREAM_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| {
+                    *value >= norbert_pico_protocol::MAX_CHUNK
+                        && *value <= 16 * 1024
+                        && value.is_multiple_of(8)
+                })
+                .unwrap_or(4 * 1024)
+        } else {
+            norbert_pico_protocol::MAX_CHUNK
+        };
+        eprintln!(
+            "Pico USB FPGA stream mode: {} (block {} bytes)",
+            if stream_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            stream_block_size
+        );
         Ok(Self {
             transport: Box::new(PicoUsbTransport::open()?),
-            read_block_size: norbert_pico_protocol::MAX_CHUNK,
-            write_block_size: norbert_pico_protocol::MAX_CHUNK,
+            read_block_size: stream_block_size,
+            write_block_size: stream_block_size,
         })
     }
 
@@ -1050,8 +1135,8 @@ impl FlashDevice {
     }
 
     fn read_block(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
-        if length == 0 || length > BLOCK_SIZE {
-            bail!("Invalid length: must be 1-{}", BLOCK_SIZE);
+        if length == 0 || length > self.read_block_size {
+            bail!("Invalid length: must be 1-{}", self.read_block_size);
         }
         if !address.is_multiple_of(8) {
             bail!("Address must be 8-byte aligned");

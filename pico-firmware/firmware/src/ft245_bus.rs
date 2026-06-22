@@ -226,19 +226,28 @@ impl<'d> Ft245Bus<'d> {
 
     /// Write a command and wait for one ACK-like byte.
     pub async fn command_ack(&mut self, command: &[u8]) -> Result<(), ErrorCode> {
-        self.drain_rx().await;
-        self.write_all(command).await?;
-        for _ in 0..8 {
-            let ack = self.read_nonzero_ack().await?;
-            if ack == 0x01 {
-                self.drain_rx().await;
-                return Ok(());
-            }
-            if ack == FPGA_PROTOCOL_VERSION || ack == 0x02 {
-                continue;
-            }
+        const ATTEMPTS: usize = 3;
+        for attempt in 0..ATTEMPTS {
             self.drain_rx().await;
-            return Err(ErrorCode::FpgaRejected(ack));
+            self.write_all(command).await?;
+            for _ in 0..8 {
+                match self.read_nonzero_ack().await {
+                    Ok(0x01) => {
+                        self.drain_rx().await;
+                        return Ok(());
+                    }
+                    Ok(ack) if ack == FPGA_PROTOCOL_VERSION || ack == 0x02 => continue,
+                    Ok(ack) => {
+                        self.drain_rx().await;
+                        return Err(ErrorCode::FpgaRejected(ack));
+                    }
+                    Err(ErrorCode::FpgaTimeout) if attempt + 1 < ATTEMPTS => break,
+                    Err(error) => {
+                        self.drain_rx().await;
+                        return Err(error);
+                    }
+                }
+            }
         }
         self.drain_rx().await;
         Err(ErrorCode::FpgaTimeout)
@@ -334,7 +343,7 @@ fn set_control<'d, const SM: usize>(sm: &mut StateMachine<'d, PIO0, SM>, value: 
 }
 
 const fn pio_set_pins_instr(value: u8) -> u16 {
-    0b11100_000_000_00000 | value as u16
+    0xE000 | value as u16
 }
 
 fn tx_settle_time(_bytes: usize) -> Duration {

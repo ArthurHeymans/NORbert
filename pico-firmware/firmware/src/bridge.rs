@@ -10,7 +10,7 @@ use zerocopy::byteorder::big_endian::U16 as BeU16;
 use crate::ft245_bus::Ft245Bus;
 
 const CMD_VERSION: u8 = 0x30;
-const CMD_READ: u8 = 0x31;
+pub(crate) const CMD_READ: u8 = 0x31;
 const CMD_WRITE: u8 = 0x32;
 const CMD_CHIPCONFIG: u8 = 0x33;
 const CMD_START: u8 = 0x34;
@@ -19,7 +19,8 @@ const CMD_STATUS: u8 = 0x36;
 const CMD_HOLDCTL: u8 = 0x37;
 const CMD_LOGCTL: u8 = 0x38;
 const CMD_TOCTOU: u8 = 0x39;
-const CMD_LOGPOLL: u8 = 0x3A;
+pub(crate) const CMD_LOGPOLL: u8 = 0x3A;
+pub(crate) const CMD_WRITE_STREAM: u8 = 0x3C;
 
 const LOG_POLL_TERMINATOR: u8 = 0xA0;
 const MAX_WRITE_FRAME: usize = MAX_CHUNK + 6;
@@ -31,7 +32,7 @@ const TOCTOU_RESET_ALL: u8 = 0x05;
 
 /// Shared bridge state used by USB and Ethernet RPC frontends.
 pub struct Bridge<'d> {
-    bus: Mutex<CriticalSectionRawMutex, Ft245Bus<'d>>,
+    pub(crate) bus: Mutex<CriticalSectionRawMutex, Ft245Bus<'d>>,
     counters: Mutex<CriticalSectionRawMutex, BridgeStats>,
 }
 
@@ -134,6 +135,9 @@ impl<'d> Bridge<'d> {
             Request::RamWriteFast { address, data } => {
                 self.ram_write(address, data.as_slice(), false).await
             }
+            Request::RamReadStream { .. } | Request::RamWriteStream { .. } => {
+                Err(ErrorCode::BadArgument)
+            }
             Request::ChipConfig(config) => self.chip_config(&config).await,
             Request::Toctou(request) => self.toctou(request).await,
             Request::Stats => self.stats().await,
@@ -142,23 +146,29 @@ impl<'d> Bridge<'d> {
 
     async fn fpga_status(&self) -> Result<bool, ErrorCode> {
         let mut bus = self.bus.lock().await;
-        bus.drain_rx().await;
-        bus.write_all(&[CMD_STATUS]).await?;
-        for _ in 0..8 {
-            let status = bus.read_nonzero_ack().await?;
-            match status {
-                0x01 => {
-                    bus.drain_rx().await;
-                    return Ok(true);
-                }
-                0x02 => {
-                    bus.drain_rx().await;
-                    return Ok(false);
-                }
-                FPGA_PROTOCOL_VERSION => continue,
-                other => {
-                    bus.drain_rx().await;
-                    return Err(ErrorCode::FpgaRejected(other));
+        for attempt in 0..3 {
+            bus.drain_rx().await;
+            bus.write_all(&[CMD_STATUS]).await?;
+            for _ in 0..8 {
+                match bus.read_nonzero_ack().await {
+                    Ok(0x01) => {
+                        bus.drain_rx().await;
+                        return Ok(true);
+                    }
+                    Ok(0x02) => {
+                        bus.drain_rx().await;
+                        return Ok(false);
+                    }
+                    Ok(FPGA_PROTOCOL_VERSION) => continue,
+                    Ok(other) => {
+                        bus.drain_rx().await;
+                        return Err(ErrorCode::FpgaRejected(other));
+                    }
+                    Err(ErrorCode::FpgaTimeout) if attempt < 2 => break,
+                    Err(error) => {
+                        bus.drain_rx().await;
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -342,6 +352,61 @@ fn push_index<const N: usize>(
     }
     out.push(subcmd).map_err(|_| ErrorCode::BadArgument)?;
     out.push(index).map_err(|_| ErrorCode::BadArgument)
+}
+
+pub(crate) fn legacy_read_command(address: u32, length: u32) -> Result<[u8; 6], ErrorCode> {
+    if length == 0 || (address & 7) != 0 || (length & 7) != 0 {
+        return Err(ErrorCode::BadArgument);
+    }
+
+    let addr_units = address / 8;
+    let len_units = length / 8;
+    if addr_units >= 0x800000 || len_units == 0 || len_units > u16::MAX as u32 {
+        return Err(ErrorCode::BadArgument);
+    }
+    let Some(end_units) = addr_units.checked_add(len_units) else {
+        return Err(ErrorCode::BadArgument);
+    };
+    if end_units > 0x800000 {
+        return Err(ErrorCode::BadArgument);
+    }
+
+    Ok([
+        CMD_READ,
+        ((addr_units >> 16) & 0xFF) as u8,
+        ((addr_units >> 8) & 0xFF) as u8,
+        (addr_units & 0xFF) as u8,
+        ((len_units >> 8) & 0xFF) as u8,
+        (len_units & 0xFF) as u8,
+    ])
+}
+
+pub(crate) fn stream_command(cmd: u8, address: u32, length: u32) -> Result<[u8; 7], ErrorCode> {
+    if length == 0 || (address & 7) != 0 || (length & 7) != 0 {
+        return Err(ErrorCode::BadArgument);
+    }
+
+    let addr_units = address / 8;
+    let len_units = length / 8;
+    if addr_units >= 0x800000 || len_units > 0x800000 {
+        return Err(ErrorCode::BadArgument);
+    }
+    let Some(end_units) = addr_units.checked_add(len_units) else {
+        return Err(ErrorCode::BadArgument);
+    };
+    if end_units > 0x800000 {
+        return Err(ErrorCode::BadArgument);
+    }
+
+    Ok([
+        cmd,
+        ((addr_units >> 16) & 0xFF) as u8,
+        ((addr_units >> 8) & 0xFF) as u8,
+        (addr_units & 0xFF) as u8,
+        ((len_units >> 16) & 0xFF) as u8,
+        ((len_units >> 8) & 0xFF) as u8,
+        (len_units & 0xFF) as u8,
+    ])
 }
 
 fn push_u24<const N: usize>(out: &mut Vec<u8, N>, value: u32) -> Result<(), ErrorCode> {
