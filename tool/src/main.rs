@@ -990,7 +990,7 @@ impl FlashDevice {
                         && *value <= 16 * 1024
                         && value.is_multiple_of(8)
                 })
-                .unwrap_or(4 * 1024)
+                .unwrap_or(8 * 1024)
         } else {
             norbert_pico_protocol::MAX_CHUNK
         };
