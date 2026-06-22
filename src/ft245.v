@@ -49,8 +49,8 @@ module ft245(
     localparam [10:0]
         DELAY_RD_DATA  = 11'd25,  // RD# active to data valid (~208ns, Pico bridge margin)
         DELAY_RD_RECOV = 11'd10,  // RD# recovery + sync pipeline (~83ns)
-        DELAY_WR_PULSE = 11'd40,  // WR# active pulse width (~333ns, Pico bridge margin)
-        DELAY_WR_RECOV = 11'd20;  // WR# recovery + sync pipeline (~167ns)
+        DELAY_WR_PULSE = 11'd20,  // WR# active pulse width (~167ns, Pico bridge margin)
+        DELAY_WR_RECOV = 11'd5;   // WR# recovery + sync pipeline (~42ns)
 
     // -----------------------------------------------------------------
     // Synchronize FT2232H status inputs into system clock domain.
