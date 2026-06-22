@@ -47,7 +47,7 @@ module ft245(
     // All delays include margin above FT2232H datasheet minimums.
     // -----------------------------------------------------------------
     localparam [10:0]
-        DELAY_RD_DATA  = 11'd240, // RD# active to data valid (~2us, Pico bridge margin)
+        DELAY_RD_DATA  = 11'd40,  // RD# active to data valid (~333ns, Pico bridge margin)
         DELAY_RD_RECOV = 11'd20,  // RD# recovery + sync pipeline (~167ns)
         DELAY_WR_PULSE = 11'd40,  // WR# active pulse width (~333ns, Pico bridge margin)
         DELAY_WR_RECOV = 11'd20;  // WR# recovery + sync pipeline (~167ns)
