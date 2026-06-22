@@ -69,6 +69,14 @@ pub enum Request {
         address: u32,
         data: Vec<u8, MAX_CHUNK>,
     },
+    /// Write a sequential chunk without a pre-write stale RX drain.
+    ///
+    /// This is for Pico USB load acceleration after a preceding drained
+    /// [`Request::RamWrite`] has synchronized the FPGA/Pico bus.
+    RamWriteFast {
+        address: u32,
+        data: Vec<u8, MAX_CHUNK>,
+    },
     /// Apply a chip identity/SFDP table to the FPGA.
     ChipConfig(ChipConfig),
     /// Manage one of the FPGA TOCTOU traps.

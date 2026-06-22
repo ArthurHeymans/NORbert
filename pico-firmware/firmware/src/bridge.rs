@@ -22,6 +22,7 @@ const CMD_TOCTOU: u8 = 0x39;
 const CMD_LOGPOLL: u8 = 0x3A;
 
 const LOG_POLL_TERMINATOR: u8 = 0xA0;
+const MAX_WRITE_FRAME: usize = MAX_CHUNK + 6;
 const TOCTOU_SET: u8 = 0x01;
 const TOCTOU_ARM: u8 = 0x02;
 const TOCTOU_DISARM: u8 = 0x03;
@@ -127,7 +128,12 @@ impl<'d> Bridge<'d> {
             }
             Request::LogPoll => self.log_poll().await,
             Request::RamRead { address, length } => self.ram_read(address, length).await,
-            Request::RamWrite { address, data } => self.ram_write(address, data.as_slice()).await,
+            Request::RamWrite { address, data } => {
+                self.ram_write(address, data.as_slice(), true).await
+            }
+            Request::RamWriteFast { address, data } => {
+                self.ram_write(address, data.as_slice(), false).await
+            }
             Request::ChipConfig(config) => self.chip_config(&config).await,
             Request::Toctou(request) => self.toctou(request).await,
             Request::Stats => self.stats().await,
@@ -185,28 +191,39 @@ impl<'d> Bridge<'d> {
         Ok(Response::Data(data))
     }
 
-    async fn ram_write(&self, address: u32, data: &[u8]) -> Result<Response, ErrorCode> {
+    async fn ram_write(
+        &self,
+        address: u32,
+        data: &[u8],
+        drain_before: bool,
+    ) -> Result<Response, ErrorCode> {
         if data.is_empty() || data.len() > MAX_CHUNK || (address & 7) != 0 || (data.len() & 7) != 0
         {
             return Err(ErrorCode::BadArgument);
         }
         let addr_units = address / 8;
         let [len_hi, len_lo] = be_u16_bytes((data.len() / 8) as u16);
-        let header = [
-            CMD_WRITE,
-            ((addr_units >> 16) & 0xFF) as u8,
-            ((addr_units >> 8) & 0xFF) as u8,
-            (addr_units & 0xFF) as u8,
-            len_hi,
-            len_lo,
-        ];
+        let mut command = Vec::<u8, MAX_WRITE_FRAME>::new();
+        command
+            .extend_from_slice(&[
+                CMD_WRITE,
+                ((addr_units >> 16) & 0xFF) as u8,
+                ((addr_units >> 8) & 0xFF) as u8,
+                (addr_units & 0xFF) as u8,
+                len_hi,
+                len_lo,
+            ])
+            .map_err(|_| ErrorCode::BadArgument)?;
+        command
+            .extend_from_slice(data)
+            .map_err(|_| ErrorCode::BadArgument)?;
 
         let mut bus = self.bus.lock().await;
-        bus.drain_rx().await;
-        bus.write_all(&header).await?;
-        bus.write_all(data).await?;
+        if drain_before {
+            bus.drain_rx().await;
+        }
+        bus.write_all(command.as_slice()).await?;
         let ack = bus.read_nonzero_ack().await?;
-        bus.drain_rx().await;
         if ack != 0x01 {
             return Err(ErrorCode::FpgaRejected(ack));
         }

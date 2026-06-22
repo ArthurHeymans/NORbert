@@ -383,6 +383,7 @@ struct PicoUsbTransport {
     pending: VecDeque<u8>,
     read_cache: VecDeque<CachedRead>,
     last_read_next: Option<(u32, usize)>,
+    last_write_next: Option<(u32, usize)>,
     read_ahead: usize,
     trace_timing: bool,
 }
@@ -469,6 +470,7 @@ impl PicoUsbTransport {
             pending: VecDeque::new(),
             read_cache: VecDeque::new(),
             last_read_next: None,
+            last_write_next: None,
             read_ahead,
             trace_timing: std::env::var_os("NORBERT_PICO_TRACE_TIMING").is_some(),
         })
@@ -553,13 +555,14 @@ impl PicoUsbTransport {
     }
 
     fn queue_pico_read(&mut self, address: u32, length: usize) -> Result<()> {
-        if let Some(cached) = self.read_cache.front() {
-            if cached.address == address && cached.length == length {
-                let cached = self.read_cache.pop_front().expect("front checked");
-                self.queue_response(cached.data.as_slice());
-                self.last_read_next = next_pico_read(address, length);
-                return Ok(());
-            }
+        if let Some(cached) = self.read_cache.front()
+            && cached.address == address
+            && cached.length == length
+        {
+            let cached = self.read_cache.pop_front().expect("front checked");
+            self.queue_response(cached.data.as_slice());
+            self.last_read_next = next_pico_read(address, length);
+            return Ok(());
         }
 
         let sequential = self.last_read_next == Some((address, length));
@@ -629,6 +632,9 @@ impl PicoUsbTransport {
             self.read_cache.clear();
             self.last_read_next = None;
         }
+        if cmd != CMD_WRITE {
+            self.last_write_next = None;
+        }
 
         match cmd {
             CMD_VERSION => match self.rpc(norbert_pico_protocol::Request::FpgaVersion)? {
@@ -674,11 +680,22 @@ impl PicoUsbTransport {
                         payload.len()
                     )
                 })?;
-                let response = self.rpc(norbert_pico_protocol::Request::RamWrite {
-                    address: addr_units * 8,
-                    data: rpc_data,
-                })?;
-                self.queue_ack_response(response, "write")
+                let address = addr_units * 8;
+                let sequential = self.last_write_next == Some((address, length));
+                let response = if sequential {
+                    self.rpc(norbert_pico_protocol::Request::RamWriteFast {
+                        address,
+                        data: rpc_data,
+                    })?
+                } else {
+                    self.rpc(norbert_pico_protocol::Request::RamWrite {
+                        address,
+                        data: rpc_data,
+                    })?
+                };
+                self.queue_ack_response(response, "write")?;
+                self.last_write_next = next_pico_read(address, length);
+                Ok(())
             }
             CMD_CHIPCONFIG => {
                 if rest.len() < 8 {
@@ -805,6 +822,7 @@ fn pico_request_name(request: &norbert_pico_protocol::Request) -> &'static str {
         norbert_pico_protocol::Request::LogPoll => "LogPoll",
         norbert_pico_protocol::Request::RamRead { .. } => "RamRead",
         norbert_pico_protocol::Request::RamWrite { .. } => "RamWrite",
+        norbert_pico_protocol::Request::RamWriteFast { .. } => "RamWriteFast",
         norbert_pico_protocol::Request::ChipConfig(_) => "ChipConfig",
         norbert_pico_protocol::Request::Toctou(_) => "Toctou",
         norbert_pico_protocol::Request::Stats => "Stats",
