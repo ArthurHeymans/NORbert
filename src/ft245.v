@@ -44,13 +44,29 @@ module ft245(
 
     // -----------------------------------------------------------------
     // Timing parameters (120MHz clock, ~8.3ns per cycle)
-    // All delays include margin above FT2232H datasheet minimums.
+    //
+    // build.tcl generates impl/generated/ft245_timing.vh from the
+    // FT245_TIMING environment variable:
+    //   FT245_TIMING=pico    - conservative strobes for the RP2040 bridge
+    //   FT245_TIMING=ft2232h - shorter strobes for a real FT2232H FIFO
+    //
+    // Both profiles exceed the FT2232H async FIFO datasheet minimums;
+    // the Pico profile adds enough margin for the RP2040 PIO/DMA bridge.
     // -----------------------------------------------------------------
+`include "impl/generated/ft245_timing.vh"
+`ifdef FT245_TIMING_FT2232H
+    localparam [10:0]
+        DELAY_RD_DATA  = 11'd7,   // RD# active to data valid (~58ns, min 50ns)
+        DELAY_RD_RECOV = 11'd10,  // RD# recovery + sync pipeline (~83ns)
+        DELAY_WR_PULSE = 11'd7,   // WR# active pulse width (~58ns, min 50ns)
+        DELAY_WR_RECOV = 11'd5;   // WR# recovery + sync pipeline (~42ns)
+`else
     localparam [10:0]
         DELAY_RD_DATA  = 11'd25,  // RD# active to data valid (~208ns, Pico bridge margin)
         DELAY_RD_RECOV = 11'd10,  // RD# recovery + sync pipeline (~83ns)
         DELAY_WR_PULSE = 11'd20,  // WR# active pulse width (~167ns, Pico bridge margin)
         DELAY_WR_RECOV = 11'd5;   // WR# recovery + sync pipeline (~42ns)
+`endif
 
     // -----------------------------------------------------------------
     // Synchronize FT2232H status inputs into system clock domain.

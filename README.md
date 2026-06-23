@@ -47,7 +47,9 @@ Without Nix, you'll need:
 ### FPGA bitstream
 
 ```
-make build                  # synthesize + place & route
+make build                  # synthesize + place & route (default Pico FT245 timing)
+make build-pico             # force-build the Raspberry Pi Pico timing variant
+make build-ft2232h          # force-build the real FT2232H timing variant
 make prog                   # program FPGA (volatile, lost on power cycle)
 make flash                  # program to flash (persistent)
 ```
@@ -164,6 +166,14 @@ spi-flash-tool --ft245 --ft-serial FT6XXXXX load firmware.bin
 ```
 
 The FT2232H is used in asynchronous 245 FIFO mode. This requires a **one-time EEPROM configuration** to set Channel A to "245 FIFO" mode using [FT_PROG](https://ftdichip.com/utilities/#ft_prog) (Windows) or `ftd2xx_eeprom` (Linux). No special BitMode is set at runtime -- the host tool just opens the device and reads/writes normally.
+
+For maximum direct-FT2232H throughput, build the FPGA image with the shorter real-FTDI FIFO timing profile:
+
+```
+make build-ft2232h
+```
+
+The default `make build`/`make build-pico` profile uses longer strobes needed by the Raspberry Pi Pico bridge and should still work with a real FT2232H, but more slowly.
 
 **Wiring:** Connect the FT2232H Channel A pins to the FPGA dock as follows:
 
