@@ -82,6 +82,8 @@ module glue(
     // spi_trx and back into this module -- so while stopped the SPI pins
     // are ignored and serial commands always have a clear path.
     output reg spi_running,
+    output reg sd_mode,
+    output reg [31:0] image_sectors,
 
     // Target flash HOLD control (active high: 1 = assert #HOLD on target)
     output reg hold_out,
@@ -130,7 +132,9 @@ module glue(
         CMD_HOLDCTL      = 8'h37,  // Assert/release target flash #HOLD
         CMD_LOGCTL       = 8'h38,  // Enable/disable SPI bus logging capture
         CMD_TOCTOU       = 8'h39,  // TOCTOU trap management
-        CMD_LOGPOLL      = 8'h3A;  // Drain logger ring FIFO
+        CMD_LOGPOLL      = 8'h3A,  // Drain logger ring FIFO
+        CMD_MODE         = 8'h3B,  // Query/set protocol mode (0=NOR, 1=SD)
+        CMD_IMAGE        = 8'h3C;  // Set SD image sector count
 
     // Terminator byte appended to every CMD_LOGPOLL response.  Log data
     // bytes equal to the terminator or escape byte are byte-stuffed as
@@ -145,7 +149,7 @@ module glue(
     // poll.
     localparam [7:0] LOG_POLL_MAX = 8'd255;
 
-    localparam VERSION = 8'h05;  // Version 5: HOLDCTL + logging + TOCTOU
+    localparam VERSION = 8'h06;  // Version 6: native 1-bit SD mode
 
     // TOCTOU sub-commands
     localparam
@@ -385,6 +389,8 @@ module glue(
             // reach the FPGA regardless of target-board state; the host
             // tool sends START explicitly after loading firmware.
             spi_running <= 0;
+            sd_mode <= 0;
+            image_sectors <= 0;
 
             for (i = 0; i < 256; i = i + 1)
                 i_spi_write_data[i][8] <= 0;
@@ -685,6 +691,7 @@ module glue(
                 serial_idle_count <= 0;
             end
             
+
             // -----------------------------------------------------------
             // Always-safe command dispatcher.
             //
@@ -820,6 +827,10 @@ module glue(
                             cmd <= CMD_TOCTOU;
                             in_count <= 1;
                         end
+                        else if (rxd_data_buf == CMD_MODE) begin
+                            cmd <= CMD_MODE;
+                            in_count <= 1;
+                        end
                         else if (!spi_running) begin
                             if (rxd_data_buf == CMD_RAMREAD ||
                                 rxd_data_buf == CMD_RAMWRITE) begin
@@ -834,6 +845,10 @@ module glue(
                             end
                             else if (rxd_data_buf == CMD_CHIPCONFIG) begin
                                 cmd <= CMD_CHIPCONFIG;
+                                in_count <= 1;
+                            end
+                            else if (rxd_data_buf == CMD_IMAGE) begin
+                                cmd <= CMD_IMAGE;
                                 in_count <= 1;
                             end
                         end
@@ -897,6 +912,37 @@ module glue(
                         end
                         else begin
                             in_count <= in_count + 1;
+                        end
+                    end
+                    // CMD_MODE takes one mandatory argument byte:
+                    //   0xFF = query current mode, 0x00/0x01 = set NOR/SD.
+                    else if (cmd == CMD_MODE) begin
+                        if (rxd_data_buf == 8'hFF) begin
+                            txd_strobe_buf <= 1;
+                            txd_data_buf <= {7'b0, sd_mode};
+                        end
+                        else if (!spi_running) begin
+                            sd_mode <= rxd_data_buf[0];
+                            txd_strobe_buf <= 1;
+                            txd_data_buf <= 8'h01;
+                        end
+                        else begin
+                            txd_strobe_buf <= 1;
+                            txd_data_buf <= 8'hEE;
+                        end
+                        in_count <= 0;
+                        cmd <= CMD_NOP;
+                    end
+                    else if (cmd == CMD_IMAGE) begin
+                        if (in_count == 1) begin image_sectors[31:24] <= rxd_data_buf; in_count <= 2; end
+                        else if (in_count == 2) begin image_sectors[23:16] <= rxd_data_buf; in_count <= 3; end
+                        else if (in_count == 3) begin image_sectors[15:8] <= rxd_data_buf; in_count <= 4; end
+                        else begin
+                            image_sectors[7:0] <= rxd_data_buf;
+                            txd_strobe_buf <= 1;
+                            txd_data_buf <= 8'h01;
+                            in_count <= 0;
+                            cmd <= CMD_NOP;
                         end
                     end
                     else if (cmd == CMD_HOLDCTL) begin

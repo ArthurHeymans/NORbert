@@ -30,7 +30,7 @@ module top(
     output wire uart_tx,          // FPGA transmits to FTDI
     
     // SPI flash emulation interface (PMOD J5)
-    input wire spi_cs_pin,        // Active low chip select
+    inout wire spi_cs_pin,        // SPI CS / SD DAT3 pull-up/card detect
     input wire spi_clk_pin,       // SPI clock from master
     inout wire spi_mosi_pin,      // IO0: MOSI / bidirectional in dual/quad mode
     inout wire spi_miso_pin,      // IO1: MISO / bidirectional in dual/quad mode
@@ -156,27 +156,43 @@ module top(
     wire spi_debug_out;
     
     // IO0 (MOSI pin): input normally, output during dual/quad read data phase
-    wire spi_active_out = !spi_cs_pin && spi_power_in;
-    assign spi_mosi_pin = (spi_io0_oe && spi_active_out) ? spi_io0_out : 1'bz;
+    wire spi_running;
+    wire sd_mode;
+    wire [31:0] image_sectors;
+    wire sd_running = spi_running && sd_mode;
+    wire nor_running = spi_running && !sd_mode;
+
+    wire sd_cmd_out;
+    wire sd_cmd_oe;
+    wire sd_dat0_out;
+    wire sd_dat0_oe;
+
+    wire spi_active_out = !spi_cs_pin && spi_power_in && !sd_mode;
+    assign spi_mosi_pin = sd_running ? (sd_cmd_oe ? sd_cmd_out : 1'bz) :
+                          (spi_io0_oe && spi_active_out) ? spi_io0_out : 1'bz;
     wire spi_io0_in = spi_mosi_pin;
     
-    // IO1 (MISO pin): output during single-mode reads and dual/quad read data phase
-    assign spi_miso_pin = (spi_io1_oe && spi_active_out) ? spi_io1_out : 1'bz;
+    // IO1 (MISO pin): output during single-mode reads and dual/quad read data phase; SD DAT0 in SD mode.
+    assign spi_miso_pin = sd_running ? (sd_dat0_oe ? sd_dat0_out : 1'bz) :
+                          (spi_io1_oe && spi_active_out) ? spi_io1_out : 1'bz;
     wire spi_io1_in = spi_miso_pin;
     
-    // IO2 (/WP pin): input normally, output during quad read data phase
-    assign spi_io2_pin = (spi_io2_oe && spi_active_out) ? spi_io2_out : 1'bz;
+    // IO2 (/WP pin): SD DAT1 is held high while running SD.
+    assign spi_io2_pin = sd_running ? 1'b1 :
+                         (spi_io2_oe && spi_active_out) ? spi_io2_out : 1'bz;
     wire spi_io2_in = spi_io2_pin;
     
-    // IO3 (/HOLD pin): input normally, output during quad read data phase.
-    // When hold_out is asserted, IO3 is driven LOW continuously to keep
-    // the target flash in hold state (mutually exclusive with quad I/O).
+    // IO3 (/HOLD pin): SD DAT2 is held high while running SD.
     wire hold_out;
-    assign spi_io3_pin = hold_out ? 1'b0 :
+    assign spi_io3_pin = sd_running ? 1'b1 :
+                         hold_out ? 1'b0 :
                          (spi_io3_oe && spi_active_out) ? spi_io3_out : 1'bz;
     wire spi_io3_in = spi_io3_pin;
+
+    // SD DAT3/card-detect shares the old CS pin; hold it high in SD mode.
+    assign spi_cs_pin = sd_running ? 1'b1 : 1'bz;
     
-    assign spi_debug_pin = spi_debug_out;
+    assign spi_debug_pin = sd_running ? sd_dat0_oe : spi_debug_out;
     
     // SPI power detection and reset logic
     reg [1:0] spi_power_reg;
@@ -209,8 +225,7 @@ module top(
     // fed back into glue.v so its serial_gate stops depending on SPI pin
     // state -- guaranteeing the host can always reach the FPGA over
     // UART/FT245 regardless of whether a target board is connected.
-    wire spi_running;
-    wire spi_reset_effective = spi_reset || !spi_running;
+    wire spi_reset_effective = spi_reset || !nor_running;
     
     // -----------------------------------------------------------
     // SPI Transceiver
@@ -309,6 +324,49 @@ module top(
     );
     
     // -----------------------------------------------------------
+    // SD 1-bit Transceiver
+    // -----------------------------------------------------------
+
+    wire sd_ram_activate;
+    wire sd_ram_read;
+    wire [22:0] sd_ram_addr;
+    wire sd_log_cmd_valid;
+    wire [7:0] sd_log_cmd_opcode;
+    wire sd_log_addr_valid;
+    wire [31:0] sd_log_addr_out;
+    wire [23:0] sd_log_byte_count;
+
+    sd_card_1bit sd_card_i(
+        .clk(clk),
+        .reset(reset),
+        .sd_reset(spi_reset || !sd_running),
+        .sd_clk(spi_clk_pin),
+        .sd_cmd_in(spi_mosi_pin),
+        .sd_cmd_out(sd_cmd_out),
+        .sd_cmd_oe(sd_cmd_oe),
+        .sd_dat0_out(sd_dat0_out),
+        .sd_dat0_oe(sd_dat0_oe),
+        .image_sectors(image_sectors),
+        .ram_activate(sd_ram_activate),
+        .ram_read(sd_ram_read),
+        .ram_addr(sd_ram_addr),
+        .ram_read_buffer(sdram_read_buffer),
+        .ram_read_busy(sdram_read_busy),
+        .log_cmd_valid(sd_log_cmd_valid),
+        .log_cmd_opcode(sd_log_cmd_opcode),
+        .log_addr_valid(sd_log_addr_valid),
+        .log_addr_out(sd_log_addr_out),
+        .log_byte_count(sd_log_byte_count)
+    );
+
+    wire bus_log_cmd_valid = sd_running ? sd_log_cmd_valid : log_cmd_valid;
+    wire [7:0] bus_log_cmd_opcode = sd_running ? sd_log_cmd_opcode : log_cmd_opcode;
+    wire bus_log_addr_valid = sd_running ? sd_log_addr_valid : log_addr_valid;
+    wire [31:0] bus_log_addr_out = sd_running ? sd_log_addr_out : log_addr_out;
+    wire [23:0] bus_log_byte_count = sd_running ? sd_log_byte_count : log_byte_count;
+    wire bus_active = sd_running ? 1'b1 : spi_active;
+
+    // -----------------------------------------------------------
     // Logging signal synchronization (SPI -> system clock domain)
     //
     // The glue module needs synchronized versions of log_addr_valid
@@ -388,11 +446,12 @@ module top(
         .dqm_o(sdram_dqm),
         .dq_io(IO_sdram_dq),
         
-        // SPI fast-path control (address passes through TOCTOU redirect mux)
-        .spi_inhibit_refresh(spi_ram_inhibit_refresh),
-        .spi_cmd_activate(spi_ram_activate),
-        .spi_cmd_read(spi_ram_read),
-        .spi_addr(spi_ram_addr_final),
+        // Fast-path control: running NOR=spi_trx, running SD=sd_card_1bit.
+        // SD holds requests until accepted, so no refresh inhibit needed.
+        .spi_inhibit_refresh(sd_running ? 1'b0 : spi_ram_inhibit_refresh),
+        .spi_cmd_activate(sd_running ? sd_ram_activate : spi_ram_activate),
+        .spi_cmd_read(sd_running ? sd_ram_read : spi_ram_read),
+        .spi_addr(sd_running ? sd_ram_addr : spi_ram_addr_final),
         
         // Serial path control
         .access_cmd(sdram_access_cmd),
@@ -485,12 +544,12 @@ module top(
         .reset(reset),
         .enable(log_active),
 
-        .spi_log_cmd_valid(log_cmd_valid),
-        .spi_log_cmd_opcode(log_cmd_opcode),
-        .spi_log_addr_valid(log_addr_valid),
-        .spi_log_addr(log_addr_out),
-        .spi_active(spi_active),
-        .spi_log_byte_count(log_byte_count),
+        .spi_log_cmd_valid(bus_log_cmd_valid),
+        .spi_log_cmd_opcode(bus_log_cmd_opcode),
+        .spi_log_addr_valid(bus_log_addr_valid),
+        .spi_log_addr(bus_log_addr_out),
+        .spi_active(bus_active),
+        .spi_log_byte_count(bus_log_byte_count),
 
         .trap_notify_strobe(trap_notify_strobe),
         .trap_notify_index(trap_notify_index),
@@ -594,6 +653,8 @@ module top(
         .sfdp_rdata(sfdp_rdata),
         
         .spi_running(spi_running),
+        .sd_mode(sd_mode),
+        .image_sectors(image_sectors),
         .hold_out(hold_out),
 
         .log_active(log_active),

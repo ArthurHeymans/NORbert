@@ -133,6 +133,7 @@
 
             # Simulation & waveform
             verilator
+            iverilog
             gtkwave
 
             # Build tools
@@ -141,7 +142,7 @@
             # FTDI EEPROM programming (FT2232H async 245 setup)
             libftdi1
 
-            # Rust toolchain for spi-flash-tool
+            # Rust toolchain for norbert-tool
             cargo
             rustc
             pkg-config
@@ -166,7 +167,8 @@
             echo "  make prog        - Program FPGA (volatile)"
             echo "  make flash       - Program to flash (persistent)"
             echo "  make lint        - Lint with yosys"
-            echo "  make tool        - Build spi-flash-tool"
+            echo "  make test        - Run SD card testbench (iverilog)"
+            echo "  make tool        - Build norbert-tool"
             echo ""
           '';
         };

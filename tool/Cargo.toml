@@ -1,5 +1,5 @@
 [package]
-name = "spi-flash-tool"
+name = "norbert-tool"
 version = "0.2.0"
 edition = "2024"
 description = "Tool for loading data into the Tang Primer 25K SPI Flash Emulator (UART + FT245)"

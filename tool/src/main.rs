@@ -29,7 +29,7 @@ const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
 const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
 const SDRAM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
-const PROTOCOL_VERSION: u8 = 5;
+const PROTOCOL_VERSION: u8 = 6;
 
 // Protocol commands (shared between UART and FT245 transports)
 const CMD_VERSION: u8 = 0x30;
@@ -43,6 +43,8 @@ const CMD_HOLDCTL: u8 = 0x37; // Target flash #HOLD control (protocol v5+)
 const CMD_LOGCTL: u8 = 0x38; // Enable/disable SPI bus logging capture (protocol v5+)
 const CMD_TOCTOU: u8 = 0x39; // TOCTOU trap management (protocol v5+)
 const CMD_LOGPOLL: u8 = 0x3A; // Drain logger ring FIFO (protocol v5+)
+const CMD_MODE: u8 = 0x3B; // Query/set protocol mode (protocol v6+)
+const CMD_IMAGE: u8 = 0x3C; // Set SD image sector count (protocol v6+)
 
 // CMD_LOGPOLL framing. Raw log bytes equal to 0xA0 or 0xA5 are escaped
 // by the FPGA as 0xA5 0x00 or 0xA5 0x05 respectively, leaving 0xA0 as an
@@ -471,6 +473,39 @@ impl FlashDevice {
         }
     }
 
+    fn mode(&mut self) -> Result<u8> {
+        self.transport.write_all(&[CMD_MODE, 0xFF])?;
+        let mode = self.read_ack("mode")?;
+        match mode {
+            0 | 1 => Ok(mode),
+            other => bail!("mode: unexpected response 0x{:02x}", other),
+        }
+    }
+
+    fn set_mode(&mut self, mode: u8) -> Result<()> {
+        self.transport.write_all(&[CMD_MODE, mode])?;
+        let ack = self.read_ack("mode set")?;
+        if ack != 0x01 {
+            bail!("mode set: unexpected response 0x{:02x}", ack);
+        }
+        Ok(())
+    }
+
+    fn set_image_sectors(&mut self, sectors: u32) -> Result<()> {
+        self.transport.write_all(&[
+            CMD_IMAGE,
+            ((sectors >> 24) & 0xff) as u8,
+            ((sectors >> 16) & 0xff) as u8,
+            ((sectors >> 8) & 0xff) as u8,
+            (sectors & 0xff) as u8,
+        ])?;
+        let ack = self.read_ack("image")?;
+        if ack != 0x01 {
+            bail!("image: unexpected response 0x{:02x}", ack);
+        }
+        Ok(())
+    }
+
     /// Ensure emulation is stopped for the duration of `f`, then
     /// restore the prior state.  On v3 or older firmware (which has
     /// no START/STOP/STATUS opcodes) `f` runs unconditionally and the
@@ -888,7 +923,7 @@ impl FlashDevice {
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "spi-flash-tool")]
+#[command(name = "norbert-tool")]
 #[command(about = "Tool for the Tang Primer 25K SPI Flash Emulator (UART + FT245)", long_about = None)]
 struct Cli {
     /// Serial port device (ignored when --ft245 is used)
@@ -949,6 +984,12 @@ enum Commands {
         /// Verify after writing
         #[arg(short, long)]
         verify: bool,
+    },
+
+    /// Query/set emulation protocol mode (nor or sd)
+    Mode {
+        /// Optional mode to set: nor or sd. Omit to query.
+        mode: Option<String>,
     },
 
     /// Dump flash contents to a file
@@ -1255,6 +1296,13 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
         pb.finish_with_message("done");
         println!("Loaded {} bytes ({} blocks)", padded.len(), block_num);
 
+        if device.mode()? == 1 {
+            // Card capacity must not exceed the 64MB SDRAM backing store.
+            let sectors = (data.len() as u32).div_ceil(512).min(SDRAM_SIZE_BYTES as u32 / 512);
+            device.set_image_sectors(sectors)?;
+            println!("SD image: {} sectors", sectors);
+        }
+
         if verify {
             println!("Verifying...");
             let pb = ProgressBar::new(padded.len() as u64);
@@ -1312,6 +1360,23 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
 
 fn cmd_dump(cli: &Cli, file: &Path, address: u32, length: u32) -> Result<()> {
     cmd_read(cli, address, length, Some(file.to_path_buf()))
+}
+
+fn cmd_mode(cli: &Cli, mode: &Option<String>) -> Result<()> {
+    let mut device = open_device(cli)?;
+    match mode.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        None => println!("mode: {}", if device.mode()? == 1 { "sd" } else { "nor" }),
+        Some("nor") => {
+            device.with_emulation_stopped(|device| device.set_mode(0))?;
+            println!("mode set: nor");
+        }
+        Some("sd") => {
+            device.with_emulation_stopped(|device| device.set_mode(1))?;
+            println!("mode set: sd");
+        }
+        Some(_) => bail!("invalid mode: use nor or sd"),
+    }
+    Ok(())
 }
 
 fn cmd_configure(cli: &Cli, chip_db_path: &str, chip_name: &str) -> Result<()> {
@@ -2099,6 +2164,7 @@ fn main() -> Result<()> {
             address,
             verify,
         } => cmd_load(&cli, file, *address, *verify),
+        Commands::Mode { mode } => cmd_mode(&cli, mode),
         Commands::Dump {
             file,
             address,

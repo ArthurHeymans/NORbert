@@ -37,6 +37,7 @@ nix develop    # or let direnv handle it
 This provides the Gowin IDE (Education Edition), yosys, openFPGALoader, verilator, and the Rust toolchain.
 
 Without Nix, you'll need:
+
 - [Gowin IDE Education Edition](https://www.gowinsemi.com/en/support/home/) v1.9.11.03 (`gw_sh` on PATH)
 - [openFPGALoader](https://github.com/trabucayre/openFPGALoader)
 - [yosys](https://github.com/YosysHQ/yosys) (optional, for linting)
@@ -57,43 +58,48 @@ make flash                  # program to flash (persistent)
 make tool
 ```
 
-This builds `spi-flash-tool` at `tool/target/release/spi-flash-tool`.
+This builds `norbert-tool` at `tool/target/release/norbert-tool`.
 
 ## Usage
 
-Load a firmware image into NORbert's SDRAM, then let your target SPI master read it back as if it were a real flash chip.
+Load a firmware image into NORbert's SDRAM, then let your target read it back as SPI NOR or as a minimal read-only 1-bit SDHC card.
 
 ```
 # Check connection
-spi-flash-tool version
-spi-flash-tool status       # running | stopped
+norbert-tool version
+norbert-tool status       # running | stopped
 
 # Load a firmware image (auto stops + starts emulation around the load)
-spi-flash-tool load firmware.bin
+norbert-tool mode nor
+norbert-tool load firmware.bin
+
+# Or expose a raw disk image as native 1-bit SD
+norbert-tool mode sd
+norbert-tool load disk.img
 
 # Load with verification
-spi-flash-tool load firmware.bin --verify
+norbert-tool load firmware.bin --verify
 
 # Dump contents to a file
-spi-flash-tool dump output.bin --length 0x100000
+norbert-tool dump output.bin --length 0x100000
 
 # Read a range (hex dump)
-spi-flash-tool read 0x0 0x100
+norbert-tool read 0x0 0x100
 
 # Configure chip identity (uses rflasher chip database)
-spi-flash-tool configure W25Q128JV --chips-dir ~/src/rflasher/chips/vendors
+norbert-tool configure W25Q128JV --chips-dir ~/src/rflasher/chips/vendors
 
 # Gate SPI emulation explicitly (the dance above does this automatically)
-spi-flash-tool start
-spi-flash-tool stop
+norbert-tool start
+norbert-tool stop
 
 # List available serial ports
-spi-flash-tool ports
+norbert-tool ports
 ```
 
 The `configure` command loads a chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database and sends the JEDEC ID, size, and a generated SFDP table to the FPGA. The chip name is matched by substring, so `W25Q128` is enough if it's unambiguous. Without configuration, NORbert defaults to Winbond W25Q64FV.
 
-At power-on the FPGA boots in the STOPPED state -- the SPI pins are held in reset and the host can always reach the tool, regardless of what the target board is doing. `load` automatically stops emulation, writes the image, and starts it again. Use `start`/`stop`/`status` for manual control.
+At power-on the FPGA boots in the STOPPED state -- the pins are held in reset and the host can always reach the tool, regardless of what the target board is doing. `load` automatically stops emulation, writes the image, sets SD image size when in SD mode, and starts it again. Use `mode`, `start`/`stop`/`status` for manual control. SD mode is first-cut: 1-bit, read-only, SDHC block addressing, no UHS/1.8V.
 
 Use `-p /dev/ttyUSBx` if your device isn't on the default `/dev/ttyUSB0`.
 
@@ -102,7 +108,7 @@ Use `-p /dev/ttyUSBx` if your device isn't on the default `/dev/ttyUSB0`.
 `monitor` streams decoded SPI activity from NORbert in real time. It works over either UART or FT245 and is safe to run while the target is actively reading:
 
 ```
-spi-flash-tool monitor
+norbert-tool monitor
 ```
 
 Example output while flashprog reads a 4 KB region:
@@ -125,17 +131,17 @@ Four independent trap entries redirect matching reads to a different SDRAM locat
 
 ```
 # Configure: any read in 0x001000-0x001FFF gets redirected to 0x101000-0x101FFF
-spi-flash-tool toctou set 1 0x001000 0xFFF000 0x101000
-spi-flash-tool toctou arm 1
+norbert-tool toctou set 1 0x001000 0xFFF000 0x101000
+norbert-tool toctou arm 1
 
 # First target read of 0x001000 returns the original data.
 # Second target read of 0x001000 returns the replacement data.
 
 # Clear the triggered flag so the next read is "first" again:
-spi-flash-tool toctou reset 1
+norbert-tool toctou reset 1
 
 # Tear everything down:
-spi-flash-tool toctou reset-all
+norbert-tool toctou reset-all
 ```
 
 Arguments to `toctou set` are `<index 0..3> <start-address> <match-mask> <replace-base>`, all as byte addresses. 1-bits in the mask must match exactly; 0-bits are don't-care. The replacement preserves the "don't-care" bits of the original address.
@@ -150,16 +156,16 @@ For much faster bulk transfers (~5 MB/s vs ~200 KB/s over UART), connect an FT22
 
 ```
 # List connected FT2232H devices
-spi-flash-tool ft-list
+norbert-tool ft-list
 
 # Use FT245 instead of UART for any command
-spi-flash-tool --ft245 version
-spi-flash-tool --ft245 load firmware.bin --verify
-spi-flash-tool --ft245 dump output.bin --length 0x100000
-spi-flash-tool --ft245 configure W25Q128JV --chips-dir ~/src/rflasher/chips/vendors
+norbert-tool --ft245 version
+norbert-tool --ft245 load firmware.bin --verify
+norbert-tool --ft245 dump output.bin --length 0x100000
+norbert-tool --ft245 configure W25Q128JV --chips-dir ~/src/rflasher/chips/vendors
 
 # Select a specific FT2232H by serial number (when multiple are connected)
-spi-flash-tool --ft245 --ft-serial FT6XXXXX load firmware.bin
+norbert-tool --ft245 --ft-serial FT6XXXXX load firmware.bin
 ```
 
 The FT2232H is used in asynchronous 245 FIFO mode. This requires a **one-time EEPROM configuration** to set Channel A to "245 FIFO" mode using [FT_PROG](https://ftdichip.com/utilities/#ft_prog) (Windows) or `ftd2xx_eeprom` (Linux). No special BitMode is set at runtime -- the host tool just opens the device and reads/writes normally.
@@ -225,6 +231,7 @@ commands (0xBB, 0xEB) use fewer SPI clocks for the address, leaving less headroo
 src/
   top.v        Top-level module, clock/reset, bus wiring, TOCTOU address mux
   spi_trx.v    SPI flash transceiver (command decoder + data path)
+  sd_card_1bit.v Minimal native 1-bit SDHC read-only transceiver
   sdram.v      Dual-chip SDRAM controller with interleaved storage
   glue.v       Protocol handler, UART/FT245 I/O, SPI write engine, TOCTOU trap engine, LOGPOLL state machine, LED control
   logger.v     SPI event capture into a 512-byte ring FIFO drained by CMD_LOGPOLL
@@ -247,7 +254,7 @@ while the parser is idle, and routes the response back to the same port.
 
 | Opcode | Name       | Args                                                | Reply                            |
 |--------|------------|-----------------------------------------------------|----------------------------------|
-| `0x30` | VERSION    | none                                                | 1 byte (current: `0x04`)         |
+| `0x30` | VERSION    | none                                                | 1 byte (current: `0x06`)         |
 | `0x31` | RAMREAD    | 3-byte burst addr + 2-byte burst count              | `count*8` data bytes             |
 | `0x32` | RAMWRITE   | 3-byte burst addr + 2-byte burst count + data       | `0x01`                           |
 | `0x33` | CHIPCONFIG | JEDEC(3) + flags + erase_bursts(3) + sfdp_len + sfdp| `0x01`                           |
@@ -258,6 +265,8 @@ while the parser is idle, and routes the response back to the same port.
 | `0x38` | LOGCTL     | 1 byte: `0x01` start capture, `0x00` stop capture   | `0x01`                           |
 | `0x39` | TOCTOU     | sub-command + args (see below)                      | `0x01`                           |
 | `0x3A` | LOGPOLL    | none                                                | log bytes terminated by `0xA0`   |
+| `0x3B` | MODE       | none to query, or 1 byte (`0` NOR, `1` SD) while stopped | mode byte or `0x01`        |
+| `0x3C` | IMAGE      | 4-byte big-endian sector count, while stopped        | `0x01`                           |
 
 TOCTOU sub-commands (all prefixed with opcode `0x39`):
 
