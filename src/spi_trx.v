@@ -114,6 +114,17 @@ module spi_trx(
     
     // JEDEC ID and 4-byte addressing are driven by cfg_jedec_id and cfg_4byte
     // from glue.v (configured at runtime via serial CHIPCONFIG command).
+    //
+    // cfg_chip_erase_bursts is both the chip-erase length and the burst-address
+    // mask. SPI NOR capacities are powers of two, and the configured value is
+    // (capacity_bytes / 8) - 1. Mask every SDRAM-facing address so unimplemented
+    // high address bits alias into the configured flash array like real chips.
+    function [22:0] wrap_burst_addr;
+        input [22:0] burst_addr;
+        begin
+            wrap_burst_addr = burst_addr & cfg_chip_erase_bursts;
+        end
+    endfunction
     
     // SPI Flash command definitions
     localparam
@@ -468,7 +479,7 @@ module spi_trx(
                                 state <= STA_AAI_DATA;
                                 write_cmd <= 1;
                                 write_type <= 2'd2;
-                                write_addr <= addr[25:3];
+                                write_addr <= wrap_burst_addr(addr[25:3]);
                                 write_len <= 0;
                                 status_reg[0] <= 1;
                             end
@@ -517,11 +528,12 @@ module spi_trx(
                         end
                         else if (addr_count == 4) begin
                             ram_activate <= 1;
-                            ram_addr[22:4] <= addr[25:7];
+                            ram_addr[22:4] <= addr[25:7] & cfg_chip_erase_bursts[22:4];
                         end
                         else if (addr_count == 3) begin
                             ram_read <= 1;
-                            ram_addr[3:0] <= {addr[6:4], spi_io0_in};
+                            ram_addr[3:0] <= {addr[6:4], spi_io0_in} &
+                                             cfg_chip_erase_bursts[3:0];
                         end
                     end
                     
@@ -604,7 +616,7 @@ module spi_trx(
                         end
                         else if (bit_count_in == 4) begin
                             ram_activate <= 1;
-                            ram_addr <= ram_addr + 1;
+                            ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
                         end
                         else if (bit_count_in == 3) begin
                             ram_read <= 1;
@@ -650,11 +662,11 @@ module spi_trx(
                         // Align address based on erase size
                         // write_addr is 23-bit burst address = byte_addr[25:3]
                         if (write_len == 20'h01FFF)
-                            write_addr <= {addr[25:16], 13'b0};  // 64KB aligned
+                            write_addr <= wrap_burst_addr({addr[25:16], 13'b0});  // 64KB aligned
                         else if (write_len == 20'h00FFF)
-                            write_addr <= {addr[25:15], 12'b0};  // 32KB aligned
+                            write_addr <= wrap_burst_addr({addr[25:15], 12'b0});  // 32KB aligned
                         else
-                            write_addr <= {addr[25:12], 9'b0};   // 4KB aligned
+                            write_addr <= wrap_burst_addr({addr[25:12], 9'b0});   // 4KB aligned
                             
                         status_reg[1] <= 0;
                         status_reg[0] <= 1;
@@ -683,7 +695,7 @@ module spi_trx(
                             state <= STA_AAI_DATA;
                             write_cmd <= 1;
                             write_type <= 2'd2;
-                            write_addr <= addr[25:3];
+                            write_addr <= wrap_burst_addr(addr[25:3]);
                             write_len <= 0;
                             status_reg[0] <= 1;
                         end else begin
@@ -693,7 +705,7 @@ module spi_trx(
 
                             // Page-aligned address in 8-byte burst units
                             // byte_addr[25:3] -> burst address, page = 256 bytes = 32 bursts
-                            write_addr <= {addr[25:8], 5'b0};
+                            write_addr <= wrap_burst_addr({addr[25:8], 5'b0});
 
                             status_reg[1] <= 0;
                             status_reg[0] <= 1;
@@ -747,12 +759,12 @@ module spi_trx(
                     end
                     else if (addr_count == 3) begin
                         ram_activate <= 1;
-                        ram_addr[22:4] <= addr[25:7];
+                        ram_addr[22:4] <= addr[25:7] & cfg_chip_erase_bursts[22:4];
                     end
                     else if (addr_count == 1) begin
                         ram_read <= 1;
                         // addr[6:3] all received by prior clocks
-                        ram_addr[3:0] <= addr[6:3];
+                        ram_addr[3:0] <= addr[6:3] & cfg_chip_erase_bursts[3:0];
                     end
                     
                     // Receive 2 address bits per clock
@@ -847,7 +859,7 @@ module spi_trx(
                         ram_inhibit_refresh <= 1;  // Also here for short first bursts
                         ram_activate <= 1;
                         ram_read <= 1;
-                        ram_addr <= ram_addr + 1;
+                        ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
                     end
                     
                     // Pipeline phase 3: deassert during last byte
@@ -858,7 +870,7 @@ module spi_trx(
                             ram_inhibit_refresh <= 1;
                             ram_activate <= 1;
                             ram_read <= 1;
-                            ram_addr <= ram_addr + 1;
+                            ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
                             saved_last_byte <= ram_read_buffer[7*8 +: 8];
                         end
                         else if (bit_count_in == 0) begin
@@ -897,13 +909,15 @@ module spi_trx(
                     end
                     else if (addr_count == 7) begin
                         // addr[25:8] available from prior clocks; addr[7] = IO3 now
-                        ram_addr[22:4] <= {addr[25:8], spi_io3_in};
+                        ram_addr[22:4] <= {addr[25:8], spi_io3_in} &
+                                         cfg_chip_erase_bursts[22:4];
                     end
                     else if (addr_count == 3) begin
                         ram_activate <= 1;
                         ram_read <= 1;
                         // addr[6:4] available from prior clock; addr[3] = IO3 now
-                        ram_addr[3:0] <= {addr[6:4], spi_io3_in};
+                        ram_addr[3:0] <= {addr[6:4], spi_io3_in} &
+                                        cfg_chip_erase_bursts[3:0];
                     end
                     
                     // Receive 4 address bits per clock
@@ -953,7 +967,7 @@ module spi_trx(
                         ram_inhibit_refresh <= 1;
                         ram_activate <= 1;
                         ram_read <= 1;
-                        ram_addr <= ram_addr + 1;
+                        ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
                     end
                     
                     // Pipeline phase 3: deassert during last byte
@@ -963,7 +977,7 @@ module spi_trx(
                             ram_inhibit_refresh <= 1;
                             ram_activate <= 1;
                             ram_read <= 1;
-                            ram_addr <= ram_addr + 1;
+                            ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
                             saved_last_byte <= ram_read_buffer[7*8 +: 8];
                         end
                         else if (bit_count_in == 0) begin
