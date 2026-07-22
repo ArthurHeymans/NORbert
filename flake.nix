@@ -111,11 +111,16 @@
             echo "Setup complete!"
           fi
 
+          # Offscreen mode: unset DISPLAY and use Qt offscreen platform to
+          # avoid GLX initialization failures in headless/server environments.
+          # GOWIN's PnR tool internally uses Qt OpenGL widgets, which fail
+          # with "Could not initialize GLX" if a DISPLAY is set without a
+          # working GLX implementation (e.g. over Xvfb without Mesa swrast).
+          unset DISPLAY
           unset QT_QPA_PLATFORMTHEME QT_STYLE_OVERRIDE
           export QT_QPA_PLATFORM=offscreen
-          export QT_XCB_GL_INTEGRATION=none
 
-          exec ${gowinFhs}/bin/gowin-fhs -c "cd '$(pwd)' && QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH='$WORKSPACE_DIR/IDE/lib':\"$LD_LIBRARY_PATH\" '$WORKSPACE_DIR/IDE/bin/gw_sh' $*"
+          exec ${gowinFhs}/bin/gowin-fhs -c "cd '$(pwd)' && unset DISPLAY QT_QPA_PLATFORMTHEME QT_STYLE_OVERRIDE && QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH='$WORKSPACE_DIR/IDE/lib':\"$LD_LIBRARY_PATH\" '$WORKSPACE_DIR/IDE/bin/gw_sh' $*"
         '';
       in
       {
