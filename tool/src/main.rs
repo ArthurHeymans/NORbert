@@ -1846,6 +1846,7 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
     let mut txn_count: u32 = 0;
     let mut current_opcode: u8 = 0;
     let mut current_addr: u32 = 0;
+    let mut command_line_open = false;
 
     // Poll loop: ask the FPGA for log data every ~5ms.  Every poll
     // response is self-delimited (ends with LOG_POLL_TERMINATOR) so
@@ -1865,6 +1866,10 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
             let remaining = pending.len() - pos;
             match pending[pos] {
                 LOG_CMD if remaining >= 2 => {
+                    if command_line_open {
+                        println!();
+                    }
+
                     let opcode = pending[pos + 1];
                     current_opcode = opcode;
                     txn_count += 1;
@@ -1874,6 +1879,8 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
                         opcode,
                         spi_opcode_name(opcode)
                     );
+                    std::io::stdout().flush()?;
+                    command_line_open = true;
                     pos += 2;
                 }
                 LOG_ADDR if remaining >= 5 => {
@@ -1901,16 +1908,23 @@ fn cmd_monitor(cli: &Cli) -> Result<()> {
                         }
                     }
                     println!();
+                    command_line_open = false;
                     pos += 5;
                 }
                 LOG_END if remaining >= 4 => {
-                    let count = ((pending[pos + 1] as u32) << 16)
+                    let byte_count = ((pending[pos + 1] as u32) << 16)
                         | ((pending[pos + 2] as u32) << 8)
                         | (pending[pos + 3] as u32);
-                    // +1 because the counter starts at 0 for the first byte
-                    let byte_count = count + 1;
+
+                    // Addressless commands do not receive a LOG_ADDR packet,
+                    // so terminate their command row when the transaction ends.
+                    if command_line_open {
+                        println!();
+                        command_line_open = false;
+                    }
+
                     if byte_count > 1 {
-                        eprintln!(
+                        println!(
                             "       end: {} bytes from 0x{:06X}",
                             byte_count, current_addr
                         );
