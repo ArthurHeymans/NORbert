@@ -389,6 +389,7 @@ module top(
         .dq_io(IO_sdram_dq),
         
         // SPI fast-path control (address passes through TOCTOU redirect mux)
+        .spi_active(spi_active),
         .spi_inhibit_refresh(spi_ram_inhibit_refresh),
         .spi_cmd_activate(spi_ram_activate),
         .spi_cmd_read(spi_ram_read),

@@ -521,19 +521,21 @@ module spi_trx(
                     // ram_addr is 23-bit burst address = byte_addr[25:3]
                     // addr_count counts down from 23 (or 31 for 4-byte) to 0
                     
-                    // SDRAM pipeline (skipped for SFDP reads which use internal table)
+                    // SDRAM pipeline (skipped for SFDP reads which use internal table).
+                    // Row and bank are complete several clocks before the column;
+                    // issue ACTIVATE early, then post READ when address bit 3 arrives.
                     if (!is_sfdp_read) begin
-                        if (addr_count == 7) begin
+                        if (addr_count == 15) begin
                             ram_inhibit_refresh <= 1;
                         end
-                        else if (addr_count == 4) begin
+                        else if (addr_count == 9) begin
                             ram_activate <= 1;
-                            ram_addr[22:4] <= addr[25:7] & cfg_chip_erase_bursts[22:4];
+                            ram_addr[22:7] <= addr[25:10] & cfg_chip_erase_bursts[22:7];
                         end
                         else if (addr_count == 3) begin
                             ram_read <= 1;
-                            ram_addr[3:0] <= {addr[6:4], spi_io0_in} &
-                                             cfg_chip_erase_bursts[3:0];
+                            ram_addr[6:0] <= {addr[9:4], spi_io0_in} &
+                                             cfg_chip_erase_bursts[6:0];
                         end
                     end
                     
@@ -606,37 +608,48 @@ module spi_trx(
                     end
                 end
                 else if (state == STA_READ) begin
-                    // Advance the read
-                    
-                    if (addr[2:0] == 7) begin
-                        // Reaching end of burst, start reading new one
-                        
+                    // Prefetch the next burst while byte 6 is shifted out.
+                    // Save byte 7 first because the completed SDRAM read will
+                    // replace ram_read_buffer before byte 7 is transmitted.
+                    if (addr[2:0] == 6) begin
                         if (bit_count_in == 7) begin
                             ram_inhibit_refresh <= 1;
-                        end
-                        else if (bit_count_in == 4) begin
                             ram_activate <= 1;
                             ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
+                            saved_last_byte <= ram_read_buffer[7*8 +: 8];
                         end
-                        else if (bit_count_in == 3) begin
+                        else if (bit_count_in == 6) begin
                             ram_read <= 1;
+                        end
+                    end
+
+                    if (addr[2:0] == 7) begin
+                        if (bit_count_in == 7 && !ram_activate) begin
+                            // Fallback when a read starts directly at byte 7.
+                            ram_inhibit_refresh <= 1;
+                            ram_activate <= 1;
+                            ram_read <= 1;
+                            ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
+                            saved_last_byte <= ram_read_buffer[7*8 +: 8];
                         end
                         else if (bit_count_in == 0) begin
                             ram_inhibit_refresh <= 0;
                             ram_activate <= 0;
                             ram_read <= 0;
-                            
                             fresh_read <= 1;
                         end
                     end
-                    
+
                     if (bit_count_in == 0) begin
-                        miso_byte <= ram_read_buffer[(addr[2:0]+1)*8 +: 8];
+                        if (addr[2:0] == 6)
+                            miso_byte <= saved_last_byte;
+                        else if (addr[2:0] != 7)
+                            miso_byte <= ram_read_buffer[(addr[2:0]+1)*8 +: 8];
                         addr <= addr + 1;
                         log_byte_count <= log_byte_count + 1;
                     end
-                    
-                    if (fresh_read) 
+
+                    if (fresh_read)
                         miso_byte <= ram_read_buffer[addr[2:0]*8 +: 8];
                 end
                 else if (state == STA_READID) begin
@@ -753,18 +766,20 @@ module spi_trx(
                 // ---------------------------------------------------------
                 else if (state == STA_ADDR_READ_DUAL) begin
                     
-                    // SDRAM pipeline during last address clocks
-                    if (addr_count == 7) begin
+                    // SDRAM pipeline during the address phase. Activate as
+                    // soon as row/bank are complete; the column is supplied
+                    // later when the READ request is posted.
+                    if (addr_count == 15) begin
                         ram_inhibit_refresh <= 1;
                     end
-                    else if (addr_count == 3) begin
+                    else if (addr_count == 9) begin
                         ram_activate <= 1;
-                        ram_addr[22:4] <= addr[25:7] & cfg_chip_erase_bursts[22:4];
+                        ram_addr[22:7] <= addr[25:10] & cfg_chip_erase_bursts[22:7];
                     end
-                    else if (addr_count == 1) begin
+                    else if (addr_count == 3) begin
                         ram_read <= 1;
-                        // addr[6:3] all received by prior clocks
-                        ram_addr[3:0] <= addr[6:3] & cfg_chip_erase_bursts[3:0];
+                        ram_addr[6:0] <= {addr[9:4], spi_io1_in} &
+                                         cfg_chip_erase_bursts[6:0];
                     end
                     
                     // Receive 2 address bits per clock
@@ -903,21 +918,21 @@ module spi_trx(
                 // ---------------------------------------------------------
                 else if (state == STA_ADDR_READ_QUAD) begin
                     
-                    // SDRAM pipeline during last address clocks
-                    if (addr_count == 11) begin
+                    // SDRAM pipeline during the address phase. At count 11,
+                    // IO3/IO2 carry byte-address bits 11/10, completing the
+                    // row and bank. The final column bit arrives at count 3.
+                    if (addr_count == 15) begin
                         ram_inhibit_refresh <= 1;
                     end
-                    else if (addr_count == 7) begin
-                        // addr[25:8] available from prior clocks; addr[7] = IO3 now
-                        ram_addr[22:4] <= {addr[25:8], spi_io3_in} &
-                                         cfg_chip_erase_bursts[22:4];
+                    else if (addr_count == 11) begin
+                        ram_activate <= 1;
+                        ram_addr[22:7] <= {addr[25:12], spi_io3_in, spi_io2_in} &
+                                         cfg_chip_erase_bursts[22:7];
                     end
                     else if (addr_count == 3) begin
-                        ram_activate <= 1;
                         ram_read <= 1;
-                        // addr[6:4] available from prior clock; addr[3] = IO3 now
-                        ram_addr[3:0] <= {addr[6:4], spi_io3_in} &
-                                        cfg_chip_erase_bursts[3:0];
+                        ram_addr[6:0] <= {addr[9:4], spi_io3_in} &
+                                        cfg_chip_erase_bursts[6:0];
                     end
                     
                     // Receive 4 address bits per clock
