@@ -1,6 +1,7 @@
 mod chip;
 mod sfdp;
 
+use chip::FlashChipExt;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -658,7 +659,7 @@ impl FlashDevice {
     fn send_chip_config(&mut self, chip: &chip::FlashChip, sfdp_table: &[u8]) -> Result<()> {
         let jedec = chip.jedec_id_bytes();
         let erase_bursts = chip.chip_erase_bursts();
-        let flags: u8 = if chip.supports_4byte { 0x01 } else { 0x00 };
+        let flags: u8 = if chip.supports_4byte() { 0x01 } else { 0x00 };
 
         let sfdp_len = sfdp_table.len();
         if sfdp_len > 128 {
@@ -967,9 +968,10 @@ enum Commands {
 
     /// Configure the emulated flash chip identity
     Configure {
-        /// Path to rflasher chip database directory (containing .ron files)
-        #[arg(long, default_value = "~/src/rflasher/chips/vendors")]
-        chip_db: String,
+        /// Path to a chip database directory (containing .ron files).
+        /// By default, use rflasher's compiled-in chip database.
+        #[arg(long, value_name = "DIR")]
+        chip_db: Option<PathBuf>,
 
         /// Chip name to emulate (substring match, e.g. "W25Q128.V")
         #[arg(short, long)]
@@ -1316,19 +1318,23 @@ fn cmd_dump(cli: &Cli, file: &Path, address: u32, length: u32) -> Result<()> {
     cmd_read(cli, address, length, Some(file.to_path_buf()))
 }
 
-fn cmd_configure(cli: &Cli, chip_db_path: &str, chip_name: &str) -> Result<()> {
-    // Expand ~ in path
-    let expanded = if let Some(stripped) = chip_db_path.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        format!("{}/{}", home, stripped)
-    } else {
-        chip_db_path.to_string()
-    };
-    let db_path = std::path::Path::new(&expanded);
+fn cmd_configure(cli: &Cli, chip_db_path: Option<&Path>, chip_name: &str) -> Result<()> {
+    let chip_db_path = chip_db_path.map(|path| {
+        let path_string = path.to_string_lossy();
+        if let Some(stripped) = path_string.strip_prefix("~/") {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            PathBuf::from(format!("{home}/{stripped}"))
+        } else {
+            path.to_path_buf()
+        }
+    });
 
-    // Load chip database
-    eprintln!("Loading chip database from {}...", db_path.display());
-    let chips = chip::load_chip_db(db_path)?;
+    if let Some(path) = chip_db_path.as_deref() {
+        eprintln!("Loading chip database override from {}...", path.display());
+    } else {
+        eprintln!("Loading rflasher's compiled-in chip database...");
+    }
+    let chips = chip::load_chip_db(chip_db_path.as_deref())?;
     eprintln!("Loaded {} chip definitions", chips.len());
 
     // Find requested chip
@@ -1344,30 +1350,32 @@ fn cmd_configure(cli: &Cli, chip_db_path: &str, chip_name: &str) -> Result<()> {
         chip.total_size / (1024 * 1024),
     );
     eprintln!("  Page size:  {} bytes", chip.page_size);
-    eprintln!("  4-byte addr: {}", chip.supports_4byte);
-    eprintln!("  Dual I/O:   {}", chip.supports_dual);
-    eprintln!("  Quad I/O:   {}", chip.supports_quad);
-    if chip.aai_word {
+    eprintln!("  4-byte addr: {}", chip.supports_4byte());
+    eprintln!("  Dual I/O:   {}", chip.supports_dual());
+    eprintln!("  Quad I/O:   {}", chip.supports_quad());
+    if chip.aai_word() {
         eprintln!("  Write mode: AAI Word Program (0xAD)");
     }
-    if chip.write_byte {
+    if chip.write_byte() {
         eprintln!("  Write mode: Byte program");
     }
 
     let erase_ops = chip.sector_erase_ops();
     for op in &erase_ops {
-        eprintln!(
-            "  Erase:      0x{:02X} ({} KB)",
-            op.opcode,
-            op.block_size / 1024
-        );
+        if let Some(block_size) = chip::erase_block_size(op) {
+            eprintln!(
+                "  Erase:      0x{:02X} ({} KB)",
+                op.opcode,
+                block_size / 1024
+            );
+        }
     }
 
     // Generate SFDP table.  For chips that do not support SFDP in real
     // hardware (e.g. older SST25VFxxx), the table is all-0xFF so SFDP
     // probes see no valid signature, matching the real part.
     let sfdp_table = sfdp::generate_sfdp(chip);
-    if chip.supports_sfdp {
+    if chip.supports_sfdp() {
         eprintln!("  SFDP table: {} bytes (valid)", sfdp_table.len());
     } else {
         eprintln!(
@@ -2120,7 +2128,7 @@ fn main() -> Result<()> {
             address,
             length,
         } => cmd_dump(&cli, file, *address, *length),
-        Commands::Configure { chip_db, chip } => cmd_configure(&cli, chip_db, chip),
+        Commands::Configure { chip_db, chip } => cmd_configure(&cli, chip_db.as_deref(), chip),
         Commands::Hold { state } => cmd_hold(&cli, state),
         Commands::Monitor => cmd_monitor(&cli),
         Commands::Toctou { action } => cmd_toctou(&cli, action),

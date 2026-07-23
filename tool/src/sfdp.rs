@@ -8,7 +8,7 @@
 //!   0x08..0x0F  Parameter Header 0 / BFPT (8 bytes)
 //!   0x10..0x4F  Basic Flash Parameter Table (16 DWORDs = 64 bytes)
 
-use crate::chip::FlashChip;
+use crate::chip::{erase_block_size, FlashChip, FlashChipExt};
 
 /// Size of the generated SFDP table in bytes.
 pub const SFDP_TABLE_SIZE: usize = 80;
@@ -28,7 +28,7 @@ const BFPT_DWORDS: u8 = 16; // JESD216A/B
 pub fn generate_sfdp(chip: &FlashChip) -> [u8; SFDP_TABLE_SIZE] {
     let mut table = [0xFFu8; SFDP_TABLE_SIZE];
 
-    if !chip.supports_sfdp {
+    if !chip.supports_sfdp() {
         return table;
     }
 
@@ -82,12 +82,15 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     // ------------------------------------------------------------------
     // 1st DWORD: erase granularity, write info, address bytes, read modes
     // ------------------------------------------------------------------
-    let has_4k_erase = chip.erase_ops.iter().any(|e| e.block_size == 4096);
-    let erase_4k_opcode = chip
-        .erase_ops
+    let has_4k_erase = chip
+        .erase_blocks
         .iter()
-        .find(|e| e.block_size == 4096)
-        .map(|e| e.opcode)
+        .any(|erase| erase_block_size(erase) == Some(4096));
+    let erase_4k_opcode = chip
+        .erase_blocks
+        .iter()
+        .find(|erase| erase_block_size(erase) == Some(4096))
+        .map(|erase| erase.opcode)
         .unwrap_or(0xFF);
 
     let mut dw1: u32 = 0;
@@ -103,7 +106,7 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     // here.  Tools that rely solely on SFDP then fall back to byte
     // programming via 0x02; tools with a hardcoded chip table (e.g.
     // flashprog) will use their own AAI path regardless.
-    let large_buffer = chip.page_size >= 64 && !chip.aai_word && !chip.write_byte;
+    let large_buffer = chip.page_size >= 64 && !chip.aai_word() && !chip.write_byte();
     if large_buffer {
         dw1 |= 1 << 2;
     }
@@ -116,24 +119,24 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     // [15:8] 4KB erase opcode
     dw1 |= (erase_4k_opcode as u32) << 8;
     // [17:16] Address bytes: 00=3-byte only, 01=3 or 4 byte
-    if chip.supports_4byte {
+    if chip.supports_4byte() {
         dw1 |= 0x01 << 16;
     }
     // [18] DTR: not supported
     // [19] 1-1-2 Fast Read
-    if chip.supports_dual {
+    if chip.supports_dual() {
         dw1 |= 1 << 19;
     }
     // [20] 1-2-2 Fast Read
-    if chip.supports_dual {
+    if chip.supports_dual() {
         dw1 |= 1 << 20;
     }
     // [21] 1-4-4 Fast Read
-    if chip.supports_quad {
+    if chip.supports_quad() {
         dw1 |= 1 << 21;
     }
     // [22] 1-1-4 Fast Read
-    if chip.supports_quad {
+    if chip.supports_quad() {
         dw1 |= 1 << 22;
     }
     put_dword(table, base, dw1);
@@ -154,7 +157,7 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     // ------------------------------------------------------------------
     // 3rd DWORD: 1-4-4 and 1-1-4 Fast Read parameters
     // ------------------------------------------------------------------
-    let dw3 = if chip.supports_quad {
+    let dw3 = if chip.supports_quad() {
         // 1-4-4 (0xEB): 4 dummy clocks after 2 mode clocks
         let wait_144: u32 = 4; // dummy clocks
         let mode_144: u32 = 2; // mode clocks
@@ -177,7 +180,7 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     // ------------------------------------------------------------------
     // 4th DWORD: 1-2-2 and 1-1-2 Fast Read parameters
     // ------------------------------------------------------------------
-    let dw4 = if chip.supports_dual {
+    let dw4 = if chip.supports_dual() {
         // 1-2-2 (0xBB): 0 dummy clocks, 4 mode clocks
         let wait_122: u32 = 0;
         let mode_122: u32 = 4;
@@ -216,8 +219,10 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     let erase_ops = chip.sector_erase_ops();
 
     let encode_erase = |idx: usize| -> u16 {
-        if let Some(op) = erase_ops.get(idx) {
-            let n = op.block_size.trailing_zeros() as u8;
+        if let Some(op) = erase_ops.get(idx)
+            && let Some(block_size) = erase_block_size(op)
+        {
+            let n = block_size.trailing_zeros() as u8;
             (n as u16) | ((op.opcode as u16) << 8)
         } else {
             0
@@ -296,7 +301,7 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     //   101 = QE is bit 1 of SR2, set via 0x01 with 2 data bytes (Winbond)
     // [31:7] Reserved
     // ------------------------------------------------------------------
-    let dw14 = if chip.supports_quad {
+    let dw14 = if chip.supports_quad() {
         // Use method 5 (0b101): QE = SR2 bit 1, write via 0x01 with 2 bytes
         // This matches Winbond W25Q and many other common chips
         0x05 << 4
@@ -312,7 +317,7 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     //   bit 1: issue 0xB7 to enter 4-byte mode
     // [31:8] Exit methods
     // ------------------------------------------------------------------
-    let dw15 = if chip.supports_4byte {
+    let dw15 = if chip.supports_4byte() {
         0x02 // Enter via 0xB7 (EN4B)
     } else {
         0
