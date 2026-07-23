@@ -83,9 +83,8 @@ pub fn erase_block_size(erase: &EraseBlock) -> Option<u32> {
 /// Load rflasher's compiled-in chip database, or an explicit directory override.
 pub fn load_chip_db(dir: Option<&Path>) -> Result<ChipDatabase> {
     match dir {
-        Some(dir) => ChipDatabase::from_dir(dir).with_context(|| {
-            format!("Failed to load chip database directory: {}", dir.display())
-        }),
+        Some(dir) => ChipDatabase::from_dir(dir)
+            .with_context(|| format!("Failed to load chip database directory: {}", dir.display())),
         None => Ok(ChipDatabase::new()),
     }
 }
@@ -94,12 +93,8 @@ pub fn load_chip_db(dir: Option<&Path>) -> Result<ChipDatabase> {
 pub fn find_chip_by_name<'a>(db: &'a ChipDatabase, name: &str) -> Result<&'a FlashChip> {
     let name_lower = name.to_lowercase();
 
-    let exact: Vec<_> = db
-        .iter()
-        .filter(|chip| chip.name.to_lowercase() == name_lower)
-        .collect();
-    if exact.len() == 1 {
-        return Ok(exact[0]);
+    if let Some(exact) = db.iter().find(|chip| chip.name.eq_ignore_ascii_case(name)) {
+        return Ok(exact);
     }
 
     let matches: Vec<_> = db
