@@ -128,19 +128,12 @@ module top(
     
     // SPI input signals
     //
-    // Keep the debounced CS path feeding spi_trx.  It rejects short CS
-    // glitches caused by SSO/ground-bounce during quad transfers; removing
-    // it can reset the SPI state machine mid-transaction.  Top-level output
-    // enables are additionally gated with the raw CS pin below so the FPGA
-    // still releases the bus immediately when the real CS deasserts.
-    reg [3:0] spi_cs_filter = 4'hF;
-    reg spi_cs_debounced = 1;
-    always @(posedge clk) begin
-        spi_cs_filter <= {spi_cs_filter[2:0], spi_cs_pin};
-        if (&spi_cs_filter)         spi_cs_debounced <= 1;  // all 1s: CS released
-        else if (~(|spi_cs_filter)) spi_cs_debounced <= 0;  // all 0s: CS asserted
-    end
-    wire spi_cs_in = spi_cs_debounced;
+    // Use raw CS for transaction framing. The previous four-sample debounce
+    // was an FT4222/quad-transfer workaround, but it delayed both CS edges by
+    // roughly 40 ns and could lose the beginning of tightly-timed commands.
+    // Output enables are also gated with raw CS below, so bus release remains
+    // immediate on deassertion.
+    wire spi_cs_in = spi_cs_pin;
     wire spi_clk_in = spi_clk_pin;
     wire spi_power_in = spi_power_pin;
     
@@ -389,6 +382,7 @@ module top(
         .dq_io(IO_sdram_dq),
         
         // SPI fast-path control (address passes through TOCTOU redirect mux)
+        .spi_active(spi_active),
         .spi_inhibit_refresh(spi_ram_inhibit_refresh),
         .spi_cmd_activate(spi_ram_activate),
         .spi_cmd_read(spi_ram_read),

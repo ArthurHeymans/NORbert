@@ -51,6 +51,7 @@ module sdram(
     inout wire [15:0] dq_io,     // Bidirectional data bus (directly to pins)
     
     // Control signals from spi_trx (directly from SPI clock domain)
+    input wire spi_active,
     input wire spi_inhibit_refresh,
     input wire spi_cmd_activate,
     input wire spi_cmd_read,
@@ -113,9 +114,11 @@ module sdram(
         STA_WRITE           = 8,
         STA_INIT_CHIP2      = 9,   // Init second chip
         STA_INIT_PRECHARGE2 = 10,
-        STA_INIT_REFRESH2   = 11,
-        STA_SETMODE2        = 12,
-        STA_REFRESH2        = 13;  // Refresh second chip
+        STA_INIT_REFRESH2      = 11,
+        STA_SETMODE2           = 12,
+        STA_REFRESH2           = 13,  // Refresh second chip
+        STA_SPI_ABORT_WAIT     = 14,  // Wait tRAS before closing an abandoned row
+        STA_SPI_ABORT_PRECHARGE = 15; // Precharge row opened by an aborted SPI read
 
     // Burst mode encoding
     localparam [2:0] BURST_MODE =
@@ -136,12 +139,16 @@ module sdram(
     reg refresh_chip;
     
     // Buffer control signals from SPI domain
+    reg [2:0] spi_active_buf;
     reg [1:0] spi_inhibit_refresh_buf;
     reg [1:0] spi_cmd_activate_buf;
     reg [1:0] spi_cmd_read_buf;
     
     reg spi_cmd_activate_ack;
     reg spi_cmd_read_ack;
+    reg spi_abort_pending;
+
+    wire spi_deselect_event = !spi_active_buf[1] && spi_active_buf[2];
     
     // Track whether ACTIVATE has been dispatched for the current SPI burst.
     // READ must not dispatch until this is set, preventing a race where
@@ -157,16 +164,15 @@ module sdram(
     //   [21:9]  = row (13 bits)
     //   [8:7]   = bank (2 bits)
     //   [6:0]   = column burst index (col[8:2])
-    // Latch the multi-bit SPI address in the system clock domain when the
-    // synchronized activate request is accepted, then use only the latched
-    // value for ACTIVATE/READ.  spi_trx holds spi_addr stable across the
-    // request handshake; this avoids using a live cross-domain bus later in
-    // the SDRAM command sequence.
+    // Latch the row/bank portion when ACTIVATE is accepted. The column bits
+    // arrive later in the SPI address phase, so READ samples them from the
+    // live SPI address bus after its synchronized request arrives. spi_trx
+    // holds each portion stable across the corresponding handshake.
     reg [22:0] spi_addr_latched;
     wire spi_chip_sel  = spi_addr_latched[22];
     wire [12:0] spi_row  = spi_addr_latched[21:9];
     wire [1:0]  spi_bank = spi_addr_latched[8:7];
-    wire [8:0]  spi_col  = {spi_addr_latched[6:0], 2'b00};  // Burst-4 aligned
+    wire [8:0]  spi_col  = {spi_addr[6:0], 2'b00};  // Burst-4 aligned
 
     // Serial/glue path: 25-bit address = {chip, row, bank, col}
     //   [24]     = chip select
@@ -181,6 +187,7 @@ module sdram(
     reg [4:0] readcount;
     reg [1:0] rdbuf_write_ptr;
     reg [2:0] wrbuf_read_ptr;
+    reg [63:0] read_buffer_work;
 
     // Read data capture: DQ sampled on aux_clk (phase-shifted for proper timing)
     // then used directly in the main clock domain read logic.
@@ -215,28 +222,42 @@ module sdram(
             refresh_chip <= 0;
             
             read_buffer <= 0;
+            read_buffer_work <= 0;
             read_busy <= 0;
             readcount <= 0;
 
             rdbuf_write_ptr <= 0;
             wrbuf_read_ptr <= 0;
             
+            spi_active_buf <= 0;
             spi_inhibit_refresh_buf <= 0;
             spi_cmd_activate_buf <= 0;
             spi_cmd_read_buf <= 0;
             
             spi_cmd_activate_ack <= 0;
             spi_cmd_read_ack <= 0;
+            spi_abort_pending <= 0;
             spi_activate_done <= 0;
             spi_addr_latched <= 0;
         end
         else begin
             refreshcount <= refreshcount + 1;
             
-            // Synchronize SPI control signals
-            spi_inhibit_refresh_buf <= {spi_inhibit_refresh_buf[0], spi_inhibit_refresh};
-            spi_cmd_activate_buf <= {spi_cmd_activate_buf[0], spi_cmd_activate};
-            spi_cmd_read_buf <= {spi_cmd_read_buf[0], spi_cmd_read};
+            // Synchronize SPI control signals. Gate requests with active CS so
+            // a master that stops the clock while deasserting CS cannot leave
+            // refresh inhibition or command requests asserted indefinitely.
+            spi_active_buf <= {spi_active_buf[1:0], spi_active};
+            spi_inhibit_refresh_buf <= {spi_inhibit_refresh_buf[0],
+                                        spi_inhibit_refresh && spi_active};
+            spi_cmd_activate_buf <= {spi_cmd_activate_buf[0],
+                                     spi_cmd_activate && spi_active};
+            spi_cmd_read_buf <= {spi_cmd_read_buf[0],
+                                 spi_cmd_read && spi_active};
+
+            // If CS drops after ACTIVATE was accepted but before READ was
+            // dispatched, close the open row once tRAS has safely elapsed.
+            if (spi_deselect_event && spi_activate_done && !spi_cmd_read_ack)
+                spi_abort_pending <= 1;
             
             if (spi_cmd_activate_ack && !spi_cmd_activate_buf[1]) begin
                 spi_cmd_activate_ack <= 0;
@@ -452,6 +473,40 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
+                else if (state == STA_SPI_ABORT_WAIT) begin
+                    // The aborted ACTIVATE has satisfied tRAS; close only the
+                    // bank opened for this SPI request.
+                    state <= STA_SPI_ABORT_PRECHARGE;
+                    cmdtarget <= tRP;
+
+                    cs_o <= spi_chip_sel;
+                    ras_o <= 0;
+                    cas_o <= 1;
+                    we_o <= 0;
+                    ba_o <= spi_bank;
+                    a_o <= 0;
+                    a_o[10] <= 0;
+                    dqm_o <= 2'b11;
+                end
+                else if (state == STA_SPI_ABORT_PRECHARGE) begin
+                    state <= STA_IDLE;
+                    cmdtarget <= 1;
+                    ras_o <= 1;
+                    cas_o <= 1;
+                    we_o <= 1;
+                    dqm_o <= 2'b11;
+                end
+                else if (spi_abort_pending) begin
+                    // Wait a full tRAS from abort detection. This is slightly
+                    // conservative but guarantees PRECHARGE is never early.
+                    spi_abort_pending <= 0;
+                    state <= STA_SPI_ABORT_WAIT;
+                    cmdtarget <= tRAS;
+                    ras_o <= 1;
+                    cas_o <= 1;
+                    we_o <= 1;
+                    dqm_o <= 2'b11;
+                end
                 else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack) begin
                     // SPI fast-path activate
                     state <= STA_ACTIVATE;
@@ -572,17 +627,27 @@ module sdram(
             // cases) so they take priority over SPI and serial command
             // dispatches in the same cycle.
             
-            // Read data capture (de-interleave 16-bit data to 64-bit buffer)
-            // Uses aux_clk-captured data (dq_captured) for reliable sampling.
+            // Read data capture (de-interleave 16-bit data to 64-bit buffer).
+            // Assemble the burst in a private work register and publish all
+            // 64 bits only when the final SDRAM beat arrives. This prevents
+            // the SPI clock domain from observing a partially-updated buffer.
             if ((readcount > tCAS + RD_PIPELINE_DELAY) && (readcount <= tCAS + RD_PIPELINE_DELAY + BURST_LEN)) begin
-                // Capture read data and de-interleave from 16-bit bus
-                // rdbuf_write_ptr counts 0..3 (4 words in burst)
-                for (i = 0; i < 8; i = i + 1) begin
-                    read_buffer[i*8 + 7 - rdbuf_write_ptr*2] <= dq_captured[i];
-                    read_buffer[i*8 + 6 - rdbuf_write_ptr*2] <= dq_captured[i+8];
+                // rdbuf_write_ptr counts 0..3 (4 words in burst).
+                if (rdbuf_write_ptr == BURST_LEN - 1) begin
+                    read_buffer <= read_buffer_work;
+                    for (i = 0; i < 8; i = i + 1) begin
+                        read_buffer[i*8 + 1] <= dq_captured[i];
+                        read_buffer[i*8]     <= dq_captured[i+8];
+                    end
+                    read_busy <= 0;
                 end
-                
-                if (rdbuf_write_ptr == BURST_LEN - 1) read_busy <= 0;
+                else begin
+                    for (i = 0; i < 8; i = i + 1) begin
+                        read_buffer_work[i*8 + 7 - rdbuf_write_ptr*2] <= dq_captured[i];
+                        read_buffer_work[i*8 + 6 - rdbuf_write_ptr*2] <= dq_captured[i+8];
+                    end
+                end
+
                 rdbuf_write_ptr <= rdbuf_write_ptr + 1;
             end
             else
