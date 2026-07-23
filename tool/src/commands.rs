@@ -88,7 +88,9 @@ fn cmd_read(cli: &Cli, address: u32, length: u32, output: Option<PathBuf>) -> Re
         let pb = ProgressBar::new(length as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
+                .template(
+                    "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+                )?
                 .progress_chars("#>-"),
         );
 
@@ -170,7 +172,9 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
         let progress = ProgressBar::new(data.len() as u64);
         progress.set_style(
             ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
+                .template(
+                    "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+                )?
                 .progress_chars("#>-"),
         );
         device.write_with_progress(address, &data, |completed| {
@@ -185,7 +189,7 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
             progress.set_style(
                 ProgressStyle::default_bar()
                     .template(
-                        "[{elapsed_precise}] [{bar:40.green/blue}] {bytes}/{total_bytes} ({eta})",
+                        "[{elapsed_precise}] [{bar:40.green/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
                     )?
                     .progress_chars("#>-"),
             );
