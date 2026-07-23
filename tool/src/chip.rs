@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::Path;
 
