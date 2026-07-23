@@ -8,7 +8,8 @@
 //!   0x08..0x0F  Parameter Header 0 / BFPT (8 bytes)
 //!   0x10..0x4F  Basic Flash Parameter Table (16 DWORDs = 64 bytes)
 
-use crate::chip::{erase_block_size, FlashChip, FlashChipExt};
+use crate::chip::{FlashChip, FlashChipExt, erase_block_size};
+use anyhow::{Result, bail};
 
 /// Size of the generated SFDP table in bytes.
 pub const SFDP_TABLE_SIZE: usize = 80;
@@ -25,18 +26,35 @@ const BFPT_DWORDS: u8 = 16; // JESD216A/B
 /// override the correct hardcoded behavior.  Returning 0xFF (erased
 /// flash pattern, invalid "SFDP" signature) makes the probe fail as
 /// it would on the real part.
-pub fn generate_sfdp(chip: &FlashChip) -> [u8; SFDP_TABLE_SIZE] {
+pub fn generate_sfdp(chip: &FlashChip) -> Result<[u8; SFDP_TABLE_SIZE]> {
     let mut table = [0xFFu8; SFDP_TABLE_SIZE];
 
     if !chip.supports_sfdp() {
-        return table;
+        return Ok(table);
+    }
+    if chip.total_size == 0 {
+        bail!("chip total size must be nonzero");
+    }
+    let density_bits = (chip.total_size as u64) * 8;
+    if density_bits > 0x8000_0000 && !density_bits.is_power_of_two() {
+        bail!("chip densities above 2 Gbit must be a power of two");
+    }
+    if chip.page_size == 0 || !chip.page_size.is_power_of_two() {
+        bail!("chip page size must be a nonzero power of two");
+    }
+    for erase in chip.sector_erase_ops() {
+        if let Some(size) = erase_block_size(erase)
+            && (size == 0 || !size.is_power_of_two())
+        {
+            bail!("erase size {size} must be a nonzero power of two");
+        }
     }
 
     write_sfdp_header(&mut table);
     write_param_header(&mut table);
     write_bfpt(chip, &mut table);
 
-    table
+    Ok(table)
 }
 
 /// SFDP Header (8 bytes at offset 0x00).
@@ -69,10 +87,8 @@ fn write_param_header(table: &mut [u8; SFDP_TABLE_SIZE]) {
 
 /// Write a little-endian DWORD at a byte offset into the table.
 fn put_dword(table: &mut [u8; SFDP_TABLE_SIZE], offset: usize, value: u32) {
-    table[offset] = value as u8;
-    table[offset + 1] = (value >> 8) as u8;
-    table[offset + 2] = (value >> 16) as u8;
-    table[offset + 3] = (value >> 24) as u8;
+    let bytes = value.to_le_bytes();
+    table[offset..offset + bytes.len()].copy_from_slice(&bytes);
 }
 
 /// Write the Basic Flash Parameter Table (16 DWORDs starting at offset 0x10).

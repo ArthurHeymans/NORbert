@@ -145,24 +145,27 @@ pub struct ToctouIndexRequest {
 }
 
 impl ToctouIndexRequest {
-    pub const fn arm(index: u8) -> Self {
+    pub const fn arm(index: u8) -> Option<Self> {
         Self::new(TOCTOU_ARM, index)
     }
 
-    pub const fn disarm(index: u8) -> Self {
+    pub const fn disarm(index: u8) -> Option<Self> {
         Self::new(TOCTOU_DISARM, index)
     }
 
-    pub const fn reset(index: u8) -> Self {
+    pub const fn reset(index: u8) -> Option<Self> {
         Self::new(TOCTOU_RESET, index)
     }
 
-    const fn new(subcommand: u8, index: u8) -> Self {
-        Self {
+    const fn new(subcommand: u8, index: u8) -> Option<Self> {
+        if index > 3 {
+            return None;
+        }
+        Some(Self {
             command: CMD_TOCTOU,
             subcommand,
-            index: index & 0x03,
-        }
+            index,
+        })
     }
 }
 
@@ -179,14 +182,16 @@ pub struct ToctouSetRequest {
 
 impl ToctouSetRequest {
     pub fn new(index: u8, start: u32, mask: u32, replace: u32) -> Option<Self> {
-        (start <= BeU24::MAX && mask <= BeU24::MAX && replace <= BeU24::MAX).then(|| Self {
-            command: CMD_TOCTOU,
-            subcommand: 0x01,
-            index: index & 0x03,
-            start: BeU24::new(start),
-            mask: BeU24::new(mask),
-            replace: BeU24::new(replace),
-        })
+        (index <= 3 && start <= BeU24::MAX && mask <= BeU24::MAX && replace <= BeU24::MAX).then(
+            || Self {
+                command: CMD_TOCTOU,
+                subcommand: 0x01,
+                index,
+                start: BeU24::new(start),
+                mask: BeU24::new(mask),
+                replace: BeU24::new(replace),
+            },
+        )
     }
 }
 
@@ -235,14 +240,15 @@ mod tests {
             &[CMD_TOCTOU, TOCTOU_RESET_ALL]
         );
         assert_eq!(
-            ToctouIndexRequest::arm(5).as_bytes(),
+            ToctouIndexRequest::arm(1).unwrap().as_bytes(),
             &[CMD_TOCTOU, TOCTOU_ARM, 1]
         );
+        assert!(ToctouIndexRequest::arm(5).is_none());
     }
 
     #[test]
     fn toctou_set_request_matches_the_existing_wire_format() {
-        let request = ToctouSetRequest::new(5, 0x12_3456, 0xff_f000, 0xab_cdef).unwrap();
+        let request = ToctouSetRequest::new(1, 0x12_3456, 0xff_f000, 0xab_cdef).unwrap();
         assert_eq!(
             request.as_bytes(),
             &[
@@ -250,5 +256,6 @@ mod tests {
             ]
         );
         assert!(ToctouSetRequest::new(0, 0x0100_0000, 0, 0).is_none());
+        assert!(ToctouSetRequest::new(4, 0, 0, 0).is_none());
     }
 }
