@@ -1,10 +1,12 @@
 mod chip;
+mod protocol;
 mod sfdp;
 
-use chip::FlashChipExt;
 use anyhow::{Context, Result, anyhow, bail};
+use chip::FlashChipExt;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use protocol::*;
 use serialport::SerialPort;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -13,6 +15,7 @@ use std::thread;
 use std::time::Duration;
 #[cfg(any(feature = "d2xx", feature = "ftdi"))]
 use std::time::Instant;
+use zerocopy::IntoBytes;
 
 const BAUD_RATE: u32 = 2_000_000;
 // Max bursts per command: 16-bit len field (v3), 8 bytes per burst.
@@ -29,40 +32,6 @@ const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
 // host-to-FPGA, SDRAM writes complete in microseconds).
 const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
 const SDRAM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
-
-const PROTOCOL_VERSION: u8 = 5;
-
-// Protocol commands (shared between UART and FT245 transports)
-const CMD_VERSION: u8 = 0x30;
-const CMD_READ: u8 = 0x31;
-const CMD_WRITE: u8 = 0x32;
-const CMD_CHIPCONFIG: u8 = 0x33;
-const CMD_START: u8 = 0x34; // Enable SPI emulation (protocol v4+)
-const CMD_STOP: u8 = 0x35; // Disable SPI emulation (protocol v4+)
-const CMD_STATUS: u8 = 0x36; // Query emulation state (protocol v4+)
-const CMD_HOLDCTL: u8 = 0x37; // Target flash #HOLD control (protocol v5+)
-const CMD_LOGCTL: u8 = 0x38; // Enable/disable SPI bus logging capture (protocol v5+)
-const CMD_TOCTOU: u8 = 0x39; // TOCTOU trap management (protocol v5+)
-const CMD_LOGPOLL: u8 = 0x3A; // Drain logger ring FIFO (protocol v5+)
-
-// CMD_LOGPOLL framing. Raw log bytes equal to 0xA0 or 0xA5 are escaped
-// by the FPGA as 0xA5 0x00 or 0xA5 0x05 respectively, leaving 0xA0 as an
-// unambiguous end-of-poll marker.
-const LOG_POLL_TERMINATOR: u8 = 0xA0;
-const LOG_POLL_ESCAPE: u8 = 0xA5;
-
-// TOCTOU sub-commands
-const TOCTOU_SET: u8 = 0x01;
-const TOCTOU_ARM: u8 = 0x02;
-const TOCTOU_DISARM: u8 = 0x03;
-const TOCTOU_RESET: u8 = 0x04;
-const TOCTOU_RESET_ALL: u8 = 0x05;
-
-// Log packet type markers
-const LOG_CMD: u8 = 0xA1;
-const LOG_ADDR: u8 = 0xA2;
-const LOG_END: u8 = 0xA3;
-const LOG_TRAP: u8 = 0xA4;
 
 // FT2232H USB identifiers
 #[cfg(any(feature = "d2xx", feature = "ftdi"))]
@@ -550,16 +519,11 @@ impl FlashDevice {
         let len_units = length / 8;
 
         // v3 header: cmd + 3 addr bytes + 2 len bytes (big-endian)
-        let cmd = [
-            CMD_READ,
-            ((addr_units >> 16) & 0xFF) as u8,
-            ((addr_units >> 8) & 0xFF) as u8,
-            (addr_units & 0xFF) as u8,
-            ((len_units >> 8) & 0xFF) as u8,
-            (len_units & 0xFF) as u8,
-        ];
+        let len_units = u16::try_from(len_units).context("read burst count exceeds 16 bits")?;
+        let header =
+            RamHeader::read(addr_units, len_units).context("read burst address exceeds 24 bits")?;
 
-        self.transport.write_all(&cmd)?;
+        self.transport.write_all(header.as_bytes())?;
 
         let mut buf = vec![0u8; length];
         self.transport.read_exact(&mut buf)?;
@@ -585,15 +549,11 @@ impl FlashDevice {
         // Combine header and data into a single write to avoid
         // transfer gaps that could trigger the FPGA's idle timeout.
         // v3 header: cmd + 3 addr bytes + 2 len bytes (big-endian)
-        let mut buf = Vec::with_capacity(6 + data.len());
-        buf.extend_from_slice(&[
-            CMD_WRITE,
-            ((addr_units >> 16) & 0xFF) as u8,
-            ((addr_units >> 8) & 0xFF) as u8,
-            (addr_units & 0xFF) as u8,
-            ((len_units >> 8) & 0xFF) as u8,
-            (len_units & 0xFF) as u8,
-        ]);
+        let len_units = u16::try_from(len_units).context("write burst count exceeds 16 bits")?;
+        let header = RamHeader::write(addr_units, len_units)
+            .context("write burst address exceeds 24 bits")?;
+        let mut buf = Vec::with_capacity(size_of::<RamHeader>() + data.len());
+        buf.extend_from_slice(header.as_bytes());
         buf.extend_from_slice(data);
         self.transport.write_all(&buf)?;
 
@@ -673,17 +633,13 @@ impl FlashDevice {
             );
         }
 
-        // Build the full command in one buffer to avoid USB transfer gaps
-        let mut buf = Vec::with_capacity(9 + sfdp_len);
-        buf.push(CMD_CHIPCONFIG);
-        buf.push(jedec[0]); // manufacturer
-        buf.push(jedec[1]); // device high
-        buf.push(jedec[2]); // device low
-        buf.push(flags);
-        buf.push(((erase_bursts >> 16) & 0x7F) as u8);
-        buf.push(((erase_bursts >> 8) & 0xFF) as u8);
-        buf.push((erase_bursts & 0xFF) as u8);
-        buf.push(sfdp_len as u8);
+        let sfdp_len = u8::try_from(sfdp_len).context("SFDP table length exceeds 8 bits")?;
+        let header = ChipConfigHeader::new(jedec, flags, erase_bursts, sfdp_len)
+            .context("chip erase burst count exceeds the protocol's 23-bit field")?;
+
+        // Build the full command in one buffer to avoid USB transfer gaps.
+        let mut buf = Vec::with_capacity(size_of::<ChipConfigHeader>() + sfdp_table.len());
+        buf.extend_from_slice(header.as_bytes());
         buf.extend_from_slice(sfdp_table);
         self.transport.write_all(&buf)?;
 
@@ -705,8 +661,8 @@ impl FlashDevice {
     ///   Byte 1: 0x01 = assert hold, 0x00 = release hold
     ///   Response: 0x01 on success.
     fn set_hold(&mut self, enable: bool) -> Result<()> {
-        let data = if enable { 0x01u8 } else { 0x00u8 };
-        self.transport.write_all(&[CMD_HOLDCTL, data])?;
+        self.transport
+            .write_all(ControlRequest::hold(enable).as_bytes())?;
 
         // Wait for ack (skip modem status bytes, see write_block)
         let mut resp = [0u8; 1];
@@ -728,7 +684,8 @@ impl FlashDevice {
     }
 
     fn log_start(&mut self) -> Result<()> {
-        self.transport.write_all(&[CMD_LOGCTL, 0x01])?;
+        self.transport
+            .write_all(ControlRequest::log(true).as_bytes())?;
         let ack = self.read_ack("log start")?;
         if ack != 0x01 {
             bail!("LOGCTL start failed: unexpected response 0x{:02x}", ack);
@@ -737,7 +694,8 @@ impl FlashDevice {
     }
 
     fn log_stop(&mut self) -> Result<()> {
-        self.transport.write_all(&[CMD_LOGCTL, 0x00])?;
+        self.transport
+            .write_all(ControlRequest::log(false).as_bytes())?;
         let ack = self.read_ack("log stop")?;
         if ack != 0x01 {
             bail!("LOGCTL stop failed: unexpected response 0x{:02x}", ack);
@@ -787,21 +745,9 @@ impl FlashDevice {
     }
 
     fn toctou_set(&mut self, index: u8, start: u32, mask: u32, replace: u32) -> Result<()> {
-        let buf = [
-            CMD_TOCTOU,
-            TOCTOU_SET,
-            index & 0x03,
-            ((start >> 16) & 0xFF) as u8,
-            ((start >> 8) & 0xFF) as u8,
-            (start & 0xFF) as u8,
-            ((mask >> 16) & 0xFF) as u8,
-            ((mask >> 8) & 0xFF) as u8,
-            (mask & 0xFF) as u8,
-            ((replace >> 16) & 0xFF) as u8,
-            ((replace >> 8) & 0xFF) as u8,
-            (replace & 0xFF) as u8,
-        ];
-        self.transport.write_all(&buf)?;
+        let request = ToctouSetRequest::new(index, start, mask, replace)
+            .context("TOCTOU addresses and masks must fit in 24 bits")?;
+        self.transport.write_all(request.as_bytes())?;
         let resp = self.read_ack("TOCTOU set")?;
         if resp != 0x01 {
             bail!("TOCTOU set failed: unexpected response 0x{:02x}", resp);
@@ -811,7 +757,7 @@ impl FlashDevice {
 
     fn toctou_arm(&mut self, index: u8) -> Result<()> {
         self.transport
-            .write_all(&[CMD_TOCTOU, TOCTOU_ARM, index & 0x03])?;
+            .write_all(ToctouIndexRequest::arm(index).as_bytes())?;
         let resp = self.read_ack("TOCTOU arm")?;
         if resp != 0x01 {
             bail!("TOCTOU arm failed: unexpected response 0x{:02x}", resp);
@@ -821,7 +767,7 @@ impl FlashDevice {
 
     fn toctou_disarm(&mut self, index: u8) -> Result<()> {
         self.transport
-            .write_all(&[CMD_TOCTOU, TOCTOU_DISARM, index & 0x03])?;
+            .write_all(ToctouIndexRequest::disarm(index).as_bytes())?;
         let resp = self.read_ack("TOCTOU disarm")?;
         if resp != 0x01 {
             bail!("TOCTOU disarm failed: unexpected response 0x{:02x}", resp);
@@ -831,7 +777,7 @@ impl FlashDevice {
 
     fn toctou_reset(&mut self, index: u8) -> Result<()> {
         self.transport
-            .write_all(&[CMD_TOCTOU, TOCTOU_RESET, index & 0x03])?;
+            .write_all(ToctouIndexRequest::reset(index).as_bytes())?;
         let resp = self.read_ack("TOCTOU reset")?;
         if resp != 0x01 {
             bail!("TOCTOU reset failed: unexpected response 0x{:02x}", resp);
@@ -840,7 +786,8 @@ impl FlashDevice {
     }
 
     fn toctou_reset_all(&mut self) -> Result<()> {
-        self.transport.write_all(&[CMD_TOCTOU, TOCTOU_RESET_ALL])?;
+        self.transport
+            .write_all(ControlRequest::toctou_reset_all().as_bytes())?;
         let resp = self.read_ack("TOCTOU reset-all")?;
         if resp != 0x01 {
             bail!(
@@ -1815,10 +1762,11 @@ fn spi_opcode_name(opcode: u8) -> &'static str {
 }
 
 fn is_read_opcode(opcode: u8) -> bool {
-    matches!(
-        opcode,
-        0x03 | 0x0B | 0x0C | 0x13 | 0x3B | 0x3C | 0x5A | 0x6B | 0x6C | 0xBB | 0xBC | 0xEB | 0xEC
-    )
+    match opcode {
+        0x03 | 0x0B | 0x0C | 0x13 | 0x3B | 0x3C | 0x5A | 0x6B | 0x6C | 0xBB | 0xBC | 0xEB
+        | 0xEC => true,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
