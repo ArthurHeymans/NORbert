@@ -167,12 +167,32 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
     // Load is the one command whose natural end state is "ready to
     // serve", so the dance is stop -> write -> (verify) -> start.
     device.with_emulation_then_start(|device| {
-        device.write(address, &data)?;
+        let progress = ProgressBar::new(data.len() as u64);
+        progress.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
+                .progress_chars("#>-"),
+        );
+        device.write_with_progress(address, &data, |completed| {
+            progress.inc(completed as u64);
+        })?;
+        progress.finish_with_message("loaded");
         println!("Loaded {} bytes", data.len());
 
         if verify {
             println!("Verifying...");
-            let readback = device.read(address, data.len() as u32)?;
+            let progress = ProgressBar::new(data.len() as u64);
+            progress.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "[{elapsed_precise}] [{bar:40.green/blue}] {bytes}/{total_bytes} ({eta})",
+                    )?
+                    .progress_chars("#>-"),
+            );
+            let readback = device.read_with_progress(address, data.len() as u32, |completed| {
+                progress.inc(completed as u64);
+            })?;
+            progress.finish_with_message("verified");
             let mismatches: Vec<_> = data
                 .iter()
                 .zip(&readback)

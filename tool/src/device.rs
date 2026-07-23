@@ -258,10 +258,6 @@ impl FlashDevice {
         self.expect_ack("write")
     }
 
-    pub(crate) fn read(&mut self, address: u32, length: u32) -> Result<Vec<u8>> {
-        self.read_with_progress(address, length, |_| {})
-    }
-
     pub(crate) fn read_with_progress(
         &mut self,
         address: u32,
@@ -459,6 +455,15 @@ impl FlashDevice {
     }
 
     pub(crate) fn write(&mut self, address: u32, data: &[u8]) -> Result<()> {
+        self.write_with_progress(address, data, |_| {})
+    }
+
+    pub(crate) fn write_with_progress(
+        &mut self,
+        address: u32,
+        data: &[u8],
+        mut progress: impl FnMut(usize),
+    ) -> Result<()> {
         if data.is_empty() {
             bail!("No data to write");
         }
@@ -495,6 +500,14 @@ impl FlashDevice {
                     block_address
                 )
             })?;
+
+            let chunk_start = block_num * BLOCK_SIZE;
+            let chunk_end = chunk_start + chunk.len();
+            let written_start = chunk_start.max(start_offset);
+            let written_end = chunk_end.min(end_offset);
+            if written_end > written_start {
+                progress(written_end - written_start);
+            }
         }
 
         Ok(())
