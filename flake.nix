@@ -149,6 +149,8 @@
             # Rust toolchain for spi-flash-tool
             cargo
             rustc
+            rustfmt
+            clippy
             pkg-config
             udev
           ];

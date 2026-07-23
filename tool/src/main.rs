@@ -1,7 +1,7 @@
 mod chip;
 mod sfdp;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use serialport::SerialPort;
@@ -1080,7 +1080,9 @@ fn open_device(cli: &Cli) -> Result<FlashDevice> {
             return FlashDevice::open_ft245(cli.ft_serial.as_deref());
         }
         #[cfg(not(any(feature = "d2xx", feature = "ftdi")))]
-        bail!("--ft245 requires the 'd2xx' or 'ftdi' feature (build with --features d2xx, --features ftdi, or --no-default-features --features d2xx)");
+        bail!(
+            "--ft245 requires the 'd2xx' or 'ftdi' feature (build with --features d2xx, --features ftdi, or --no-default-features --features d2xx)"
+        );
     }
     FlashDevice::open_serial(&cli.port)
 }
@@ -1817,8 +1819,8 @@ fn is_read_opcode(opcode: u8) -> bool {
 
 fn cmd_monitor(cli: &Cli) -> Result<()> {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let mut device = open_device(cli)?;
 
