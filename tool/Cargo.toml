@@ -18,3 +18,4 @@ anyhow = "1.0"
 indicatif = "0.17"
 rflasher-chips = { git = "https://github.com/ArthurHeymans/rflasher.git", rev = "1879f3819cb4f3d9fde76447198346cae3e2b40d", features = ["static-chips"] }
 ctrlc = "3.4"
+zerocopy = { version = "=0.8.55", features = ["derive"] }
