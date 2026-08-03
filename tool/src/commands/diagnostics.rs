@@ -9,14 +9,19 @@ pub(super) fn cmd_probe(cli: &Cli) -> Result<()> {
     eprintln!("Opening FT2232H for probe (ftdi-nusb)...");
     let serial = cli.ft_serial.as_deref();
     let mut dev = if let Some(sn) = serial {
-        let filter = ftdi::DeviceFilter::new(FTDI_VID, FT2232H_PID).serial(sn);
-        ftdi::FtdiDevice::open_with_filter(&filter, ftdi::Interface::A)
+        let filter = ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).serial(sn);
+        ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
             .with_context(|| format!("No FT2232H with serial '{}'", sn))?
     } else {
-        let filter = ftdi::DeviceFilter::new(FTDI_VID, FT2232H_PID).description("NORbert FT245");
-        ftdi::FtdiDevice::open_with_filter(&filter, ftdi::Interface::A)
+        let filter =
+            ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).description("NORbert FT245");
+        ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
             .or_else(|_| {
-                ftdi::FtdiDevice::open_with_interface(FTDI_VID, FT2232H_PID, ftdi::Interface::A)
+                ftdi_nusb::FtdiDevice::open_with_interface(
+                    FTDI_VID,
+                    FT2232H_PID,
+                    ftdi_nusb::Interface::A,
+                )
             })
             .context("No FT2232H found")?
     };
@@ -146,7 +151,7 @@ pub(super) fn cmd_probe(cli: &Cli) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 pub(super) fn cmd_ft_list() -> Result<()> {
-    let devices = ftdi::find_devices(FTDI_VID, FT2232H_PID)
+    let devices = ftdi_nusb::find_devices(FTDI_VID, FT2232H_PID)
         .map_err(|e| anyhow!(e))
         .context("Failed to enumerate FTDI devices")?;
 

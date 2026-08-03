@@ -8,9 +8,6 @@ pub trait FlashChipExt {
     /// Full 3-byte JEDEC ID: [manufacturer, device_hi, device_lo].
     fn jedec_id_bytes(&self) -> [u8; 3];
 
-    /// Number of 8-byte SDRAM bursts needed to erase the whole chip, minus 1.
-    fn chip_erase_bursts(&self) -> u32;
-
     /// Whether the chip supports 4-byte addressing as advertised by rflasher.
     fn supports_4byte(&self) -> bool;
 
@@ -31,10 +28,6 @@ impl FlashChipExt for FlashChip {
             (self.jedec_device >> 8) as u8,
             self.jedec_device as u8,
         ]
-    }
-
-    fn chip_erase_bursts(&self) -> u32 {
-        (self.total_size / 8).saturating_sub(1)
     }
 
     fn supports_4byte(&self) -> bool {

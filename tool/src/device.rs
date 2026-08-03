@@ -1,513 +1,811 @@
-use crate::chip::{self, FlashChipExt};
 use crate::protocol::*;
-use crate::transport::Ft245Transport;
-use crate::transport::{
-    BLOCK_SIZE, SDRAM_SIZE_BYTES, SerialTransport, Transport, UART_READ_BLOCK_SIZE,
-};
 use anyhow::{Context, Result, bail};
 use std::mem::size_of;
 use zerocopy::IntoBytes;
 
-// ---------------------------------------------------------------------------
-// FlashDevice -- protocol implementation over any transport
-// ---------------------------------------------------------------------------
+#[cfg(any(feature = "ftdi", feature = "wasm"))]
+pub(crate) const FTDI_VID: u16 = 0x0403;
+#[cfg(any(feature = "ftdi", feature = "wasm"))]
+pub(crate) const FT2232H_PID: u16 = 0x6010;
+pub(crate) const UART_BAUD_RATE: u32 = 2_000_000;
+
+// 64 KiB transfers are unreliable in the FPGA glue/SDRAM path. Keep FT245
+// protocol requests at or below the largest size that passes stress tests.
+#[cfg(any(feature = "ftdi", feature = "wasm", test))]
+const FT245_READ_BLOCK_SIZE: usize = 16_384;
+
+// UART reads must complete inside the SDRAM refresh window. At 2 Mbaud a
+// 4 KiB read takes about 20 ms, leaving adequate margin.
+const UART_READ_BLOCK_SIZE: usize = 4_096;
+const MAX_WRITE_BLOCK_SIZE: usize = 16_384;
+pub(crate) const SDRAM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionKind {
+    #[cfg(any(feature = "ftdi", feature = "wasm", test))]
+    Ft245,
+    Uart,
+}
+
+impl ConnectionKind {
+    fn read_block_size(self) -> usize {
+        match self {
+            #[cfg(any(feature = "ftdi", feature = "wasm", test))]
+            Self::Ft245 => FT245_READ_BLOCK_SIZE,
+            Self::Uart => UART_READ_BLOCK_SIZE,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProtocolCapabilities {
+    pub(crate) version: u8,
+    pub(crate) emulation_control: bool,
+    pub(crate) hold_control: bool,
+    pub(crate) activity_log: bool,
+    pub(crate) toctou: bool,
+}
+
+impl ProtocolCapabilities {
+    fn from_version(version: u8) -> Result<Self> {
+        if !is_supported_protocol_version(version) {
+            bail!(
+                "unsupported protocol version {version}; supported versions are {MIN_SUPPORTED_PROTOCOL_VERSION} through {PROTOCOL_VERSION}"
+            );
+        }
+        Ok(Self {
+            version,
+            emulation_control: supports_emulation_control(version),
+            hold_control: supports_hold_control(version),
+            activity_log: supports_activity_log(version),
+            toctou: supports_toctou(version),
+        })
+    }
+}
+
+#[cfg_attr(feature = "cli", allow(dead_code))]
+#[maybe_async::maybe_async(?Send)]
+pub(crate) trait Transport {
+    async fn write_all(&mut self, data: &[u8]) -> Result<()>;
+    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize>;
+    async fn disconnect(&mut self) -> Result<()>;
+    fn is_connected(&self) -> bool;
+}
 
 pub(crate) struct FlashDevice {
     transport: Box<dyn Transport>,
     read_block_size: usize,
+    capabilities: Option<ProtocolCapabilities>,
 }
 
-fn validate_sdram_range(address: u32, length: usize, what: &str) -> Result<()> {
+pub(crate) struct WriteSession<'a> {
+    device: &'a mut FlashDevice,
+    next_address: u32,
+    remaining: usize,
+    was_running: bool,
+}
+
+pub(crate) fn validate_sdram_range(address: u32, length: usize, what: &str) -> Result<()> {
     let end = (address as u64)
         .checked_add(length as u64)
-        .with_context(|| format!("{} range overflows address arithmetic", what))?;
+        .with_context(|| format!("{what} range overflows address arithmetic"))?;
     if end > SDRAM_SIZE_BYTES {
         bail!(
-            "{} range 0x{:08x}..0x{:08x} exceeds {} MiB SDRAM backing store",
-            what,
-            address,
-            end,
+            "{what} range 0x{address:08x}..0x{end:08x} exceeds {} MiB SDRAM backing store",
             SDRAM_SIZE_BYTES / (1024 * 1024)
         );
     }
     Ok(())
 }
 
+#[cfg_attr(feature = "cli", allow(dead_code))]
+#[maybe_async::maybe_async(?Send)]
 impl FlashDevice {
-    pub(crate) fn open_serial(port_name: &str) -> Result<Self> {
+    pub(crate) fn new<T>(
+        transport: T,
+        connection: ConnectionKind,
+        known_version: Option<u8>,
+    ) -> Result<Self>
+    where
+        T: Transport + 'static,
+    {
+        let capabilities = known_version
+            .map(ProtocolCapabilities::from_version)
+            .transpose()?;
         Ok(Self {
-            transport: Box::new(SerialTransport::open(port_name)?),
-            read_block_size: UART_READ_BLOCK_SIZE,
+            transport: Box::new(transport),
+            read_block_size: connection.read_block_size(),
+            capabilities,
         })
     }
 
-    pub(crate) fn open_ft245(serial: Option<&str>) -> Result<Self> {
-        Ok(Self {
-            transport: Box::new(Ft245Transport::open(serial)?),
-            read_block_size: BLOCK_SIZE,
-        })
+    pub(crate) fn is_connected(&self) -> bool {
+        self.transport.is_connected()
     }
 
-    pub(crate) fn get_version(&mut self) -> Result<u8> {
-        self.transport.write_all(&[CMD_VERSION])?;
-        self.read_ack("version")
+    pub(crate) async fn disconnect(&mut self) -> Result<()> {
+        self.transport.disconnect().await
     }
 
-    /// Read one response byte, transparently skipping stray 0x00 bytes
-    /// that the FT2232H 245 FIFO mode can occasionally leak from USB
-    /// (the 2-byte USB IN modem status header).  Used by all single-
-    /// byte-ack commands.
-    pub(crate) fn read_ack(&mut self, context: &str) -> Result<u8> {
-        let mut resp = [0u8; 1];
-        let mut skipped = 0u32;
-        loop {
-            self.transport.read_exact(&mut resp)?;
-            if resp[0] != 0x00 {
-                return Ok(resp[0]);
-            }
-            skipped += 1;
-            if skipped > 8 {
-                bail!("{}: too many 0x00 bytes before ACK", context);
-            }
+    pub(crate) async fn capabilities(&mut self) -> Result<ProtocolCapabilities> {
+        if let Some(capabilities) = self.capabilities {
+            return Ok(capabilities);
+        }
+
+        self.transport.write_all(&[CMD_VERSION]).await?;
+        let version = self.read_ack("version").await?;
+        let capabilities = ProtocolCapabilities::from_version(version)?;
+        self.capabilities = Some(capabilities);
+        Ok(capabilities)
+    }
+
+    pub(crate) async fn get_version(&mut self) -> Result<u8> {
+        Ok(self.capabilities().await?.version)
+    }
+
+    async fn require_capability(
+        &mut self,
+        name: &str,
+        supported: impl FnOnce(ProtocolCapabilities) -> bool,
+    ) -> Result<()> {
+        let capabilities = self.capabilities().await?;
+        if supported(capabilities) {
+            Ok(())
+        } else {
+            bail!(
+                "{name} is unavailable with protocol version {}",
+                capabilities.version
+            )
         }
     }
 
-    fn expect_ack(&mut self, context: &str) -> Result<()> {
-        let ack = self.read_ack(context)?;
-        if ack != 0x01 {
-            bail!("{}: unexpected response 0x{:02x}", context, ack);
+    async fn read_exact(&mut self, buffer: &mut [u8]) -> Result<()> {
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let count = self.transport.read(&mut buffer[offset..]).await?;
+            if count == 0 {
+                continue;
+            }
+            if count > buffer.len() - offset {
+                bail!("transport returned more bytes than requested");
+            }
+            offset += count;
         }
         Ok(())
     }
 
-    /// Start SPI emulation.  ACK = 0x01.  Safe to call while running
-    /// (no-op that still acks).
-    pub(crate) fn start_emulation(&mut self) -> Result<()> {
-        self.transport.write_all(&[CMD_START])?;
-        self.expect_ack("start")
+    /// Read one response byte while tolerating the known startup/status noise
+    /// bytes emitted by the UART and FT2232H paths.
+    pub(crate) async fn read_ack(&mut self, context: &str) -> Result<u8> {
+        let mut response = [0u8; 1];
+        for _ in 0..=8 {
+            self.read_exact(&mut response).await?;
+            if response[0] != 0x00 && response[0] != 0xff {
+                return Ok(response[0]);
+            }
+        }
+        bail!("{context}: too many synchronization bytes before ACK")
     }
 
-    /// Stop SPI emulation.  ACK = 0x01.  Safe to call while stopped.
-    ///
-    /// Always deliverable: even when SPI emulation is actively driving
-    /// the target, the FPGA's always-safe dispatcher picks up this
-    /// command ahead of the usual SPI-idle gate.
-    pub(crate) fn stop_emulation(&mut self) -> Result<()> {
-        self.transport.write_all(&[CMD_STOP])?;
-        self.expect_ack("stop")
-    }
-
-    /// Query the current emulation state.  Returns true when running.
-    ///
-    /// The FPGA encodes stopped as 0x02 (not 0x00) so that any leaked
-    /// FT2232H modem-status zeros can be transparently skipped.
-    pub(crate) fn status(&mut self) -> Result<bool> {
-        self.transport.write_all(&[CMD_STATUS])?;
-        let resp = self.read_ack("status")?;
-        match resp {
-            0x01 => Ok(true),  // running
-            0x02 => Ok(false), // stopped
-            other => bail!("status: unexpected response 0x{:02x}", other),
+    async fn expect_ack(&mut self, context: &str) -> Result<()> {
+        let response = self.read_ack(context).await?;
+        if response == 0x01 {
+            Ok(())
+        } else {
+            bail!("{context}: unexpected response 0x{response:02x}")
         }
     }
 
-    /// Ensure emulation is stopped for the duration of `f`, then
-    /// restore the prior state.  On v3 or older firmware (which has
-    /// no START/STOP/STATUS opcodes) `f` runs unconditionally and the
-    /// caller is responsible for ensuring the SPI bus is idle.
-    ///
-    /// State is restored on a best-effort basis even when `f` returns
-    /// an error so a failed operation doesn't leave the emulator
-    /// unexpectedly stopped.
-    pub(crate) fn with_emulation_stopped<F, R>(&mut self, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut Self) -> Result<R>,
-    {
-        let version = self.get_version()?;
-        if version < 4 {
-            eprintln!(
-                "Note: FPGA protocol v{} has no START/STOP; assuming idle SPI bus.",
-                version
-            );
-            return f(self);
-        }
+    pub(crate) async fn start_emulation(&mut self) -> Result<()> {
+        self.require_capability("emulation control", |c| c.emulation_control)
+            .await?;
+        self.command_with_ack(CMD_START, "start").await
+    }
 
-        let was_running = self.status()?;
+    pub(crate) async fn stop_emulation(&mut self) -> Result<()> {
+        self.require_capability("emulation control", |c| c.emulation_control)
+            .await?;
+        self.command_with_ack(CMD_STOP, "stop").await
+    }
+
+    pub(crate) async fn status(&mut self) -> Result<bool> {
+        self.require_capability("emulation status", |c| c.emulation_control)
+            .await?;
+        self.transport.write_all(&[CMD_STATUS]).await?;
+        match self.read_ack("status").await? {
+            0x01 => Ok(true),
+            0x02 => Ok(false),
+            response => bail!("status: unexpected response 0x{response:02x}"),
+        }
+    }
+
+    pub(crate) async fn prepare_stopped(&mut self) -> Result<bool> {
+        let capabilities = self.capabilities().await?;
+        if !capabilities.emulation_control {
+            return Ok(false);
+        }
+        let was_running = self.status().await?;
         if was_running {
-            eprintln!("Stopping SPI emulation for operation...");
-            self.stop_emulation()?;
+            self.stop_emulation().await?;
         }
-        let operation = f(self);
+        Ok(was_running)
+    }
+
+    pub(crate) async fn finish_stopped<T>(
+        &mut self,
+        was_running: bool,
+        operation: Result<T>,
+    ) -> Result<T> {
         let restoration = if was_running {
-            self.start_emulation()
+            self.start_emulation().await
         } else {
             Ok(())
         };
-
         match (operation, restoration) {
-            (Ok(value), Ok(())) => {
-                if was_running {
-                    eprintln!("SPI emulation resumed.");
-                }
-                Ok(value)
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => {
+                Err(error.context("operation completed, but emulation could not be resumed"))
             }
-            (Ok(_), Err(resume_error)) => {
-                Err(resume_error
-                    .context("operation completed, but SPI emulation could not be resumed"))
-            }
-            (Err(operation_error), Ok(())) => Err(operation_error),
-            (Err(operation_error), Err(resume_error)) => Err(operation_error.context(format!(
-                "SPI emulation also could not be resumed: {resume_error:#}"
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(resume_error)) => Err(error.context(format!(
+                "emulation also could not be resumed: {resume_error:#}"
             ))),
         }
     }
 
-    /// Stop emulation, run `f`, then start emulation unconditionally.
-    /// Used by `load`, whose natural end state is "ready to serve".
-    pub(crate) fn with_emulation_then_start<F, R>(&mut self, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut Self) -> Result<R>,
-    {
-        let version = self.get_version()?;
-        if version < 4 {
-            eprintln!(
-                "Note: FPGA protocol v{} has no START/STOP; assuming idle SPI bus.",
-                version
-            );
-            return f(self);
-        }
-
-        eprintln!("Stopping SPI emulation...");
-        self.stop_emulation()?;
-        let operation = f(self);
-        let restoration = self.start_emulation();
-
-        match (operation, restoration) {
-            (Ok(value), Ok(())) => {
-                eprintln!("SPI emulation started; target can now read the loaded data.");
-                Ok(value)
-            }
-            (Ok(_), Err(start_error)) => {
-                Err(start_error.context("load completed, but SPI emulation could not be started"))
-            }
-            (Err(operation_error), Ok(())) => Err(operation_error),
-            (Err(operation_error), Err(start_error)) => Err(operation_error.context(format!(
-                "SPI emulation also could not be started: {start_error:#}"
-            ))),
-        }
+    pub(crate) async fn read(&mut self, address: u32, length: u32) -> Result<Vec<u8>> {
+        self.read_with_progress(address, length, |_| Ok(())).await
     }
 
-    pub(crate) fn read_block(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
-        if length == 0 || length > BLOCK_SIZE {
-            bail!("Invalid length: must be 1-{}", BLOCK_SIZE);
-        }
-        if !address.is_multiple_of(8) {
-            bail!("Address must be 8-byte aligned");
-        }
-        if !length.is_multiple_of(8) {
-            bail!("Length must be a multiple of 8");
-        }
-
-        validate_sdram_range(address, length, "read")?;
-
-        let addr_units = address / 8;
-        let len_units = length / 8;
-
-        // v3 header: cmd + 3 addr bytes + 2 len bytes (big-endian)
-        let len_units = u16::try_from(len_units).context("read burst count exceeds 16 bits")?;
-        let header =
-            RamHeader::read(addr_units, len_units).context("read burst address exceeds 24 bits")?;
-
-        self.transport.write_all(header.as_bytes())?;
-
-        let mut buf = vec![0u8; length];
-        self.transport.read_exact(&mut buf)?;
-        Ok(buf)
-    }
-
-    pub(crate) fn write_block(&mut self, address: u32, data: &[u8]) -> Result<()> {
-        if data.is_empty() || data.len() > BLOCK_SIZE {
-            bail!("Invalid data length: must be 1-{}", BLOCK_SIZE);
-        }
-        if !address.is_multiple_of(8) {
-            bail!("Address must be 8-byte aligned");
-        }
-        if !data.len().is_multiple_of(8) {
-            bail!("Data length must be a multiple of 8");
-        }
-
-        validate_sdram_range(address, data.len(), "write")?;
-
-        let addr_units = address / 8;
-        let len_units = data.len() / 8;
-
-        // Combine header and data into a single write to avoid
-        // transfer gaps that could trigger the FPGA's idle timeout.
-        // v3 header: cmd + 3 addr bytes + 2 len bytes (big-endian)
-        let len_units = u16::try_from(len_units).context("write burst count exceeds 16 bits")?;
-        let header = RamHeader::write(addr_units, len_units)
-            .context("write burst address exceeds 24 bits")?;
-        let mut buf = Vec::with_capacity(size_of::<RamHeader>() + data.len());
-        buf.extend_from_slice(header.as_bytes());
-        buf.extend_from_slice(data);
-        self.transport.write_all(&buf)?;
-
-        // Wait for completion byte (read_ack skips leaked FT2232H 0x00s).
-        self.expect_ack("write")
-    }
-
-    pub(crate) fn read_with_progress(
+    pub(crate) async fn read_with_progress(
         &mut self,
         address: u32,
         length: u32,
-        mut progress: impl FnMut(usize),
+        mut progress: impl FnMut(usize) -> Result<()>,
     ) -> Result<Vec<u8>> {
-        validate_sdram_range(address, length as usize, "read")?;
-        let rbs = self.read_block_size;
         let mut result = Vec::with_capacity(length as usize);
-        let mut addr = address;
-        let mut remaining = length as usize;
-
-        let start_offset = (addr % 8) as usize;
-        if start_offset != 0 {
-            let aligned_addr = addr - start_offset as u32;
-            let chunk_len = std::cmp::min(8 - start_offset, remaining);
-            let block = self.read_block(aligned_addr, 8)?;
-            result.extend_from_slice(&block[start_offset..start_offset + chunk_len]);
-            addr += chunk_len as u32;
-            remaining -= chunk_len;
-            progress(chunk_len);
-        }
-
-        while remaining >= 8 {
-            let chunk_len = std::cmp::min(rbs, remaining / 8 * 8);
-            let block = self.read_block(addr, chunk_len)?;
-            result.extend_from_slice(&block);
-            addr += chunk_len as u32;
-            remaining -= chunk_len;
-            progress(chunk_len);
-        }
-
-        if remaining > 0 {
-            let block = self.read_block(addr, 8)?;
-            result.extend_from_slice(&block[..remaining]);
-            progress(remaining);
-        }
-
+        self.read_chunks(address, length, |_, chunk| {
+            result.extend_from_slice(chunk);
+            progress(chunk.len())
+        })
+        .await?;
         Ok(result)
     }
 
-    /// Send chip configuration to the FPGA.
-    ///
-    /// Protocol (CMD_CHIPCONFIG = 0x33):
-    ///   Byte 0:    0x33
-    ///   Byte 1:    JEDEC manufacturer ID
-    ///   Byte 2:    JEDEC device ID high byte
-    ///   Byte 3:    JEDEC device ID low byte
-    ///   Byte 4:    Flags (bit 0 = supports 4-byte addressing)
-    ///   Byte 5-7:  Chip erase burst count (23-bit, MSB first)
-    ///              = (total_size / 8) - 1
-    ///   Byte 8:    SFDP table length (0-128)
-    ///   Byte 9+:   SFDP table data
-    ///
-    /// Response: 0x01 on success.
-    pub(crate) fn send_chip_config(
+    pub(crate) async fn read_chunks(
         &mut self,
-        chip: &chip::FlashChip,
+        address: u32,
+        length: u32,
+        mut on_chunk: impl FnMut(u32, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        validate_sdram_range(address, length as usize, "read")?;
+        let was_running = self.prepare_stopped().await?;
+        let operation = self.read_raw_chunks(address, length, &mut on_chunk).await;
+        self.finish_stopped(was_running, operation).await
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) async fn read_raw_with_progress(
+        &mut self,
+        address: u32,
+        length: u32,
+        mut progress: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<u8>> {
+        let mut result = Vec::with_capacity(length as usize);
+        self.read_raw_chunks(address, length, |_, chunk| {
+            result.extend_from_slice(chunk);
+            progress(chunk.len())
+        })
+        .await?;
+        Ok(result)
+    }
+
+    async fn read_raw_chunks(
+        &mut self,
+        address: u32,
+        length: u32,
+        mut on_chunk: impl FnMut(u32, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        validate_sdram_range(address, length as usize, "read")?;
+        let mut current = address;
+        let mut remaining = length as usize;
+
+        let start_offset = (current % 8) as usize;
+        if start_offset != 0 {
+            let block = self.read_block(current - start_offset as u32, 8).await?;
+            let count = (8 - start_offset).min(remaining);
+            on_chunk(current, &block[start_offset..start_offset + count])?;
+            current += count as u32;
+            remaining -= count;
+        }
+
+        while remaining >= 8 {
+            let count = self.read_block_size.min(remaining / 8 * 8);
+            let block = self.read_block(current, count).await?;
+            on_chunk(current, &block)?;
+            current += count as u32;
+            remaining -= count;
+        }
+
+        if remaining != 0 {
+            let block = self.read_block(current, 8).await?;
+            on_chunk(current, &block[..remaining])?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn write(&mut self, address: u32, data: &[u8]) -> Result<()> {
+        self.write_with_progress(address, data, |_| Ok(())).await
+    }
+
+    pub(crate) async fn begin_write(
+        &mut self,
+        address: u32,
+        length: usize,
+    ) -> Result<WriteSession<'_>> {
+        if length == 0 {
+            bail!("no data to write");
+        }
+        validate_sdram_range(address, length, "write")?;
+        let was_running = self.prepare_stopped().await?;
+        Ok(WriteSession {
+            device: self,
+            next_address: address,
+            remaining: length,
+            was_running,
+        })
+    }
+
+    pub(crate) async fn write_with_progress(
+        &mut self,
+        address: u32,
+        data: &[u8],
+        mut progress: impl FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        let mut session = self.begin_write(address, data.len()).await?;
+        let operation = session.write_chunk(data, &mut progress).await;
+        session.finish(operation).await
+    }
+
+    pub(crate) async fn write_raw_with_progress(
+        &mut self,
+        address: u32,
+        data: &[u8],
+        mut progress: impl FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        if data.is_empty() {
+            bail!("no data to write");
+        }
+        validate_sdram_range(address, data.len(), "write")?;
+
+        let mut current_address = address;
+        let mut remaining = data;
+        let mut operation_number = 0usize;
+        let start_offset = (address % 8) as usize;
+        let initial_bytes = if start_offset == 0 {
+            0
+        } else {
+            (8 - start_offset).min(data.len())
+        };
+        let bytes_after_initial = data.len() - initial_bytes;
+        let aligned_bytes = bytes_after_initial / 8 * 8;
+        let total_operations = usize::from(initial_bytes != 0)
+            + aligned_bytes.div_ceil(MAX_WRITE_BLOCK_SIZE)
+            + usize::from(bytes_after_initial != aligned_bytes);
+
+        if start_offset != 0 {
+            let aligned_address = current_address - start_offset as u32;
+            let count = (8 - start_offset).min(remaining.len());
+            let mut burst = self.read_block(aligned_address, 8).await?;
+            burst[start_offset..start_offset + count].copy_from_slice(&remaining[..count]);
+            self.write_block(aligned_address, &burst).await?;
+            current_address += count as u32;
+            remaining = &remaining[count..];
+            progress(count)?;
+            operation_number += 1;
+        }
+
+        while remaining.len() >= 8 {
+            let count = MAX_WRITE_BLOCK_SIZE.min(remaining.len() / 8 * 8);
+            self.write_block(current_address, &remaining[..count])
+                .await
+                .with_context(|| {
+                    format!(
+                        "operation {}/{} at address 0x{:06x}",
+                        operation_number + 1,
+                        total_operations.max(operation_number + 1),
+                        current_address
+                    )
+                })?;
+            current_address += count as u32;
+            remaining = &remaining[count..];
+            progress(count)?;
+            operation_number += 1;
+        }
+
+        if !remaining.is_empty() {
+            let mut burst = self.read_block(current_address, 8).await?;
+            burst[..remaining.len()].copy_from_slice(remaining);
+            self.write_block(current_address, &burst).await?;
+            progress(remaining.len())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn configure(
+        &mut self,
+        jedec_id: [u8; 3],
+        total_size: u32,
+        supports_4byte: bool,
         sfdp_table: &[u8],
     ) -> Result<()> {
-        let jedec = chip.jedec_id_bytes();
-        let erase_bursts = chip.chip_erase_bursts();
-        let flags: u8 = if chip.supports_4byte() { 0x01 } else { 0x00 };
+        let was_running = self.prepare_stopped().await?;
+        let operation = self
+            .configure_raw(jedec_id, total_size, supports_4byte, sfdp_table)
+            .await;
+        self.finish_stopped(was_running, operation).await
+    }
 
-        let sfdp_len = sfdp_table.len();
-        if sfdp_len > 128 {
-            bail!("SFDP table too large: {} bytes (max 128)", sfdp_len);
+    async fn configure_raw(
+        &mut self,
+        jedec_id: [u8; 3],
+        total_size: u32,
+        supports_4byte: bool,
+        sfdp_table: &[u8],
+    ) -> Result<()> {
+        let erase_bursts = capacity_erase_bursts(total_size)
+            .context("chip size must be a power of two between 8 bytes and 64 MiB")?;
+        if sfdp_table.len() > 128 {
+            bail!("SFDP table exceeds 128 bytes");
         }
-        if chip.total_size as u64 > SDRAM_SIZE_BYTES {
-            bail!(
-                "chip size {} bytes exceeds {} MiB SDRAM backing store",
-                chip.total_size,
-                SDRAM_SIZE_BYTES / (1024 * 1024)
-            );
-        }
 
-        let sfdp_len = u8::try_from(sfdp_len).context("SFDP table length exceeds 8 bits")?;
-        let header = ChipConfigHeader::new(jedec, flags, erase_bursts, sfdp_len)
-            .context("chip erase burst count exceeds the protocol's 23-bit field")?;
-
-        // Build the full command in one buffer to avoid USB transfer gaps.
-        let mut buf = Vec::with_capacity(size_of::<ChipConfigHeader>() + sfdp_table.len());
-        buf.extend_from_slice(header.as_bytes());
-        buf.extend_from_slice(sfdp_table);
-        self.transport.write_all(&buf)?;
-
-        self.expect_ack("chip config")
+        let flags = u8::from(supports_4byte);
+        let header = ChipConfigHeader::new(jedec_id, flags, erase_bursts, sfdp_table.len() as u8)
+            .context("chip erase burst count exceeds the protocol field")?;
+        let mut request = Vec::with_capacity(size_of::<ChipConfigHeader>() + sfdp_table.len());
+        request.extend_from_slice(header.as_bytes());
+        request.extend_from_slice(sfdp_table);
+        self.transport.write_all(&request).await?;
+        self.expect_ack("chip config").await
     }
 
-    /// Control the target flash #HOLD pin.
-    ///
-    /// When enabled, IO3 is driven LOW continuously, asserting #HOLD on
-    /// the target flash and silencing it so NORbert can respond instead.
-    /// Mutually exclusive with quad I/O.
-    ///
-    /// Protocol (CMD_HOLDCTL = 0x37):
-    ///   Byte 0: 0x37
-    ///   Byte 1: 0x01 = assert hold, 0x00 = release hold
-    ///   Response: 0x01 on success.
-    pub(crate) fn set_hold(&mut self, enable: bool) -> Result<()> {
+    pub(crate) async fn set_hold(&mut self, enabled: bool) -> Result<()> {
+        self.require_capability("target flash HOLD control", |c| c.hold_control)
+            .await?;
         self.transport
-            .write_all(ControlRequest::hold(enable).as_bytes())?;
-
-        self.expect_ack("hold control")
+            .write_all(ControlRequest::hold(enabled).as_bytes())
+            .await?;
+        self.expect_ack("hold control").await
     }
 
-    pub(crate) fn log_start(&mut self) -> Result<()> {
+    pub(crate) async fn log_start(&mut self) -> Result<()> {
+        self.require_capability("activity logging", |c| c.activity_log)
+            .await?;
         self.transport
-            .write_all(ControlRequest::log(true).as_bytes())?;
-        self.expect_ack("log start")
+            .write_all(ControlRequest::log(true).as_bytes())
+            .await?;
+        self.expect_ack("log start").await
     }
 
-    pub(crate) fn log_stop(&mut self) -> Result<()> {
+    pub(crate) async fn log_stop(&mut self) -> Result<()> {
+        self.require_capability("activity logging", |c| c.activity_log)
+            .await?;
         self.transport
-            .write_all(ControlRequest::log(false).as_bytes())?;
-        self.expect_ack("log stop")
+            .write_all(ControlRequest::log(false).as_bytes())
+            .await?;
+        self.expect_ack("log stop").await
     }
 
-    /// Drain the logger ring FIFO in a single poll.
-    ///
-    /// Protocol (CMD_LOGPOLL = 0x3A):
-    ///   Host:  0x3A
-    ///   FPGA:  [escaped log byte]* 0xA0
-    /// The response ends when an unescaped 0xA0 is seen.  Raw payload
-    /// 0xA0 is encoded as 0xA5 0x00; raw 0xA5 is encoded as 0xA5 0x05.
-    /// The FPGA caps each poll at 255 raw data bytes; any remaining log
-    /// data is picked up on the next poll.
-    pub(crate) fn log_poll(&mut self) -> Result<Vec<u8>> {
-        self.transport.write_all(&[CMD_LOGPOLL])?;
-        let mut out = Vec::with_capacity(256);
+    pub(crate) async fn log_poll(&mut self) -> Result<Vec<u8>> {
+        self.require_capability("activity logging", |c| c.activity_log)
+            .await?;
+        self.transport.write_all(&[CMD_LOGPOLL]).await?;
+        let mut output = Vec::with_capacity(256);
         loop {
-            let mut byte = [0u8; 1];
-            self.transport.read_exact(&mut byte)?;
-            match byte[0] {
-                LOG_POLL_TERMINATOR => return Ok(out),
-                LOG_POLL_ESCAPE => {
-                    let mut code = [0u8; 1];
-                    self.transport.read_exact(&mut code)?;
-                    match code[0] {
-                        0x00 => out.push(LOG_POLL_TERMINATOR),
-                        0x05 => out.push(LOG_POLL_ESCAPE),
-                        other => bail!("LOGPOLL: invalid escape code 0x{:02x}", other),
-                    }
-                }
-                b => out.push(b),
+            let byte = self.read_byte().await?;
+            match byte {
+                LOG_POLL_TERMINATOR => return Ok(output),
+                LOG_POLL_ESCAPE => match self.read_byte().await? {
+                    0x00 => output.push(LOG_POLL_TERMINATOR),
+                    0x05 => output.push(LOG_POLL_ESCAPE),
+                    code => bail!("invalid log escape 0x{code:02x}"),
+                },
+                value => output.push(value),
             }
-            // Safety net: cap log poll responses so a misbehaving
-            // device cannot lock the tool in this loop.  Should never
-            // trip given the FPGA's LOG_POLL_MAX = 255 raw bytes plus
-            // escapes and terminator.
-            if out.len() > 1024 {
-                bail!(
-                    "log poll overran 1024 bytes without terminator; last byte 0x{:02x}",
-                    byte[0]
-                );
+            if output.len() > 1024 {
+                bail!("log poll exceeded 1024 bytes without terminator");
             }
         }
     }
 
-    pub(crate) fn toctou_set(
+    pub(crate) async fn toctou_set(
         &mut self,
         index: u8,
         start: u32,
         mask: u32,
         replace: u32,
     ) -> Result<()> {
+        self.require_capability("TOCTOU traps", |c| c.toctou)
+            .await?;
         let request = ToctouSetRequest::new(index, start, mask, replace)
-            .context("TOCTOU addresses and masks must fit in 24 bits")?;
-        self.transport.write_all(request.as_bytes())?;
-        self.expect_ack("TOCTOU set")
+            .context("TOCTOU index must be 0-3 and addresses must fit in 24 bits")?;
+        self.transport.write_all(request.as_bytes()).await?;
+        self.expect_ack("TOCTOU set").await
     }
 
-    pub(crate) fn toctou_arm(&mut self, index: u8) -> Result<()> {
-        let request = ToctouIndexRequest::arm(index).context("trap index must be 0-3")?;
-        self.transport.write_all(request.as_bytes())?;
-        self.expect_ack("TOCTOU arm")
-    }
-
-    pub(crate) fn toctou_disarm(&mut self, index: u8) -> Result<()> {
-        let request = ToctouIndexRequest::disarm(index).context("trap index must be 0-3")?;
-        self.transport.write_all(request.as_bytes())?;
-        self.expect_ack("TOCTOU disarm")
-    }
-
-    pub(crate) fn toctou_reset(&mut self, index: u8) -> Result<()> {
-        let request = ToctouIndexRequest::reset(index).context("trap index must be 0-3")?;
-        self.transport.write_all(request.as_bytes())?;
-        self.expect_ack("TOCTOU reset")
-    }
-
-    pub(crate) fn toctou_reset_all(&mut self) -> Result<()> {
-        self.transport
-            .write_all(ControlRequest::toctou_reset_all().as_bytes())?;
-        self.expect_ack("TOCTOU reset-all")
-    }
-
-    pub(crate) fn write(&mut self, address: u32, data: &[u8]) -> Result<()> {
-        self.write_with_progress(address, data, |_| {})
-    }
-
-    pub(crate) fn write_with_progress(
+    async fn toctou_index(
         &mut self,
-        address: u32,
-        data: &[u8],
-        mut progress: impl FnMut(usize),
+        request: Option<ToctouIndexRequest>,
+        context: &str,
     ) -> Result<()> {
-        if data.is_empty() {
-            bail!("No data to write");
+        self.require_capability("TOCTOU traps", |c| c.toctou)
+            .await?;
+        let request = request.context("TOCTOU index must be 0-3")?;
+        self.transport.write_all(request.as_bytes()).await?;
+        self.expect_ack(context).await
+    }
+
+    pub(crate) async fn toctou_arm(&mut self, index: u8) -> Result<()> {
+        self.toctou_index(ToctouIndexRequest::arm(index), "TOCTOU arm")
+            .await
+    }
+
+    pub(crate) async fn toctou_disarm(&mut self, index: u8) -> Result<()> {
+        self.toctou_index(ToctouIndexRequest::disarm(index), "TOCTOU disarm")
+            .await
+    }
+
+    pub(crate) async fn toctou_reset(&mut self, index: u8) -> Result<()> {
+        self.toctou_index(ToctouIndexRequest::reset(index), "TOCTOU reset")
+            .await
+    }
+
+    pub(crate) async fn toctou_reset_all(&mut self) -> Result<()> {
+        self.require_capability("TOCTOU traps", |c| c.toctou)
+            .await?;
+        self.transport
+            .write_all(ControlRequest::toctou_reset_all().as_bytes())
+            .await?;
+        self.expect_ack("TOCTOU reset-all").await
+    }
+
+    async fn read_byte(&mut self) -> Result<u8> {
+        let mut byte = [0u8; 1];
+        self.read_exact(&mut byte).await?;
+        Ok(byte[0])
+    }
+
+    async fn command_with_ack(&mut self, command: u8, context: &str) -> Result<()> {
+        self.transport.write_all(&[command]).await?;
+        self.expect_ack(context).await
+    }
+
+    async fn read_block(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
+        if length == 0
+            || length > MAX_WRITE_BLOCK_SIZE
+            || !address.is_multiple_of(8)
+            || !length.is_multiple_of(8)
+        {
+            bail!("read block must be 8-byte aligned and at most {MAX_WRITE_BLOCK_SIZE} bytes");
+        }
+        validate_sdram_range(address, length, "read")?;
+        let header = RamHeader::read(address / 8, (length / 8) as u16)
+            .context("read address exceeds the protocol field")?;
+        self.transport.write_all(header.as_bytes()).await?;
+        let mut data = vec![0u8; length];
+        self.read_exact(&mut data).await?;
+        Ok(data)
+    }
+
+    async fn write_block(&mut self, address: u32, data: &[u8]) -> Result<()> {
+        if data.is_empty()
+            || data.len() > MAX_WRITE_BLOCK_SIZE
+            || !address.is_multiple_of(8)
+            || !data.len().is_multiple_of(8)
+        {
+            bail!("write block must be 8-byte aligned and at most {MAX_WRITE_BLOCK_SIZE} bytes");
         }
         validate_sdram_range(address, data.len(), "write")?;
+        let header = RamHeader::write(address / 8, (data.len() / 8) as u16)
+            .context("write address exceeds the protocol field")?;
+        let mut request = Vec::with_capacity(size_of::<RamHeader>() + data.len());
+        request.extend_from_slice(header.as_bytes());
+        request.extend_from_slice(data);
+        self.transport.write_all(&request).await?;
+        self.expect_ack("write").await
+    }
+}
 
-        let start_offset = (address % 8) as usize;
-        let aligned_address = address - start_offset as u32;
-        let aligned_len = (start_offset + data.len()).div_ceil(8) * 8;
-        let mut aligned = vec![0u8; aligned_len];
-
-        // Preserve bytes outside the requested range in the first and last
-        // bursts instead of silently overwriting them with padding.
-        if start_offset != 0 {
-            aligned[..8].copy_from_slice(&self.read_block(aligned_address, 8)?);
+#[maybe_async::maybe_async(?Send)]
+impl WriteSession<'_> {
+    pub(crate) async fn write_chunk(
+        &mut self,
+        data: &[u8],
+        mut progress: impl FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        if data.is_empty() {
+            bail!("write chunk is empty");
         }
-        let end_offset = start_offset + data.len();
-        if !end_offset.is_multiple_of(8) {
-            let last_offset = aligned_len - 8;
-            if last_offset != 0 || start_offset == 0 {
-                let last_address = aligned_address + last_offset as u32;
-                aligned[last_offset..].copy_from_slice(&self.read_block(last_address, 8)?);
-            }
-        }
-        aligned[start_offset..end_offset].copy_from_slice(data);
-
-        let total_blocks = aligned.len().div_ceil(BLOCK_SIZE);
-        for (block_num, chunk) in aligned.chunks(BLOCK_SIZE).enumerate() {
-            let block_address = aligned_address + (block_num * BLOCK_SIZE) as u32;
-            self.write_block(block_address, chunk).with_context(|| {
-                format!(
-                    "Block {}/{} at addr 0x{:06x}",
-                    block_num + 1,
-                    total_blocks,
-                    block_address
-                )
-            })?;
-
-            let chunk_start = block_num * BLOCK_SIZE;
-            let chunk_end = chunk_start + chunk.len();
-            let written_start = chunk_start.max(start_offset);
-            let written_end = chunk_end.min(end_offset);
-            if written_end > written_start {
-                progress(written_end - written_start);
-            }
+        if data.len() > self.remaining {
+            bail!(
+                "write chunk contains {} bytes, but only {} remain",
+                data.len(),
+                self.remaining
+            );
         }
 
+        self.device
+            .write_raw_with_progress(self.next_address, data, &mut progress)
+            .await?;
+        self.next_address += data.len() as u32;
+        self.remaining -= data.len();
         Ok(())
+    }
+
+    pub(crate) async fn finish(self, operation: Result<()>) -> Result<()> {
+        let operation = operation.and_then(|()| {
+            if self.remaining == 0 {
+                Ok(())
+            } else {
+                bail!("write ended with {} bytes remaining", self.remaining)
+            }
+        });
+        self.device
+            .finish_stopped(self.was_running, operation)
+            .await
+    }
+}
+
+#[cfg(feature = "cli")]
+impl FlashDevice {
+    /// Load is the one operation whose natural end state is running, even if
+    /// the emulator was stopped before the operation.
+    pub(crate) fn with_emulation_then_start<F, R>(&mut self, operation: F) -> Result<R>
+    where
+        F: FnOnce(&mut Self) -> Result<R>,
+    {
+        let capabilities = self.capabilities()?;
+        if !capabilities.emulation_control {
+            eprintln!(
+                "Note: FPGA protocol v{} has no START/STOP; assuming idle SPI bus.",
+                capabilities.version
+            );
+            return operation(self);
+        }
+
+        eprintln!("Stopping SPI emulation...");
+        self.stop_emulation()?;
+        let result = operation(self);
+        let restoration = self.start_emulation();
+        match (result, restoration) {
+            (Ok(value), Ok(())) => {
+                eprintln!("SPI emulation started; target can now read the loaded data.");
+                Ok(value)
+            }
+            (Ok(_), Err(error)) => {
+                Err(error.context("load completed, but SPI emulation could not be started"))
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(start_error)) => Err(error.context(format!(
+                "SPI emulation also could not be started: {start_error:#}"
+            ))),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cli"))]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    struct MockTransport {
+        reads: VecDeque<u8>,
+        writes: Rc<RefCell<Vec<Vec<u8>>>>,
+        connected: bool,
+    }
+
+    impl MockTransport {
+        fn new(reads: impl IntoIterator<Item = u8>) -> (Self, Rc<RefCell<Vec<Vec<u8>>>>) {
+            let writes = Rc::new(RefCell::new(Vec::new()));
+            (
+                Self {
+                    reads: reads.into_iter().collect(),
+                    writes: writes.clone(),
+                    connected: true,
+                },
+                writes,
+            )
+        }
+    }
+
+    #[maybe_async::maybe_async(?Send)]
+    impl Transport for MockTransport {
+        async fn write_all(&mut self, data: &[u8]) -> Result<()> {
+            self.writes.borrow_mut().push(data.to_vec());
+            Ok(())
+        }
+
+        async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
+            let count = buffer.len().min(self.reads.len());
+            for slot in &mut buffer[..count] {
+                *slot = self.reads.pop_front().unwrap();
+            }
+            Ok(count)
+        }
+
+        async fn disconnect(&mut self) -> Result<()> {
+            self.connected = false;
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+    }
+
+    #[test]
+    fn unsupported_protocol_is_rejected_before_commands_continue() {
+        let (transport, writes) = MockTransport::new([PROTOCOL_VERSION + 1]);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, None).unwrap();
+
+        let error = device.get_version().unwrap_err().to_string();
+
+        assert!(error.contains("unsupported protocol version"));
+        assert_eq!(&*writes.borrow(), &[vec![CMD_VERSION]]);
+    }
+
+    #[test]
+    fn shared_read_path_stops_and_restores_emulation() {
+        let data = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
+        let reads = [5, 1, 1].into_iter().chain(data).chain([1]);
+        let (transport, writes) = MockTransport::new(reads);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, None).unwrap();
+
+        assert_eq!(device.read(0, 8).unwrap(), data);
+        assert_eq!(
+            &*writes.borrow(),
+            &[
+                vec![CMD_VERSION],
+                vec![CMD_STATUS],
+                vec![CMD_STOP],
+                RamHeader::read(0, 1).unwrap().as_bytes().to_vec(),
+                vec![CMD_START],
+            ]
+        );
+    }
+
+    #[test]
+    fn cancelled_streaming_read_still_restores_emulation() {
+        let reads = [1, 1].into_iter().chain([0u8; 8]).chain([1]);
+        let (transport, writes) = MockTransport::new(reads);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+
+        let error = device
+            .read_chunks(0, 8, |_, _| bail!("cancelled by test"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cancelled by test"));
+        assert_eq!(writes.borrow().last(), Some(&vec![CMD_START]));
+    }
+
+    #[test]
+    fn cancelled_write_session_still_restores_emulation() {
+        let (transport, writes) = MockTransport::new([1, 1, 1, 1]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+
+        let mut session = device.begin_write(0, 16).unwrap();
+        session.write_chunk(&[0xaa; 8], |_| Ok(())).unwrap();
+        let error = session
+            .finish(Err(anyhow::anyhow!("cancelled by test")))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cancelled by test"));
+        assert_eq!(writes.borrow().last(), Some(&vec![CMD_START]));
     }
 }

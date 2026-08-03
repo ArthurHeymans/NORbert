@@ -4,12 +4,35 @@ version = "0.2.0"
 edition = "2024"
 description = "Tool for loading data into the Tang Primer 25K SPI Flash Emulator (UART + FT245)"
 
+[features]
+default = ["cli", "ftdi"]
+cli = [
+    "maybe-async/is_sync",
+    "dep:serialport",
+    "dep:clap",
+    "dep:indicatif",
+    "dep:rflasher-chips",
+    "dep:ctrlc",
+]
+ftdi = ["cli", "dep:ftdi-nusb", "ftdi-nusb/std", "dep:nusb"]
+# Reserved for the browser bindings added in the next change.
+wasm = []
+
 [dependencies]
-serialport = "4.9"
-ftdi = { package = "ftdi-nusb", version = "0.2.0" }
-clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"
-indicatif = "0.18"
-rflasher-chips = { git = "https://github.com/ArthurHeymans/rflasher.git", rev = "1879f3819cb4f3d9fde76447198346cae3e2b40d", features = ["static-chips"] }
-ctrlc = "3.5"
+ftdi-nusb = { version = "0.2", default-features = false, optional = true }
+nusb = { version = "0.2.7", optional = true }
 zerocopy = { version = "=0.8.55", features = ["derive"] }
+maybe-async = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+serialport = { version = "4.9", optional = true }
+clap = { version = "4.6", features = ["derive"], optional = true }
+indicatif = { version = "0.18", optional = true }
+rflasher-chips = { git = "https://github.com/ArthurHeymans/rflasher.git", rev = "1879f3819cb4f3d9fde76447198346cae3e2b40d", features = ["static-chips"], optional = true }
+ctrlc = { version = "3.5", optional = true }
+
+[[bin]]
+name = "spi-flash-tool"
+path = "src/main.rs"
+required-features = ["cli"]
