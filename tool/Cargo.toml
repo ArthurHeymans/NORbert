@@ -15,15 +15,67 @@ cli = [
     "dep:ctrlc",
 ]
 ftdi = ["cli", "dep:ftdi-nusb", "ftdi-nusb/std", "dep:nusb"]
-# Reserved for the browser bindings added in the next change.
-wasm = []
+wasm = [
+    "dep:async-trait",
+    "dep:ftdi-nusb",
+    "ftdi-nusb/wasm",
+    "dep:nusb",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+    "dep:js-sys",
+    "dep:gloo-timers",
+    "dep:futures-util",
+]
 
 [dependencies]
 anyhow = "1.0"
+async-trait = { version = "0.1.92", optional = true }
 ftdi-nusb = { version = "0.2", default-features = false, optional = true }
 nusb = { version = "0.2.7", optional = true }
 zerocopy = { version = "=0.8.55", features = ["derive"] }
+wasm-bindgen = { version = "0.2.127", optional = true }
+wasm-bindgen-futures = { version = "0.4.77", optional = true }
+js-sys = { version = "0.3.104", optional = true }
+gloo-timers = { version = "0.3", features = ["futures"], optional = true }
+futures-util = { version = "0.3.34", optional = true }
 maybe-async = "0.2"
+web-sys = { version = "0.3.104", optional = true, features = [
+    "Blob",
+    "File",
+    "Navigator",
+    "Window",
+    "WorkerNavigator",
+    "Serial",
+    "SerialOptions",
+    "SerialPort",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+    "Usb",
+    "UsbDevice",
+    "UsbConfiguration",
+    "UsbInterface",
+    "UsbAlternateInterface",
+    "UsbEndpoint",
+    "UsbDirection",
+    "UsbEndpointType",
+    "UsbControlTransferParameters",
+    "UsbDeviceFilter",
+    "UsbDeviceRequestOptions",
+    "UsbInTransferResult",
+    "UsbOutTransferResult",
+    "UsbIsochronousInTransferResult",
+    "UsbIsochronousOutTransferResult",
+    "UsbIsochronousInTransferPacket",
+    "UsbIsochronousOutTransferPacket",
+    "UsbTransferStatus",
+    "UsbRecipient",
+    "UsbRequestType",
+    "UsbConnectionEvent",
+    "UsbConnectionEventInit",
+] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 serialport = { version = "4.9", optional = true }
@@ -31,6 +83,9 @@ clap = { version = "4.6", features = ["derive"], optional = true }
 indicatif = { version = "0.18", optional = true }
 rflasher-chips = { git = "https://github.com/ArthurHeymans/rflasher.git", rev = "1879f3819cb4f3d9fde76447198346cae3e2b40d", features = ["static-chips"], optional = true }
 ctrlc = { version = "3.5", optional = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "spi-flash-tool"
