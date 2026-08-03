@@ -10,3 +10,9 @@ mod device;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod protocol;
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+mod web;
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub use web::WebFlashDevice;
