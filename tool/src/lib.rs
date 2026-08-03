@@ -4,6 +4,12 @@ compile_error!(
 );
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub mod chip;
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub mod sfdp;
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod device;
 

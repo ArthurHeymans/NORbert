@@ -51,9 +51,10 @@ If you have [Nix](https://nixos.org/) with flakes enabled, just enter the dev sh
 nix develop    # or let direnv handle it
 ```
 
-This provides the Gowin IDE (Education Edition), yosys, openFPGALoader, verilator, and the Rust toolchain.
+This provides the Gowin IDE (Education Edition), yosys, openFPGALoader, verilator, the Rust toolchain with the WebAssembly target, `wasm-bindgen-cli`, and Trunk for building and serving the Web UI.
 
 Without Nix, you'll need:
+
 - [Gowin IDE Education Edition](https://www.gowinsemi.com/en/support/home/) v1.9.11.03 (`gw_sh` on PATH)
 - [openFPGALoader](https://github.com/trabucayre/openFPGALoader)
 - [yosys](https://github.com/YosysHQ/yosys) (optional, for linting)
@@ -75,6 +76,50 @@ make tool
 ```
 
 This builds `spi-flash-tool` at `tool/target/release/spi-flash-tool`.
+
+The tool also exposes a WebAssembly library for browser frontends.
+`WebFlashDevice.requestUsb()` opens the FT2232H FT245 interface through WebUSB,
+while `WebFlashDevice.requestSerial()` opens the dock's 2 Mbaud UART through Web
+Serial. The returned device provides the same protocol operations for either
+transport, automatically stops and restores SPI emulation around RAM and
+configuration changes, and applies I/O timeouts. Browser
+frontends should prefer `read_chunks` and `write_file` for bounded-memory
+transfers with progress and cancellation callbacks. Check the WASM build with:
+
+```
+rustup target add wasm32-unknown-unknown
+cargo check --manifest-path tool/Cargo.toml \
+  --target wasm32-unknown-unknown --no-default-features --features wasm --lib
+```
+
+`WebFlashDevice.requestUsb()` and `WebFlashDevice.requestSerial()` must be called
+from a browser user gesture so the browser can display its device
+permission picker. Web Serial currently requires a Chromium-based browser and,
+like WebUSB, a secure context (HTTPS or localhost).
+
+A ready-to-use frontend is in `web/`. From the Nix development shell, build and
+serve it with Trunk:
+
+```sh
+make webui-serve
+```
+
+Without Nix, first install the WebAssembly target, Trunk, and the
+`wasm-bindgen-cli` version recorded in `tool/Cargo.lock`:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install trunk
+cargo install wasm-bindgen-cli --version 0.2.127
+make webui-serve
+```
+
+Open <http://localhost:8081> and choose either **Connect FT245 (WebUSB)** or
+**Connect UART (Web Serial)**. The UI uses the compiled-in rflasher database to
+search for and configure the emulated chip, and provides emulation control,
+verified SDRAM uploads and downloads, target-flash `#HOLD`, decoded live SPI
+activity monitoring, and full TOCTOU trap configuration. Browser device APIs
+are unavailable when opening `web/index.html` directly as a `file://` URL.
 
 ## Usage
 
@@ -264,7 +309,7 @@ while the parser is idle, and routes the response back to the same port.
 
 | Opcode | Name       | Args                                                | Reply                            |
 |--------|------------|-----------------------------------------------------|----------------------------------|
-| `0x30` | VERSION    | none                                                | 1 byte (current: `0x04`)         |
+| `0x30` | VERSION    | none                                                | 1 byte (current: `0x05`)         |
 | `0x31` | RAMREAD    | 3-byte burst addr + 2-byte burst count              | `count*8` data bytes             |
 | `0x32` | RAMWRITE   | 3-byte burst addr + 2-byte burst count + data       | `0x01`                           |
 | `0x33` | CHIPCONFIG | JEDEC(3) + flags + erase_bursts(3) + sfdp_len + sfdp| `0x01`                           |

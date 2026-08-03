@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>NORbert Control</title>
+    <link data-trunk rel="css" href="style.css">
+</head>
+<body>
+    <div id="loading">
+        <h1>NORbert Control</h1>
+        <div class="spinner"></div>
+        <p>Loading WebAssembly...</p>
+    </div>
+
+    <canvas id="norbert_canvas"></canvas>
+
+    <link data-trunk rel="rust" href="../tool/Cargo.toml" data-bin="norbert-web" data-cargo-no-default-features data-cargo-features="wasm" data-wasm-opt="s">
+
+    <script>
+        window.addEventListener("TrunkApplicationStarted", function () {
+            document.body.classList.add("loaded");
+        });
+    </script>
+</body>
+</html>

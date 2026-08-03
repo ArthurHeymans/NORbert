@@ -1,0 +1,12 @@
+[build]
+target = "web/index.html"
+dist = "dist"
+
+[watch]
+watch = ["tool/src", "tool/Cargo.toml", "tool/Cargo.lock", "web"]
+ignore = ["tool/target", "dist"]
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8081
+open = false
