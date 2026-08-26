@@ -20,6 +20,7 @@ enum Panel {
     Device,
     Activity,
     Toctou,
+    Wiring,
 }
 
 #[derive(Default)]
@@ -1089,8 +1090,10 @@ impl eframe::App for NorbertWebApp {
                 ui.selectable_value(&mut self.panel, Panel::Device, "Device");
                 ui.selectable_value(&mut self.panel, Panel::Activity, "Activity");
                 ui.selectable_value(&mut self.panel, Panel::Toctou, "TOCTOU");
+                ui.selectable_value(&mut self.panel, Panel::Wiring, "Wiring");
             });
         });
+        set_wiring_visible(self.panel == Panel::Wiring);
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             let state = self.state.borrow();
             let color = if state.status_error {
@@ -1104,6 +1107,7 @@ impl eframe::App for NorbertWebApp {
             Panel::Device => self.device_panel(ui, ctx),
             Panel::Activity => self.activity_panel(ui, ctx),
             Panel::Toctou => self.toctou_panel(ui, ctx),
+            Panel::Wiring => {}
         });
         if self.state.borrow().busy
             || matches!(self.state.borrow().connection, ConnectionState::Connecting)
@@ -1111,6 +1115,22 @@ impl eframe::App for NorbertWebApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
+}
+
+fn set_wiring_visible(visible: bool) {
+    let Some(body) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.body())
+    else {
+        return;
+    };
+
+    let classes = body.class_list();
+    let _ = if visible {
+        classes.add_1("wiring-open")
+    } else {
+        classes.remove_1("wiring-open")
+    };
 }
 
 fn decode_log_packets(state: &mut SharedState, data: &[u8]) {

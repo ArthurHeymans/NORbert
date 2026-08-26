@@ -43,3 +43,295 @@ html, body {
 body.loaded #loading {
     display: none;
 }
+
+#wiring-schematic {
+    --data: #4aa8ff;
+    --control: #f2a93b;
+    --spi: #74c991;
+    position: fixed;
+    z-index: 2;
+    inset: 45px 0 29px;
+    display: none;
+    box-sizing: border-box;
+    overflow: auto;
+    padding: 24px clamp(18px, 4vw, 48px) 48px;
+    color: #e8e8e8;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+body.wiring-open #wiring-schematic {
+    display: block;
+}
+
+#wiring-schematic h1 {
+    margin: 0;
+    font-size: 24px;
+    font-weight: 600;
+}
+
+.wiring-subtitle {
+    margin: 4px 0 22px;
+    color: #9a9a9a;
+    font-size: 14px;
+}
+
+.tang-dock {
+    position: relative;
+    width: min(1040px, 100%);
+    min-width: 820px;
+    margin: 0 auto;
+    padding: 18px;
+    box-sizing: border-box;
+    border: 2px solid #59615d;
+    border-radius: 8px;
+    background: #202927;
+    box-shadow: 0 10px 22px rgba(0, 0, 0, 0.22);
+}
+
+.sdram-module {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    width: 500px;
+    height: 92px;
+    margin: 0 auto 10px;
+    box-sizing: border-box;
+    padding: 13px 16px;
+    border: 1px solid #4b5551;
+    background: #242a29;
+}
+
+.memory-chip {
+    display: grid;
+    place-items: center;
+    border: 1px solid #555b59;
+    color: #7f8784;
+    background: #171918;
+    font: 9px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.dock-main {
+    position: relative;
+    width: 500px;
+    height: 205px;
+    margin: auto;
+    border: 1px solid #38423f;
+    background: #25302d;
+}
+
+.usb-host {
+    position: absolute;
+    top: 52px;
+    left: -9px;
+    display: grid;
+    place-items: center;
+    width: 60px;
+    height: 76px;
+    border: 2px solid #aeb5b2;
+    border-radius: 3px;
+    color: #292929;
+    background: #c9cecc;
+    font-size: 9px;
+    font-weight: 800;
+}
+
+.tang-core {
+    position: absolute;
+    top: 42px;
+    left: 50%;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    width: 170px;
+    height: 116px;
+    box-sizing: border-box;
+    padding: 16px;
+    border: 2px solid #d4b65e;
+    border-radius: 6px;
+    color: #e8e2c9;
+    background: #1c2422;
+    transform: translateX(-50%) rotate(-1deg);
+}
+
+.tang-core small { font-weight: 700; }
+
+.tang-core strong {
+    font-size: 20px;
+    letter-spacing: 0.06em;
+}
+
+.tang-core em {
+    padding: 2px 4px;
+    border: 1px solid #e8e2c9;
+    font-size: 11px;
+    font-style: normal;
+}
+
+.dock-controls {
+    position: absolute;
+    top: 12px;
+    right: 10px;
+    display: grid;
+    justify-items: center;
+    gap: 9px;
+}
+
+.button {
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border: 2px solid #aeb4b1;
+    border-radius: 4px;
+    color: #777;
+    background: #e0e3e2;
+    font-size: 8px;
+}
+
+.usb-c {
+    display: grid;
+    place-items: center;
+    width: 39px;
+    height: 18px;
+    margin-top: 8px;
+    border: 2px solid #aeb4b1;
+    border-radius: 5px;
+    color: #222;
+    background: #cbd0ce;
+    font-size: 7px;
+    font-weight: 800;
+}
+
+.pmod-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 28px;
+}
+
+.pmod-card {
+    min-width: 0;
+    padding: 12px;
+    border: 1px solid #444d49;
+    border-radius: 6px;
+    background: rgba(15, 18, 17, 0.38);
+}
+
+.pmod-card h2 {
+    margin: 0 0 9px;
+    color: #e5e8e6;
+    font: 700 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.pmod-card h2 small {
+    margin-left: 5px;
+    color: #999f9c;
+    font-size: 10px;
+    font-weight: 500;
+}
+
+.pmod {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(30px, 1fr));
+    gap: 8px;
+    padding: 11px;
+    border: 2px solid #080909;
+    border-radius: 4px;
+    background: #111313;
+}
+
+.pin {
+    display: grid;
+    place-items: center;
+    aspect-ratio: 1;
+    box-sizing: border-box;
+    border: 2px solid #5c625f;
+    border-radius: 50%;
+    color: #bcc2bf;
+    background: #070808;
+    font: 9px ui-monospace, SFMono-Regular, Menlo, monospace;
+    cursor: default;
+    transition: border-color 100ms, box-shadow 100ms, color 100ms;
+}
+
+.pmod-ft-data .pin:not(.power) { --pin-color: var(--data); }
+.pmod-ft-control .pin:not(.power):not(.spare) { --pin-color: var(--control); }
+.pmod-spi .pin:not(.power) { --pin-color: var(--spi); }
+.pin.power { --pin-color: #b1b1b1; }
+.pin.spare { --pin-color: #777; }
+
+.pin:hover {
+    border-color: var(--pin-color);
+    color: #fff;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--pin-color) 25%, transparent);
+}
+
+.pin-legend {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 5px;
+    margin: 10px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.pin-legend li {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 36px;
+    padding: 3px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: #aeb3b0;
+    font-size: 8px;
+    text-align: center;
+    transition: border-color 100ms, background-color 100ms, color 100ms;
+}
+
+.pin-legend b {
+    color: #777d7a;
+    font: 700 9px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.pin-legend span {
+    font-weight: 700;
+    line-height: 1.1;
+}
+
+.pmod-card:has(.pin:nth-child(1):hover) .pin-legend li:nth-child(1),
+.pmod-card:has(.pin:nth-child(2):hover) .pin-legend li:nth-child(2),
+.pmod-card:has(.pin:nth-child(3):hover) .pin-legend li:nth-child(3),
+.pmod-card:has(.pin:nth-child(4):hover) .pin-legend li:nth-child(4),
+.pmod-card:has(.pin:nth-child(5):hover) .pin-legend li:nth-child(5),
+.pmod-card:has(.pin:nth-child(6):hover) .pin-legend li:nth-child(6),
+.pmod-card:has(.pin:nth-child(7):hover) .pin-legend li:nth-child(7),
+.pmod-card:has(.pin:nth-child(8):hover) .pin-legend li:nth-child(8),
+.pmod-card:has(.pin:nth-child(9):hover) .pin-legend li:nth-child(9),
+.pmod-card:has(.pin:nth-child(10):hover) .pin-legend li:nth-child(10),
+.pmod-card:has(.pin:nth-child(11):hover) .pin-legend li:nth-child(11),
+.pmod-card:has(.pin:nth-child(12):hover) .pin-legend li:nth-child(12) {
+    border-color: var(--pin-color, #aaa);
+    color: #fff;
+    background: rgba(255, 255, 255, 0.07);
+}
+
+.pmod-ft-data { --pin-color: var(--data); }
+.pmod-ft-control { --pin-color: var(--control); }
+.pmod-spi { --pin-color: var(--spi); }
+
+.dock-label {
+    margin-top: 13px;
+    color: #d8ddd9;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-align: center;
+}
+
+@media (max-width: 900px) {
+    .tang-dock {
+        margin: 0;
+    }
+}

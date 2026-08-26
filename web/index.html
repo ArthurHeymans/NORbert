@@ -15,6 +15,69 @@
 
     <canvas id="norbert_canvas"></canvas>
 
+    <section id="wiring-schematic" aria-labelledby="wiring-title">
+        <h1 id="wiring-title">Dock pinout</h1>
+        <p class="wiring-subtitle">Hover a numbered PMOD pin to highlight its assignment.</p>
+
+        <article class="tang-dock" aria-label="Tang Primer 25K Dock pinout">
+            <div class="sdram-module">
+                <div class="memory-chip">SDRAM</div>
+                <div class="memory-chip">SDRAM</div>
+            </div>
+            <div class="dock-main">
+                <div class="usb-host">USB</div>
+                <div class="tang-core">
+                    <small>Sipeed</small>
+                    <strong>TANG <em>25K</em></strong>
+                </div>
+                <div class="dock-controls">
+                    <span class="button">S0</span>
+                    <span class="button">S1</span>
+                    <span class="usb-c">USB-C</span>
+                </div>
+            </div>
+
+            <div class="pmod-row">
+                <section class="pmod-card pmod-ft-data">
+                    <h2>J7 <small>FT245 data</small></h2>
+                    <div class="pmod" aria-label="J7 FT245 data PMOD">
+                        <span class="pin power">3V3</span><span class="pin power">GND</span><span class="pin">H5</span><span class="pin">H8</span><span class="pin">G7</span><span class="pin">F5</span>
+                        <span class="pin power">3V3</span><span class="pin power">GND</span><span class="pin">J5</span><span class="pin">H7</span><span class="pin">G8</span><span class="pin">G5</span>
+                    </div>
+                    <ol class="pin-legend">
+                        <li><b>3V3</b><span>3V3</span></li><li><b>GND</b><span>GND</span></li><li><b>H5</b><span>D0</span></li><li><b>H8</b><span>D1</span></li><li><b>G7</b><span>D2</span></li><li><b>F5</b><span>D3</span></li>
+                        <li><b>3V3</b><span>3V3</span></li><li><b>GND</b><span>GND</span></li><li><b>J5</b><span>D7</span></li><li><b>H7</b><span>D4</span></li><li><b>G8</b><span>D5</span></li><li><b>G5</b><span>D6</span></li>
+                    </ol>
+                </section>
+
+                <section class="pmod-card pmod-ft-control">
+                    <h2>J6 <small>FT245 control</small></h2>
+                    <div class="pmod" aria-label="J6 FT245 control PMOD">
+                        <span class="pin power">3V3</span><span class="pin power">GND</span><span class="pin">L5</span><span class="pin">K11</span><span class="pin">E11</span><span class="pin">A11</span>
+                        <span class="pin power">3V3</span><span class="pin power">GND</span><span class="pin spare">K5</span><span class="pin spare">L11</span><span class="pin spare">E10</span><span class="pin spare">A10</span>
+                    </div>
+                    <ol class="pin-legend">
+                        <li><b>3V3</b><span>3V3</span></li><li><b>GND</b><span>GND</span></li><li><b>L5</b><span>WR#</span></li><li><b>K11</b><span>RD#</span></li><li><b>E11</b><span>TXE#</span></li><li><b>A11</b><span>RXF#</span></li>
+                        <li><b>3V3</b><span>3V3</span></li><li><b>GND</b><span>GND</span></li><li><b>K5</b><span>spare</span></li><li><b>L11</b><span>spare</span></li><li><b>E10</b><span>spare</span></li><li><b>A10</b><span>spare</span></li>
+                    </ol>
+                </section>
+
+                <section class="pmod-card pmod-spi">
+                    <h2>J5 <small>SPI flash · USB-C side</small></h2>
+                    <div class="pmod" aria-label="J5 SPI flash PMOD">
+                        <span class="pin power">3V3</span><span class="pin power">GND</span><span class="pin">C11</span><span class="pin">B11</span><span class="pin">D11</span><span class="pin">G11</span>
+                        <span class="pin power">3V3</span><span class="pin power">GND</span><span class="pin">C10</span><span class="pin">B10</span><span class="pin">D10</span><span class="pin">G10</span>
+                    </div>
+                    <ol class="pin-legend">
+                        <li><b>3V3</b><span>3V3</span></li><li><b>GND</b><span>GND</span></li><li><b>C11</b><span>IO1 / MISO</span></li><li><b>B11</b><span>IO0 / MOSI</span></li><li><b>D11</b><span>CLK</span></li><li><b>G11</b><span>CS#</span></li>
+                        <li><b>3V3</b><span>3V3</span></li><li><b>GND</b><span>GND</span></li><li><b>C10</b><span>DEBUG</span></li><li><b>B10</b><span>POWER</span></li><li><b>D10</b><span>IO3 / HOLD#</span></li><li><b>G10</b><span>IO2 / WP#</span></li>
+                    </ol>
+                </section>
+            </div>
+            <div class="dock-label">Tang Primer 25K Dock</div>
+        </article>
+    </section>
+
     <link data-trunk rel="rust" href="../tool/Cargo.toml" data-bin="norbert-web" data-cargo-no-default-features data-cargo-features="wasm" data-wasm-opt="s">
 
     <script>
