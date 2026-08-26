@@ -48,6 +48,7 @@ body.loaded #loading {
     --data: #4aa8ff;
     --control: #f2a93b;
     --spi: #74c991;
+
     position: fixed;
     z-index: 2;
     inset: 45px 0 29px;

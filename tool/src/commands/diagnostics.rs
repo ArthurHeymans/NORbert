@@ -4,27 +4,10 @@ use super::*;
 // Probe command -- ftdi-nusb backend
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "ftdi")]
 pub(super) fn cmd_probe(cli: &Cli) -> Result<()> {
-    // Open FT2232H via rs-ftdi
     eprintln!("Opening FT2232H for probe (ftdi-nusb)...");
-    let serial = cli.ft_serial.as_deref();
-    let mut dev = if let Some(sn) = serial {
-        let filter = ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).serial(sn);
-        ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
-            .with_context(|| format!("No FT2232H with serial '{}'", sn))?
-    } else {
-        let filter =
-            ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).description("NORbert FT245");
-        ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
-            .or_else(|_| {
-                ftdi_nusb::FtdiDevice::open_with_interface(
-                    FTDI_VID,
-                    FT2232H_PID,
-                    ftdi_nusb::Interface::A,
-                )
-            })
-            .context("No FT2232H found")?
-    };
+    let mut dev = crate::transport::open_ft2232h(cli.ft_serial.as_deref())?;
 
     dev.usb_reset().context("FT2232H reset failed")?;
     dev.flush_all().context("FT2232H flush failed")?;
@@ -51,7 +34,7 @@ pub(super) fn cmd_probe(cli: &Cli) -> Result<()> {
         (0xFF, "non-command 0xFF", None),
     ];
 
-    println!("FT245 probe (rs-ftdi): send 1 byte, wait 200ms, read back\n");
+    println!("FT245 probe (ftdi-nusb): send 1 byte, wait 200ms, read back\n");
     println!("{:<30} {:>4}   {:>8}  Response", "Test", "Sent", "Expected");
     println!("{}", "-".repeat(70));
 
@@ -150,6 +133,7 @@ pub(super) fn cmd_probe(cli: &Cli) -> Result<()> {
 // FT-list command
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "ftdi")]
 pub(super) fn cmd_ft_list() -> Result<()> {
     let devices = ftdi_nusb::find_devices(FTDI_VID, FT2232H_PID)
         .map_err(|e| anyhow!(e))
@@ -167,16 +151,27 @@ pub(super) fn cmd_ft_list() -> Result<()> {
     println!("FT2232H devices ({} found):", devices.len());
     for (i, dev) in devices.iter().enumerate() {
         println!(
-            "  [{}] bus={} addr={} vid={:04x} pid={:04x}",
+            "  [{}] bus={} addr={} vid={:04x} pid={:04x} serial={}",
             i,
             dev.busnum(),
             dev.device_address(),
             dev.vendor_id(),
             dev.product_id(),
+            dev.serial_number().unwrap_or("<unavailable>"),
         );
     }
     println!();
     println!("Use --ft-serial <SERIAL> to select a specific device.");
     println!("Channel A is used by default for async FIFO.");
     Ok(())
+}
+
+#[cfg(not(feature = "ftdi"))]
+pub(super) fn cmd_probe(_cli: &Cli) -> Result<()> {
+    bail!("probe requires the 'ftdi' feature (build with --features ftdi)")
+}
+
+#[cfg(not(feature = "ftdi"))]
+pub(super) fn cmd_ft_list() -> Result<()> {
+    bail!("ft-list requires the 'ftdi' feature (build with --features ftdi)")
 }

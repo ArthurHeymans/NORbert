@@ -46,7 +46,7 @@ struct SharedState {
     status: String,
     status_error: bool,
     pending_file: Option<(String, File)>,
-    read_data: Option<Vec<u8>>,
+    read_data: Option<(u32, Vec<u8>)>,
     log_output: String,
     log_pending: Vec<u8>,
     log_txn_count: u32,
@@ -467,7 +467,7 @@ impl NorbertWebApp {
             shared.busy = false;
             match result {
                 Ok(data) => {
-                    shared.read_data = Some(data);
+                    shared.read_data = Some((address, data));
                     shared.status = "Download complete".to_owned();
                     shared.status_error = false;
                 }
@@ -907,7 +907,7 @@ impl NorbertWebApp {
                     self.read_memory(address.unwrap(), length.unwrap(), ctx);
                 }
             });
-            if let Some(data) = self.state.borrow().read_data.as_ref() {
+            if let Some((base, data)) = self.state.borrow().read_data.as_ref() {
                 ui.horizontal(|ui| {
                     ui.label(format!("{} bytes ready", data.len()));
                     if ui.button("Save As...").clicked() {
@@ -917,7 +917,7 @@ impl NorbertWebApp {
                 egui::ScrollArea::vertical()
                     .max_height(180.0)
                     .show(ui, |ui| {
-                        ui.code(hex_dump(&data[..data.len().min(4096)], 0));
+                        ui.code(hex_dump(&data[..data.len().min(4096)], *base));
                     });
             }
         }
@@ -1330,8 +1330,14 @@ fn save_file(data: &[u8], filename: &str) {
     let link: HtmlAnchorElement = document.create_element("a").unwrap().dyn_into().unwrap();
     link.set_href(&url);
     link.set_download(filename);
+    let body = document.body().unwrap();
+    body.append_child(&link).unwrap();
     link.click();
-    Url::revoke_object_url(&url).unwrap();
+    body.remove_child(&link).unwrap();
+    spawn_local(async move {
+        TimeoutFuture::new(1_000).await;
+        let _ = Url::revoke_object_url(&url);
+    });
 }
 
 fn main() {

@@ -56,7 +56,7 @@ ftdi-setup:
 	@echo ""
 	@echo "EEPROM programmed. Unplug and replug the FT2232H now."
 
-# Build the spi-flash-tool (default: rs-ftdi backend, pure Rust)
+# Build the spi-flash-tool (default: ftdi-nusb backend, pure Rust)
 tool:
 	cargo build --release --manifest-path tool/Cargo.toml
 	@echo "Tool built: tool/target/release/spi-flash-tool"

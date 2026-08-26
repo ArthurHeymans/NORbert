@@ -68,6 +68,7 @@ impl SerialTransport {
         // stray that arrives *after* the reply (it would be seen as
         // the last byte on the first attempt, forcing a retry).
         const SYNC_ATTEMPTS: u32 = 5;
+        let mut last_unsupported = None;
         for attempt in 0..SYNC_ATTEMPTS {
             port.write_all(&[CMD_VERSION])?;
             port.flush().ok();
@@ -103,14 +104,20 @@ impl SerialTransport {
                     }
                     return Ok(Self { port });
                 }
+                Some(v) if v != 0x00 && v != 0xff => last_unsupported = Some(v),
                 _ => {} // keep trying
             }
         }
-        bail!(
-            "Failed to sync with FPGA on {} after {} attempts (only saw 0x00/0xFF junk)",
-            port_name,
-            SYNC_ATTEMPTS
-        );
+        match last_unsupported {
+            Some(version) => bail!(
+                "Failed to sync with FPGA on {port_name}: unsupported protocol version {version}"
+            ),
+            None => bail!(
+                "Failed to sync with FPGA on {} after {} attempts (only saw 0x00/0xFF junk)",
+                port_name,
+                SYNC_ATTEMPTS
+            ),
+        }
     }
 }
 
@@ -139,6 +146,28 @@ impl Transport for SerialTransport {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "ftdi")]
+pub(crate) fn open_ft2232h(serial: Option<&str>) -> Result<ftdi_nusb::FtdiDevice> {
+    if let Some(serial) = serial {
+        let filter = ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).serial(serial);
+        return ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
+            .with_context(|| format!("No FT2232H with serial '{serial}'"));
+    }
+
+    // DeviceFilter matches the USB product string configured in ft2232h.conf;
+    // the interface is selected separately below.
+    let filter = ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).description("NORbert FT245");
+    ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
+        .or_else(|_| {
+            ftdi_nusb::FtdiDevice::open_with_interface(
+                FTDI_VID,
+                FT2232H_PID,
+                ftdi_nusb::Interface::A,
+            )
+        })
+        .context("No FT2232H found")
+}
+
+#[cfg(feature = "ftdi")]
 pub(crate) struct Ft245Transport {
     dev: ftdi_nusb::FtdiDevice,
 }
@@ -146,27 +175,9 @@ pub(crate) struct Ft245Transport {
 #[cfg(feature = "ftdi")]
 impl Ft245Transport {
     pub(crate) fn open(serial: Option<&str>) -> Result<Self> {
-        // Open the FT2232H Channel A.  The EEPROM must already be
-        // configured for "245 FIFO" mode.
-        let mut dev = if let Some(sn) = serial {
-            let filter = ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).serial(sn);
-            ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
-                .with_context(|| format!("No FT2232H with serial '{}'", sn))?
-        } else {
-            // Try to find by description first
-            let filter =
-                ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).description("NORbert FT245");
-            ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
-                .or_else(|_| {
-                    // Fall back to opening any FT2232H on interface A
-                    ftdi_nusb::FtdiDevice::open_with_interface(
-                        FTDI_VID,
-                        FT2232H_PID,
-                        ftdi_nusb::Interface::A,
-                    )
-                })
-                .context("No FT2232H found")?
-        };
+        // Open the FT2232H Channel A. The EEPROM must already be configured
+        // for "245 FIFO" mode.
+        let mut dev = open_ft2232h(serial)?;
 
         // Reset the FT2232H's internal state and flush FIFOs.
         dev.usb_reset().context("FT2232H reset failed")?;

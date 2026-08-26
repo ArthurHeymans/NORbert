@@ -39,7 +39,7 @@ NORbert exposes the SPI flash interface on the **PMOD J5** connector of the Tang
 | `GND`      | —        | 10          | Ground                             |
 | `VCC`      | —        | 9           | 3.3V Power                         |
 
-*Note: D3 and `#HOLD#` share the physical IO3 pin. Asserting `#HOLD` drives it low to silence a real flash on a shared bus. Consult the `.lpf` constraint file for exact pin assignments.*
+*Note: D3 and `#HOLD#` share the physical IO3 pin. Asserting `#HOLD` drives it low to silence a real flash on a shared bus. Consult `tangprimer25k.cst` for exact pin assignments.*
 
 ## Building
 
@@ -47,7 +47,7 @@ NORbert exposes the SPI flash interface on the **PMOD J5** connector of the Tang
 
 If you have [Nix](https://nixos.org/) with flakes enabled, just enter the dev shell:
 
-```
+```sh
 nix develop    # or let direnv handle it
 ```
 
@@ -63,7 +63,7 @@ Without Nix, you'll need:
 
 ### FPGA bitstream
 
-```
+```sh
 make build                  # synthesize + place & route
 make prog                   # program FPGA (volatile, lost on power cycle)
 make flash                  # program to flash (persistent)
@@ -71,7 +71,7 @@ make flash                  # program to flash (persistent)
 
 ### Host tool
 
-```
+```sh
 make tool
 ```
 
@@ -86,7 +86,7 @@ configuration changes, and applies I/O timeouts. Browser
 frontends should prefer `read_chunks` and `write_file` for bounded-memory
 transfers with progress and cancellation callbacks. Check the WASM build with:
 
-```
+```sh
 rustup target add wasm32-unknown-unknown
 cargo check --manifest-path tool/Cargo.toml \
   --target wasm32-unknown-unknown --no-default-features --features wasm --lib
@@ -125,7 +125,7 @@ are unavailable when opening `web/index.html` directly as a `file://` URL.
 
 Load a firmware image into NORbert's SDRAM, then let your target SPI master read it back as if it were a real flash chip.
 
-```
+```sh
 # Check connection
 spi-flash-tool version
 spi-flash-tool status       # running | stopped
@@ -163,13 +163,13 @@ Use `-p /dev/ttyUSBx` if your device isn't on the default `/dev/ttyUSB0`.
 
 `monitor` streams decoded SPI activity from NORbert in real time. It works over either UART or FT245 and is safe to run while the target is actively reading:
 
-```
+```sh
 spi-flash-tool monitor
 ```
 
 Example output while flashprog reads a 4 KB region:
 
-```
+```text
 TXN#   COMMAND            ADDRESS    INFO
 ------------------------------------------------------------
 1      0x9F READ_JEDEC_ID
@@ -185,7 +185,7 @@ The monitor also tracks double-reads of the same (opcode, address) pair and flag
 
 Four independent trap entries redirect matching reads to a different SDRAM location on the second (and subsequent) access. The first matching read is let through unchanged -- it arms the trap. The first 8 bytes of the redirected read come from the original address because the SDRAM prefetch pipeline fires before the trap check completes; bytes 8+ come from the replacement.
 
-```
+```sh
 # Configure: any read in 0x001000-0x001FFF gets redirected to 0x101000-0x101FFF
 spi-flash-tool toctou set 1 0x001000 0xFFF000 0x101000
 spi-flash-tool toctou arm 1
@@ -210,7 +210,7 @@ When NORbert shares a SPI bus with a real flash chip, `hold on` drives IO3 low c
 
 For much faster bulk transfers (~5 MB/s vs ~200 KB/s over UART), connect an FT2232H module and use `--ft245`:
 
-```
+```sh
 # List connected FT2232H devices
 spi-flash-tool ft-list
 
@@ -283,7 +283,7 @@ commands (0xBB, 0xEB) use fewer SPI clocks for the address, leaving less headroo
 
 ## Project structure
 
-```
+```text
 src/
   top.v        Top-level module, clock/reset, bus wiring, TOCTOU address mux
   spi_trx.v    SPI flash transceiver (command decoder + data path)
