@@ -9,7 +9,7 @@ use crate::cli::{Cli, HoldState, ToctouAction};
 use crate::device::FlashDevice;
 use crate::protocol::*;
 use crate::sfdp;
-#[cfg(any(feature = "d2xx", feature = "ftdi"))]
+#[cfg(feature = "ftdi")]
 use crate::transport::{FT2232H_PID, FTDI_VID};
 use anyhow::{Context, Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -50,20 +50,13 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 
 fn open_device(cli: &Cli) -> Result<FlashDevice> {
     if cli.ft245 {
-        #[cfg(any(feature = "d2xx", feature = "ftdi"))]
+        #[cfg(feature = "ftdi")]
         {
-            let backend = if cfg!(feature = "d2xx") {
-                "D2XX"
-            } else {
-                "rs-ftdi"
-            };
-            eprintln!("Opening FT2232H in async FIFO mode ({})...", backend);
+            eprintln!("Opening FT2232H in async FIFO mode (ftdi-nusb)...");
             return FlashDevice::open_ft245(cli.ft_serial.as_deref());
         }
-        #[cfg(not(any(feature = "d2xx", feature = "ftdi")))]
-        bail!(
-            "--ft245 requires the 'd2xx' or 'ftdi' feature (build with --features d2xx, --features ftdi, or --no-default-features --features d2xx)"
-        );
+        #[cfg(not(feature = "ftdi"))]
+        bail!("--ft245 requires the 'ftdi' feature (enabled by default)");
     }
     FlashDevice::open_serial(&cli.port)
 }

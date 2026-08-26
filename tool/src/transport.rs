@@ -1,12 +1,12 @@
 use crate::protocol::CMD_VERSION;
-#[cfg(all(feature = "ftdi", not(feature = "d2xx")))]
+#[cfg(feature = "ftdi")]
 use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use serialport::SerialPort;
 use std::io::{Read, Write};
 use std::thread;
 use std::time::Duration;
-#[cfg(any(feature = "d2xx", feature = "ftdi"))]
+#[cfg(feature = "ftdi")]
 use std::time::Instant;
 
 const BAUD_RATE: u32 = 2_000_000;
@@ -26,9 +26,9 @@ pub(crate) const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
 pub(crate) const SDRAM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
 // FT2232H USB identifiers
-#[cfg(any(feature = "d2xx", feature = "ftdi"))]
+#[cfg(feature = "ftdi")]
 pub(crate) const FTDI_VID: u16 = 0x0403;
-#[cfg(any(feature = "d2xx", feature = "ftdi"))]
+#[cfg(feature = "ftdi")]
 pub(crate) const FT2232H_PID: u16 = 0x6010;
 
 // ---------------------------------------------------------------------------
@@ -143,110 +143,19 @@ impl Transport for SerialTransport {
 }
 
 // ---------------------------------------------------------------------------
-// FT245 transport -- D2XX backend (FTDI's proprietary driver)
+// FT245 transport -- ftdi-nusb backend (pure Rust)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "d2xx")]
-pub(crate) struct Ft245Transport {
-    ft: libftd2xx::Ft2232h,
-}
-
-#[cfg(feature = "d2xx")]
-impl Ft245Transport {
-    pub(crate) fn open(serial: Option<&str>) -> Result<Self> {
-        use libftd2xx::FtdiCommon;
-
-        // FT2232H EEPROM must be configured for "245 FIFO" on Channel A
-        // (one-time setup using FT_PROG).  No special BitMode is needed
-        // for async FIFO -- just open, reset, and read/write.
-        let mut ft = if let Some(sn) = serial {
-            libftd2xx::Ft2232h::with_serial_number(sn)
-                .with_context(|| format!("No FT2232H with serial '{}'", sn))?
-        } else {
-            // Default: open Channel A by its standard description.
-            // If EEPROM was reprogrammed with a custom description,
-            // use --ft-serial to select by serial number instead.
-            libftd2xx::Ft2232h::with_description("NORbert FT245 A")
-                .context("No FT2232H found (looking for 'NORbert FT245 A')")?
-        };
-
-        ft.reset().context("FT2232H reset failed")?;
-        ft.purge_all().context("FT2232H purge failed")?;
-
-        // Set USB transfer size for bulk throughput
-        ft.set_usb_parameters(65536)
-            .context("Failed to set USB parameters")?;
-
-        // Minimum latency timer -- each ACK/response byte sits in the
-        // FT2232H TX FIFO until either a full USB packet fills or this
-        // timer fires.  1ms is the FT2232H minimum.
-        ft.set_latency_timer(Duration::from_millis(1))
-            .context("Failed to set latency timer")?;
-
-        // D2XX read/write timeouts (prevents infinite blocking)
-        ft.set_timeouts(Duration::from_secs(5), Duration::from_secs(5))
-            .context("Failed to set timeouts")?;
-
-        // The USB reset can glitch the FT2232H data bus, injecting
-        // garbage bytes into the FPGA's protocol parser.  Wait 5ms
-        // (covers USB reset settling + FPGA idle timeout of ~546µs).
-        thread::sleep(Duration::from_millis(5));
-        ft.purge_all().ok();
-
-        let mut trash = [0u8; 4096];
-        loop {
-            let n = ft.queue_status().context("Failed to query queue status")?;
-            if n == 0 {
-                break;
-            }
-            let to_read = std::cmp::min(n, trash.len());
-            let _ = ft.read(&mut trash[..to_read]);
-        }
-
-        Ok(Self { ft })
-    }
-}
-
-#[cfg(feature = "d2xx")]
-impl Transport for Ft245Transport {
-    fn write_all(&mut self, data: &[u8]) -> Result<()> {
-        use libftd2xx::FtdiCommon;
-        self.ft.write_all(data)?;
-        Ok(())
-    }
-
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        use libftd2xx::FtdiCommon;
-        let mut pos = 0;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pos < buf.len() {
-            if Instant::now() > deadline {
-                bail!("FT245 read timeout: got {} of {} bytes", pos, buf.len());
-            }
-            let n = self.ft.read(&mut buf[pos..])?;
-            if n == 0 {
-                thread::sleep(Duration::from_micros(100));
-            }
-            pos += n;
-        }
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FT245 transport -- rs-ftdi backend (pure Rust, nusb)
-// ---------------------------------------------------------------------------
-
-#[cfg(all(feature = "ftdi", not(feature = "d2xx")))]
+#[cfg(feature = "ftdi")]
 pub(crate) struct Ft245Transport {
     dev: ftdi::FtdiDevice,
 }
 
-#[cfg(all(feature = "ftdi", not(feature = "d2xx")))]
+#[cfg(feature = "ftdi")]
 impl Ft245Transport {
     pub(crate) fn open(serial: Option<&str>) -> Result<Self> {
         // Open the FT2232H Channel A.  The EEPROM must already be
-        // configured for "245 FIFO" mode (same as the D2XX path).
+        // configured for "245 FIFO" mode.
         let mut dev = if let Some(sn) = serial {
             let filter = ftdi::DeviceFilter::new(FTDI_VID, FT2232H_PID).serial(sn);
             ftdi::FtdiDevice::open_with_filter(&filter, ftdi::Interface::A)
@@ -302,7 +211,7 @@ impl Ft245Transport {
     }
 }
 
-#[cfg(all(feature = "ftdi", not(feature = "d2xx")))]
+#[cfg(feature = "ftdi")]
 impl Transport for Ft245Transport {
     fn write_all(&mut self, data: &[u8]) -> Result<()> {
         self.dev.write_all(data).map_err(|e| anyhow!(e))?;

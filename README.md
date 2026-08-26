@@ -41,7 +41,7 @@ Without Nix, you'll need:
 - [openFPGALoader](https://github.com/trabucayre/openFPGALoader)
 - [yosys](https://github.com/YosysHQ/yosys) (optional, for linting)
 - Rust toolchain (for the host tool)
-- FTDI D2XX driver/library (only if using FT245 transport)
+
 
 ### FPGA bitstream
 
@@ -162,7 +162,7 @@ spi-flash-tool --ft245 configure W25Q128JV --chips-dir ~/src/rflasher/chips/vend
 spi-flash-tool --ft245 --ft-serial FT6XXXXX load firmware.bin
 ```
 
-The FT2232H is used in asynchronous 245 FIFO mode. This requires a **one-time EEPROM configuration** to set Channel A to "245 FIFO" mode using [FT_PROG](https://ftdichip.com/utilities/#ft_prog) (Windows) or `ftd2xx_eeprom` (Linux). No special BitMode is set at runtime -- the host tool just opens the device and reads/writes normally.
+The FT2232H is used in asynchronous 245 FIFO mode. This requires a **one-time EEPROM configuration** to set Channel A to "245 FIFO" mode using [FT_PROG](https://ftdichip.com/utilities/#ft_prog) (Windows) or `ftdi_eeprom` (Linux). No special BitMode is set at runtime -- the host tool just opens the device and reads/writes normally.
 
 **Wiring:** Connect the FT2232H Channel A pins to the FPGA dock as follows:
 
