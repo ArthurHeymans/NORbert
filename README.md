@@ -22,25 +22,53 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 
 - [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang/tang-primer-25k/primer-25k.html) (Gowin GW5A-LV25MG121)
 - Tang Primer 25K Dock ext-board (provides SDRAM and USB-UART)
-- SPI signals exposed on PMOD connector J5
+- All three PMOD headers are used: SPI on PMOD 1 and the optional FT245 transport on PMOD 2 and PMOD 3
 - **Optional:** FT2232H breakout board for FT245 high-speed transport (e.g., CJMCU-FT2232H or any FT2232H module)
 
-## SPI Flash Pin Mapping
+### PMOD pinout
 
-NORbert exposes the SPI flash interface on the **PMOD J5** connector of the Tang Primer 25K Dock. The table below maps the standard SPI flash signals to the corresponding FPGA I/O pins:
+The headers are shown in their physical left-to-right order when looking toward the Dock from the cable/module side: PMOD 3, PMOD 2, then PMOD 1. The thick bottom edge is the PCB, making it clear which row is nearest the board. Connector names follow the [Tang Primer 25K Dock schematic](https://dl.sipeed.com/fileList/TANG/Primer_25K/02_Schematic/Tang_Primer_25K_Dock_60033_Schematic.pdf). FPGA balls are shown in parentheses.
 
-| SPI Signal | FPGA Pin | PMOD J5 Pin | Notes                              |
-|------------|----------|-------------|------------------------------------|
-| `/CS#`     | `T9`     | 1           | Chip Select (active-low)           |
-| `SCK`      | `T8`     | 2           | SPI Clock                          |
-| `D0/DO`    | `R9`     | 3           | Data Out / IO0                     |
-| `D1/DI`    | `R8`     | 4           | Data In / IO1                      |
-| `D2`       | `L8`     | 5           | IO2 (used for Dual/Quad reads)     |
-| `D3`       | `L9`     | 6           | IO3 / `#HOLD#` (shared function)   |
-| `GND`      | —        | 10          | Ground                             |
-| `VCC`      | —        | 9           | 3.3V Power                         |
+```text
+ PMOD 3 / J6 — FT245 data
+ +------------+------------+------------+------------+--------+--------+
+ | D6  (G5)   | D5  (G8)   | D4  (H7)   | D7  (J5)   | GND    | 3V3    |
+ | D3  (F5)   | D2  (G7)   | D1  (H8)   | D0  (H5)   | GND    | 3V3    |
+ +=========================== PCB / BOARD =============================+
 
-*Note: D3 and `#HOLD#` share the physical IO3 pin. Asserting `#HOLD` drives it low to silence a real flash on a shared bus. Consult `tangprimer25k.cst` for exact pin assignments.*
+ PMOD 2 / J5 — FT245 control
+ +------------+------------+------------+------------+--------+--------+
+ | NC  (A10)  | NC  (E10)  | NC  (L11)  | NC  (K5)   | GND    | 3V3    |
+ | RXF# (A11) | TXE# (E11) | RD# (K11)  | WR# (L5)   | GND    | 3V3    |
+ +=========================== PCB / BOARD =============================+
+
+ PMOD 1 / J4 — SPI
+ +------------+------------+------------+------------+--------+--------+
+ | #WP (G10)  | #HOLD(D10) | POWER(B10) | DEBUG(C10) | GND    | 3V3    |
+ | #CS (G11)  | SCLK (D11) | MOSI (B11) | MISO (C11) | GND    | 3V3    |
+ +=========================== PCB / BOARD =============================+
+```
+
+`#WP` and `#HOLD` become the extra IO2 and IO3 data lines in quad-SPI mode. `POWER` is an active-high target-power sense input: connect it to the target's 3.3 V rail so NORbert only drives the bus while the target is powered. It is not a power output. Always connect a common ground; `DEBUG` is optional.
+
+### SPI signals
+
+| SPI signal     | FPGA ball | J4 pin | Notes                                          |
+|----------------|-----------|--------|------------------------------------------------|
+| `CS#`          | G11       | 11     | Chip select (active low)                       |
+| `SCK`          | D11       | 9      | SPI clock                                      |
+| `IO0` / `MOSI` | B11       | 7      | Data in; output in dual/quad reads             |
+| `IO1` / `MISO` | C11       | 5      | Data out; input in dual/quad address phases    |
+| `IO2` / `WP#`  | G10       | 12     | Quad I/O                                       |
+| `IO3` / `HOLD#`| D10       | 10     | Quad I/O, or driven low by `hold on`           |
+| `POWER`        | B10       | 8      | Target 3.3 V sense input (**required**, see above) |
+| `DEBUG`        | C10       | 6      | Optional debug output; leave unconnected       |
+| GND            | —         | 3, 4   |                                                |
+| 3V3            | —         | 1, 2   | Dock supply; do not back-feed from the target  |
+
+J4 pin numbers follow the Dock schematic. NORbert only drives IO0-IO3 while
+`POWER` is high, and the input has an internal pull-down, so the SPI outputs
+stay tri-stated if it is left unconnected.
 
 ## Releases
 
@@ -299,15 +327,15 @@ The FT2232H is used in asynchronous 245 FIFO mode. This requires a **one-time EE
 
 **Wiring:** Connect the FT2232H Channel A pins to the FPGA dock as follows:
 
-| FT2232H Pin | Signal   | FPGA Pin | Dock Location    |
-|-------------|----------|----------|------------------|
-| AD0-AD7     | D[0:7]   | H5, H8, G7, F5, H7, G8, G5, F3 | PMOD J7 |
-| RXF#        | ft_rxf_n | D10      | PMOD J6 top      |
-| TXE#        | ft_txe_n | G10      | PMOD J6 top      |
-| RD#         | ft_rd_n  | B10      | PMOD J6 top      |
-| WR#         | ft_wr_n  | H11      | Button S0 (core board) |
+| FT2232H Pin | NORbert signal | Dock location |
+|-------------|----------------|---------------|
+| AD0-AD7     | D0-D7          | PMOD 3 / J6   |
+| RXF#        | RXF#           | PMOD 2 / J5   |
+| TXE#        | TXE#           | PMOD 2 / J5   |
+| RD#         | RD#            | PMOD 2 / J5   |
+| WR#         | WR#            | PMOD 2 / J5   |
 
-Note: H11 is a core board button pin, repurposed for FT245 (buttons are unused by NORbert). CLKOUT and OE# are not used in async mode. All signals are 3.3V LVCMOS.
+CLKOUT and OE# are not used in async mode. All signals are 3.3 V LVCMOS. See the PMOD diagram above for the physical order and FPGA ball assignments.
 
 ## SPI read performance
 
