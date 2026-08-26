@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust and WebAssembly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tool -> target
+          key: wasm32-unknown-unknown
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libudev-dev pkg-config
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path tool/Cargo.toml --all -- --check
+
+      - name: Test native tool
+        run: cargo test --manifest-path tool/Cargo.toml
+
+      - name: Lint native tool
+        run: cargo clippy --manifest-path tool/Cargo.toml --all-targets -- --deny warnings
+
+      - name: Lint WebAssembly tool
+        run: cargo clippy --manifest-path tool/Cargo.toml --target wasm32-unknown-unknown --no-default-features --features wasm -- --deny warnings
+
+      - name: Build Web UI
+        run: trunk build --release
+
+  verilog:
+    name: Verilog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: YosysHQ/setup-oss-cad-suite@v4
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Run Yosys and Verilator checks
+        run: make lint

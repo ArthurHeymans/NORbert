@@ -25,7 +25,11 @@ CST_FILE = tangprimer25k.cst
 # Gowin IDE output
 BITSTREAM = impl/pnr/spi_flash.fs
 
-.PHONY: all build lint prog flash clean tool webui webui-serve ftdi-setup help
+# Open-source lint tools use Yosys' GW5A primitive declarations so the
+# generated PLL wrapper can be elaborated without the proprietary simulator.
+GOWIN_CELLS = $(shell yosys-config --datdir)/gowin/cells_xtra_gw5a.v
+
+.PHONY: all build lint lint-yosys lint-verilator prog flash clean tool webui webui-serve ftdi-setup help
 
 all: build
 
@@ -35,9 +39,21 @@ build: $(BITSTREAM)
 $(BITSTREAM): $(VERILOG_FILES) $(CST_FILE) build.tcl
 	gw_sh build.tcl
 
-# Lint with yosys (quick syntax/logic check)
-lint:
-	yosys -p "read_verilog $(VERILOG_FILES); synth_gowin -top top -noflatten"
+# Open-source syntax, elaboration, and synthesis checks.
+lint: lint-yosys lint-verilator
+
+lint-yosys:
+	yosys -Q -q \
+		-w "define gw1n not used.*" \
+		-w "Yosys has only limited support for tri-state logic.*" \
+		-e ".*" \
+		-p "read_verilog -lib $(GOWIN_CELLS); read_verilog $(VERILOG_FILES); synth_gowin -family gw5a -top top -noflatten; check"
+
+lint-verilator:
+	verilator --lint-only --top-module top \
+		-Wno-CASEINCOMPLETE -Wno-DEFPARAM -Wno-PINMISSING \
+		-Wno-WIDTHTRUNC -Wno-WIDTHEXPAND \
+		$(GOWIN_CELLS) $(VERILOG_FILES)
 
 # Program the device (volatile - lost on power cycle)
 prog: $(BITSTREAM)
@@ -74,7 +90,7 @@ help:
 	@echo "  make build   - Synthesize + PnR (default, requires gw_sh)"
 	@echo "  make prog    - Program FPGA (volatile)"
 	@echo "  make flash   - Program to flash (persistent)"
-	@echo "  make lint    - Lint Verilog with yosys"
+	@echo "  make lint    - Check Verilog with Yosys and Verilator"
 	@echo "  make tool    - Build spi-flash-tool (ftdi-nusb backend, default)"
 	@echo "  make webui  - Build the WebUSB/Web Serial browser UI"
 	@echo "  make webui-serve - Build and serve the UI at http://localhost:8081"
