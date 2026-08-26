@@ -41,6 +41,24 @@ NORbert exposes the SPI flash interface on the **PMOD J5** connector of the Tang
 
 *Note: D3 and `#HOLD#` share the physical IO3 pin. Asserting `#HOLD` drives it low to silence a real flash on a shared bus. Consult `tangprimer25k.cst` for exact pin assignments.*
 
+## Releases
+
+Tagged releases publish a Gowin `.fs` bitstream for the Tang Primer 25K. Download
+`spi_flash.fs` from the [latest release](https://github.com/ArthurHeymans/NORbert/releases/latest)
+and load it with openFPGALoader:
+
+```sh
+# Volatile: runs immediately, lost on power-off
+openFPGALoader -b tangprimer25k spi_flash.fs
+
+# Persistent: boots automatically after power-on
+openFPGALoader -b tangprimer25k -f spi_flash.fs
+```
+
+Release tags exactly match the Rust package version (for example, tag `0.1.0`
+uses `version = "0.1.0"` in `tool/Cargo.toml`). The release workflow rejects a
+mismatch.
+
 ## Building
 
 ### Prerequisites
@@ -59,7 +77,6 @@ Without Nix, you'll need:
 - [openFPGALoader](https://github.com/trabucayre/openFPGALoader)
 - [yosys](https://github.com/YosysHQ/yosys) (optional, for linting)
 - Rust toolchain (for the host tool)
-
 
 ### FPGA bitstream
 
@@ -118,8 +135,21 @@ Open <http://localhost:8081> and choose either **Connect FT245 (WebUSB)** or
 **Connect UART (Web Serial)**. The UI uses the compiled-in rflasher database to
 search for and configure the emulated chip, and provides emulation control,
 verified SDRAM uploads and downloads, target-flash `#HOLD`, decoded live SPI
-activity monitoring, and full TOCTOU trap configuration. Browser device APIs
-are unavailable when opening `web/index.html` directly as a `file://` URL.
+activity monitoring, and full TOCTOU trap configuration.
+
+The **Bitstream** tab can program a release or locally built Gowin `.fs` file
+straight into volatile SRAM or persistent configuration flash. This is a Rust/
+WebAssembly port of the FT2232H MPSSE/JTAG and Gowin GW5A paths used by
+openFPGALoader, built on the existing `ftdi-nusb`, `nusb`, and WebUSB support.
+Disconnect an active FT245 connection and close native JTAG tools before
+programming because they also claim FT2232H interface A. On Linux, unbind the
+`ftdi_sio` driver from interface A if Chromium reports that it cannot claim the
+interface. On Windows, interface A must use the WinUSB driver (for example,
+configured with Zadig); leave interface B on its normal driver.
+
+Browser device APIs are unavailable when opening `web/index.html` directly as
+a `file://` URL. WebUSB requires Chromium and a secure context (HTTPS or
+localhost).
 
 ## Usage
 

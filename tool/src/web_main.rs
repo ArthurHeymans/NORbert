@@ -5,6 +5,7 @@ use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Function, Uint8Array};
 use spi_flash_tool::WebFlashDevice;
 use spi_flash_tool::chip::{FlashChip, FlashChipExt};
+use spi_flash_tool::gowin::{self, FlashOptions, ProgramProgress};
 use spi_flash_tool::sfdp::generate_sfdp;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -20,6 +21,7 @@ use web_sys::{
 enum Panel {
     #[default]
     Device,
+    Bitstream,
     Activity,
     Toctou,
     Wiring,
@@ -46,6 +48,7 @@ struct SharedState {
     status: String,
     status_error: bool,
     pending_file: Option<(String, File)>,
+    pending_bitstream_file: Option<(String, Vec<u8>)>,
     read_data: Option<(u32, Vec<u8>)>,
     log_output: String,
     log_pending: Vec<u8>,
@@ -72,6 +75,7 @@ impl Default for SharedState {
             status: "Choose a transport to connect to NORbert".to_owned(),
             status_error: false,
             pending_file: None,
+            pending_bitstream_file: None,
             read_data: None,
             log_output: String::new(),
             log_pending: Vec::new(),
@@ -103,6 +107,13 @@ struct NorbertWebApp {
     upload_name: String,
     upload_file: Option<File>,
     verify_upload: bool,
+    bitstream_name: String,
+    bitstream_data: Option<Vec<u8>>,
+    bitstream_info: String,
+    bitstream_flash_offset: String,
+    bitstream_verify_flash: bool,
+    bitstream_unprotect_flash: bool,
+    bitstream_chip_erase: bool,
     toctou_index: String,
     toctou_start: String,
     toctou_mask: String,
@@ -135,6 +146,13 @@ impl NorbertWebApp {
             upload_name: String::new(),
             upload_file: None,
             verify_upload: false,
+            bitstream_name: String::new(),
+            bitstream_data: None,
+            bitstream_info: String::new(),
+            bitstream_flash_offset: "0".to_owned(),
+            bitstream_verify_flash: true,
+            bitstream_unprotect_flash: false,
+            bitstream_chip_erase: false,
             toctou_index: "0".to_owned(),
             toctou_start: "0x001000".to_owned(),
             toctou_mask: "0xFFF000".to_owned(),
@@ -420,6 +438,125 @@ impl NorbertWebApp {
         input.click();
     }
 
+    fn select_bitstream_file(&self) {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let input: HtmlInputElement = document
+            .create_element("input")
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_type("file");
+        input.set_accept(".fs,*/*");
+        let state = self.state.clone();
+        let onchange = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            let input: HtmlInputElement = event.target().unwrap().dyn_into().unwrap();
+            if let Some(file) = input.files().and_then(|files| files.get(0)) {
+                let name = file.name();
+                let state = state.clone();
+                spawn_local(async move {
+                    match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
+                        Ok(buffer) => {
+                            let data = Uint8Array::new(&buffer).to_vec();
+                            state.borrow_mut().pending_bitstream_file = Some((name, data));
+                        }
+                        Err(error) => set_error(
+                            &mut state.borrow_mut(),
+                            format!("Failed to read bitstream: {}", js_error(error)),
+                        ),
+                    }
+                });
+            }
+        }) as Box<dyn FnMut(_)>);
+        input.set_onchange(Some(onchange.as_ref().unchecked_ref()));
+        onchange.forget();
+        input.click();
+    }
+
+    fn program_bitstream_sram(&self, ctx: &egui::Context) {
+        let Some(data) = self.bitstream_data.clone() else {
+            set_error(
+                &mut self.state.borrow_mut(),
+                "Select a Gowin .fs bitstream first".to_owned(),
+            );
+            return;
+        };
+        self.run_bitstream_program(data, None, ctx);
+    }
+
+    fn program_bitstream_flash(&self, ctx: &egui::Context) {
+        let Some(data) = self.bitstream_data.clone() else {
+            set_error(
+                &mut self.state.borrow_mut(),
+                "Select a Gowin .fs bitstream first".to_owned(),
+            );
+            return;
+        };
+        let Some(offset) = parse_number(&self.bitstream_flash_offset) else {
+            set_error(
+                &mut self.state.borrow_mut(),
+                "Invalid flash offset".to_owned(),
+            );
+            return;
+        };
+        self.run_bitstream_program(
+            data,
+            Some(FlashOptions {
+                offset,
+                verify: self.bitstream_verify_flash,
+                unprotect: self.bitstream_unprotect_flash,
+                chip_erase: self.bitstream_chip_erase,
+            }),
+            ctx,
+        );
+    }
+
+    fn run_bitstream_program(
+        &self,
+        data: Vec<u8>,
+        flash_options: Option<FlashOptions>,
+        ctx: &egui::Context,
+    ) {
+        let state = self.state.clone();
+        let repaint = ctx.clone();
+        {
+            let mut shared = state.borrow_mut();
+            shared.busy = true;
+            shared.status = if flash_options.is_some() {
+                "Requesting JTAG adapter to program FPGA flash..."
+            } else {
+                "Requesting JTAG adapter to program FPGA SRAM..."
+            }
+            .to_owned();
+            shared.status_error = false;
+        }
+        spawn_local(async move {
+            let progress_state = state.clone();
+            let progress_repaint = repaint.clone();
+            let progress = move |update: ProgramProgress| {
+                let mut shared = progress_state.borrow_mut();
+                shared.status = format!("{}: {}/{}", update.stage, update.done, update.total);
+                progress_repaint.request_repaint();
+            };
+            let result = match flash_options {
+                Some(options) => gowin::program_flash_from_webusb(&data, options, progress).await,
+                None => gowin::program_sram_from_webusb(&data, progress).await,
+            };
+            let mut shared = state.borrow_mut();
+            shared.busy = false;
+            match result {
+                Ok(report) => {
+                    shared.status = format!(
+                        "FPGA programmed: {} bytes, JTAG IDCODE 0x{:08X}",
+                        report.bytes_programmed, report.idcode
+                    );
+                    shared.status_error = false;
+                }
+                Err(error) => set_error(&mut shared, format!("FPGA programming failed: {error}")),
+            }
+            repaint.request_repaint();
+        });
+    }
+
     fn write_memory(&self, address: u32, file: File, verify: bool, ctx: &egui::Context) {
         let state = self.state.clone();
         let repaint = ctx.clone();
@@ -629,6 +766,88 @@ impl NorbertWebApp {
         let mut state = self.state.borrow_mut();
         state.monitoring = false;
         state.status = "Stopping SPI activity capture...".to_owned();
+    }
+
+    fn bitstream_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("FPGA Bitstream");
+        ui.separator();
+        ui.label(
+            "Program the Tang Primer 25K directly from the browser using its FT2232H JTAG adapter. This ports the Gowin GW5A subset of openFPGALoader to Rust/WASM on top of ftdi-nusb and WebUSB.",
+        );
+        ui.label(
+            "Download spi_flash.fs from the latest GitHub release, or choose a locally built .fs file.",
+        );
+        ui.hyperlink_to(
+            "Download latest release bitstream",
+            "https://github.com/ArthurHeymans/NORbert/releases/latest/download/spi_flash.fs",
+        );
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.state.borrow().busy,
+                    egui::Button::new("Choose .fs File..."),
+                )
+                .clicked()
+            {
+                self.select_bitstream_file();
+            }
+            if self.bitstream_name.is_empty() {
+                ui.label("No bitstream selected");
+            } else {
+                ui.label(&self.bitstream_name);
+            }
+        });
+        if !self.bitstream_info.is_empty() {
+            ui.label(&self.bitstream_info);
+        }
+
+        let (busy, transport_connected) = {
+            let state = self.state.borrow();
+            (state.busy, state.device.is_some())
+        };
+        let can_program = self.bitstream_data.is_some() && !busy && !transport_connected;
+
+        ui.add_space(12.0);
+        ui.heading("Volatile SRAM");
+        ui.label("Loads immediately and is lost when the board is powered off.");
+        if ui
+            .add_enabled(can_program, egui::Button::new("Program SRAM via WebUSB"))
+            .clicked()
+        {
+            self.program_bitstream_sram(ctx);
+        }
+
+        ui.add_space(12.0);
+        ui.heading("Persistent Flash");
+        ui.label("Writes the board's external configuration flash. The FPGA loads it at power-on.");
+        ui.horizontal(|ui| {
+            ui.label("Flash offset:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.bitstream_flash_offset).desired_width(100.0),
+            );
+            ui.checkbox(&mut self.bitstream_verify_flash, "Verify");
+            ui.checkbox(&mut self.bitstream_unprotect_flash, "Clear protection bits");
+            ui.checkbox(&mut self.bitstream_chip_erase, "Erase whole chip");
+        });
+        if ui
+            .add_enabled(can_program, egui::Button::new("Program Flash via WebUSB"))
+            .clicked()
+        {
+            self.program_bitstream_flash(ctx);
+        }
+
+        ui.add_space(12.0);
+        if transport_connected {
+            ui.colored_label(
+                Color32::YELLOW,
+                "Disconnect the current NORbert transport before programming. An FT245 connection already owns FT2232H interface A.",
+            );
+        }
+        ui.label(
+            "WebUSB requires Chromium and HTTPS or localhost. On Linux, FT2232H interface A must not be claimed by ftdi_sio; on Windows, it must use the WinUSB driver.",
+        );
     }
 
     fn device_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1081,11 +1300,33 @@ impl eframe::App for NorbertWebApp {
             self.upload_file = Some(file);
         }
 
+        let pending_bitstream = self.state.borrow_mut().pending_bitstream_file.take();
+        if let Some((name, data)) = pending_bitstream {
+            match gowin::inspect_bitstream(&data) {
+                Ok(info) => {
+                    self.bitstream_info = format!(
+                        "{} SRAM bytes, {} flash bytes, target IDCODE 0x{:08X}, checksum 0x{:08X}",
+                        info.sram_bytes, info.flash_bytes, info.idcode, info.checksum
+                    );
+                    self.bitstream_name = name;
+                    self.bitstream_data = Some(data);
+                    let mut state = self.state.borrow_mut();
+                    state.status = "Bitstream loaded".to_owned();
+                    state.status_error = false;
+                }
+                Err(error) => set_error(
+                    &mut self.state.borrow_mut(),
+                    format!("Invalid bitstream: {error}"),
+                ),
+            }
+        }
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("NORbert Web Interface");
                 ui.separator();
                 ui.selectable_value(&mut self.panel, Panel::Device, "Device");
+                ui.selectable_value(&mut self.panel, Panel::Bitstream, "Bitstream");
                 ui.selectable_value(&mut self.panel, Panel::Activity, "Activity");
                 ui.selectable_value(&mut self.panel, Panel::Toctou, "TOCTOU");
                 ui.selectable_value(&mut self.panel, Panel::Wiring, "Wiring");
@@ -1103,6 +1344,7 @@ impl eframe::App for NorbertWebApp {
         });
         egui::CentralPanel::default().show(ctx, |ui| match self.panel {
             Panel::Device => self.device_panel(ui, ctx),
+            Panel::Bitstream => self.bitstream_panel(ui, ctx),
             Panel::Activity => self.activity_panel(ui, ctx),
             Panel::Toctou => self.toctou_panel(ui, ctx),
             Panel::Wiring => {}
