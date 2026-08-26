@@ -25,7 +25,7 @@ CST_FILE = tangprimer25k.cst
 # Gowin IDE output
 BITSTREAM = impl/pnr/spi_flash.fs
 
-.PHONY: all build lint prog flash clean tool ftdi-setup help
+.PHONY: all build lint prog flash clean tool webui webui-serve ftdi-setup help
 
 all: build
 
@@ -56,10 +56,17 @@ ftdi-setup:
 	@echo ""
 	@echo "EEPROM programmed. Unplug and replug the FT2232H now."
 
-# Build the spi-flash-tool (default: rs-ftdi backend, pure Rust)
+# Build the spi-flash-tool (default: ftdi-nusb backend, pure Rust)
 tool:
 	cargo build --release --manifest-path tool/Cargo.toml
 	@echo "Tool built: tool/target/release/spi-flash-tool"
+
+# Build and serve the browser UI with Trunk.
+webui:
+	trunk build --release
+
+webui-serve:
+	trunk serve
 
 help:
 	@echo "Tang Primer 25K SPI Flash Emulator"
@@ -68,7 +75,8 @@ help:
 	@echo "  make prog    - Program FPGA (volatile)"
 	@echo "  make flash   - Program to flash (persistent)"
 	@echo "  make lint    - Lint Verilog with yosys"
-	@echo "  make tool    - Build spi-flash-tool (rs-ftdi backend, default)"
-
+	@echo "  make tool    - Build spi-flash-tool (ftdi-nusb backend, default)"
+	@echo "  make webui  - Build the WebUSB/Web Serial browser UI"
+	@echo "  make webui-serve - Build and serve the UI at http://localhost:8081"
 	@echo "  make ftdi-setup - Program FT2232H EEPROM for 245 FIFO"
 	@echo "  make clean   - Clean build artifacts"

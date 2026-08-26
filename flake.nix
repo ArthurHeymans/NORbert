@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     gowin-eda = {
       url = "github:Blue-Berry/gowin-eda.nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -15,6 +19,7 @@
       self,
       nixpkgs,
       flake-utils,
+      rust-overlay,
       gowin-eda,
     }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (
@@ -22,11 +27,34 @@
       let
         pkgs = import nixpkgs {
           inherit system;
+          overlays = [ (import rust-overlay) ];
           config.allowUnfree = true;
+        };
+
+        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+          extensions = [
+            "rust-src"
+            "rust-analyzer"
+            "rustfmt"
+            "clippy"
+          ];
+          targets = [ "wasm32-unknown-unknown" ];
         };
 
         # Gowin EDA Education edition from gowin-eda.nix
         gowinEda = gowin-eda.packages.${system}.default;
+
+        # Keep the CLI exactly in sync with the wasm-bindgen crate in
+        # tool/Cargo.lock. Mismatched versions cannot process its Wasm output.
+        wasmBindgenCli = pkgs.runCommand "wasm-bindgen-cli-0.2.127" { } ''
+          mkdir -p $out/bin
+          install -m755 ${
+            pkgs.fetchzip {
+              url = "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-x86_64-unknown-linux-musl.tar.gz";
+              hash = "sha256-X6rT4cwbJaCX/oyWX8NDN4u6uUS/Io5axRy8nvUQi7I=";
+            }
+          }/{wasm-bindgen,wasm-bindgen-test-runner,wasm2es6js} $out/bin/
+        '';
 
         # Create a gw_sh wrapper using the same FHS approach
         gowinSrc = pkgs.stdenv.mkDerivation {
@@ -146,11 +174,10 @@
             # FTDI EEPROM programming (FT2232H async 245 setup)
             libftdi1
 
-            # Rust toolchain for spi-flash-tool
-            cargo
-            rustc
-            rustfmt
-            clippy
+            # Rust and WebAssembly toolchain for spi-flash-tool and the Web UI
+            rustToolchain
+            trunk
+            wasmBindgenCli
             pkg-config
             udev
           ];
@@ -166,7 +193,9 @@
             echo "  verilator        - Verilog simulation"
             echo "  gtkwave          - Waveform viewer"
             echo "  ftdi_eeprom      - FT2232H EEPROM programmer"
-            echo "  cargo            - Rust build tool"
+            echo "  cargo            - Rust build tool (including wasm32 target support)"
+            echo "  wasm-bindgen      - Generate browser bindings for the Web UI"
+            echo "  trunk             - Build and serve the Web UI"
             echo ""
             echo "Build commands:"
             echo "  make build       - Synthesize with gw_sh (CLI)"
@@ -174,6 +203,7 @@
             echo "  make flash       - Program to flash (persistent)"
             echo "  make lint        - Lint with yosys"
             echo "  make tool        - Build spi-flash-tool"
+            echo "  make webui-serve - Build and serve the browser UI"
             echo ""
           '';
         };

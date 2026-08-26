@@ -1,39 +1,28 @@
-use crate::protocol::CMD_VERSION;
+use crate::device::{ConnectionKind, FlashDevice, Transport, UART_BAUD_RATE};
+#[cfg(feature = "ftdi")]
+use crate::device::{FT2232H_PID, FTDI_VID};
+use crate::protocol::{CMD_VERSION, is_supported_protocol_version};
+#[cfg(feature = "ftdi")]
 use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use serialport::SerialPort;
 use std::io::{Read, Write};
 use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
-const BAUD_RATE: u32 = 2_000_000;
-// Max bursts per command: 16-bit len field (v3), 8 bytes per burst.
-// 64KB blocks are unreliable -- the FPGA loses a byte during sustained
-// 8192-burst writes (likely a glue/SDRAM timing race under refresh
-// pressure).  16KB is the largest size that passes 10/10 stress tests.
-pub(crate) const BLOCK_SIZE: usize = 16384; // 2048 bursts * 8 bytes
+impl FlashDevice {
+    pub(crate) fn open_serial(port_name: &str) -> Result<Self> {
+        Self::new(
+            SerialTransport::open(port_name)?,
+            ConnectionKind::Uart,
+            None,
+        )
+    }
 
-// UART read block size: must be smaller than BLOCK_SIZE because the
-// glue module inhibits SDRAM refresh for the entire serial-path read
-// duration.  At 2Mbaud (~200KB/s), a 16KB read takes ~82ms -- exceeding
-// the SDRAM's 64ms refresh window and risking data loss.  4KB takes
-// ~20ms, well within budget.  Writes are unaffected (data flows
-// host-to-FPGA, SDRAM writes complete in microseconds).
-pub(crate) const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
-pub(crate) const SDRAM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
-
-// FT2232H USB identifiers
-pub(crate) const FTDI_VID: u16 = 0x0403;
-pub(crate) const FT2232H_PID: u16 = 0x6010;
-
-// ---------------------------------------------------------------------------
-// Transport trait -- abstracts UART serial vs FT245 FIFO
-// ---------------------------------------------------------------------------
-
-pub(crate) trait Transport {
-    fn write_all(&mut self, data: &[u8]) -> Result<()>;
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
+    #[cfg(feature = "ftdi")]
+    pub(crate) fn open_ft245(serial: Option<&str>) -> Result<Self> {
+        Self::new(Ft245Transport::open(serial)?, ConnectionKind::Ft245, None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -46,7 +35,7 @@ pub(crate) struct SerialTransport {
 
 impl SerialTransport {
     pub(crate) fn open(port_name: &str) -> Result<Self> {
-        let mut port = serialport::new(port_name, BAUD_RATE)
+        let mut port = serialport::new(port_name, UART_BAUD_RATE)
             .timeout(Duration::from_secs(2))
             .open()
             .with_context(|| format!("Failed to open serial port {}", port_name))?;
@@ -79,6 +68,7 @@ impl SerialTransport {
         // stray that arrives *after* the reply (it would be seen as
         // the last byte on the first attempt, forcing a retry).
         const SYNC_ATTEMPTS: u32 = 5;
+        let mut last_unsupported = None;
         for attempt in 0..SYNC_ATTEMPTS {
             port.write_all(&[CMD_VERSION])?;
             port.flush().ok();
@@ -97,11 +87,10 @@ impl SerialTransport {
                 }
             }
 
-            // 0x00 is a leaked modem-status zero; 0xFF is the usual
-            // glitch byte.  Anything else is a plausible version reply
-            // (versions 1..=127 are in range for this protocol).
+            // Accept only versions whose command semantics this tool knows.
+            // Any other byte is noise or an incompatible device response.
             match last {
-                Some(v) if v != 0x00 && v != 0xFF => {
+                Some(v) if is_supported_protocol_version(v) => {
                     // Double-check the line is now quiet.
                     port.set_timeout(Duration::from_millis(5))?;
                     while port.read(&mut discard).unwrap_or(0) > 0 {}
@@ -115,56 +104,80 @@ impl SerialTransport {
                     }
                     return Ok(Self { port });
                 }
+                Some(v) if v != 0x00 && v != 0xff => last_unsupported = Some(v),
                 _ => {} // keep trying
             }
         }
-        bail!(
-            "Failed to sync with FPGA on {} after {} attempts (only saw 0x00/0xFF junk)",
-            port_name,
-            SYNC_ATTEMPTS
-        );
+        match last_unsupported {
+            Some(version) => bail!(
+                "Failed to sync with FPGA on {port_name}: unsupported protocol version {version}"
+            ),
+            None => bail!(
+                "Failed to sync with FPGA on {} after {} attempts (only saw 0x00/0xFF junk)",
+                port_name,
+                SYNC_ATTEMPTS
+            ),
+        }
     }
 }
 
+#[maybe_async::maybe_async(?Send)]
 impl Transport for SerialTransport {
-    fn write_all(&mut self, data: &[u8]) -> Result<()> {
+    async fn write_all(&mut self, data: &[u8]) -> Result<()> {
         self.port.write_all(data)?;
         Ok(())
     }
 
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.port.read_exact(buf)?;
+    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
+        Ok(self.port.read(buffer)?)
+    }
+
+    async fn disconnect(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        true
     }
 }
 
 // ---------------------------------------------------------------------------
-// FT245 transport -- ftdi-nusb backend (pure Rust)
+// FT245 transport -- ftdi-nusb backend (pure Rust, nusb)
 // ---------------------------------------------------------------------------
 
-pub(crate) struct Ft245Transport {
-    dev: ftdi::FtdiDevice,
+#[cfg(feature = "ftdi")]
+pub(crate) fn open_ft2232h(serial: Option<&str>) -> Result<ftdi_nusb::FtdiDevice> {
+    if let Some(serial) = serial {
+        let filter = ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).serial(serial);
+        return ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
+            .with_context(|| format!("No FT2232H with serial '{serial}'"));
+    }
+
+    // DeviceFilter matches the USB product string configured in ft2232h.conf;
+    // the interface is selected separately below.
+    let filter = ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).description("NORbert FT245");
+    ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
+        .or_else(|_| {
+            ftdi_nusb::FtdiDevice::open_with_interface(
+                FTDI_VID,
+                FT2232H_PID,
+                ftdi_nusb::Interface::A,
+            )
+        })
+        .context("No FT2232H found")
 }
 
+#[cfg(feature = "ftdi")]
+pub(crate) struct Ft245Transport {
+    dev: ftdi_nusb::FtdiDevice,
+}
+
+#[cfg(feature = "ftdi")]
 impl Ft245Transport {
     pub(crate) fn open(serial: Option<&str>) -> Result<Self> {
-        // Open the FT2232H Channel A.  The EEPROM must already be
-        // configured for "245 FIFO" mode.
-        let mut dev = if let Some(sn) = serial {
-            let filter = ftdi::DeviceFilter::new(FTDI_VID, FT2232H_PID).serial(sn);
-            ftdi::FtdiDevice::open_with_filter(&filter, ftdi::Interface::A)
-                .with_context(|| format!("No FT2232H with serial '{}'", sn))?
-        } else {
-            // Try to find by description first
-            let filter =
-                ftdi::DeviceFilter::new(FTDI_VID, FT2232H_PID).description("NORbert FT245");
-            ftdi::FtdiDevice::open_with_filter(&filter, ftdi::Interface::A)
-                .or_else(|_| {
-                    // Fall back to opening any FT2232H on interface A
-                    ftdi::FtdiDevice::open_with_interface(FTDI_VID, FT2232H_PID, ftdi::Interface::A)
-                })
-                .context("No FT2232H found")?
-        };
+        // Open the FT2232H Channel A. The EEPROM must already be configured
+        // for "245 FIFO" mode.
+        let mut dev = open_ft2232h(serial)?;
 
         // Reset the FT2232H's internal state and flush FIFOs.
         dev.usb_reset().context("FT2232H reset failed")?;
@@ -205,28 +218,23 @@ impl Ft245Transport {
     }
 }
 
+#[cfg(feature = "ftdi")]
+#[maybe_async::maybe_async(?Send)]
 impl Transport for Ft245Transport {
-    fn write_all(&mut self, data: &[u8]) -> Result<()> {
+    async fn write_all(&mut self, data: &[u8]) -> Result<()> {
         self.dev.write_all(data).map_err(|e| anyhow!(e))?;
         Ok(())
     }
 
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        let mut pos = 0;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pos < buf.len() {
-            if Instant::now() > deadline {
-                bail!("FT245 read timeout: got {} of {} bytes", pos, buf.len());
-            }
-            let n = self
-                .dev
-                .read_data(&mut buf[pos..])
-                .map_err(|e| anyhow!(e))?;
-            if n == 0 {
-                thread::sleep(Duration::from_micros(100));
-            }
-            pos += n;
-        }
+    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
+        self.dev.read_data(buffer).map_err(|e| anyhow!(e))
+    }
+
+    async fn disconnect(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        true
     }
 }

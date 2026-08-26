@@ -42,11 +42,10 @@ fn spi_opcode_name(opcode: u8) -> &'static str {
 }
 
 fn is_read_opcode(opcode: u8) -> bool {
-    match opcode {
-        0x03 | 0x0B | 0x0C | 0x13 | 0x3B | 0x3C | 0x5A | 0x6B | 0x6C | 0xBB | 0xBC | 0xEB
-        | 0xEC => true,
-        _ => false,
-    }
+    const READ_OPCODES: [u8; 13] = [
+        0x03, 0x0B, 0x0C, 0x13, 0x3B, 0x3C, 0x5A, 0x6B, 0x6C, 0xBB, 0xBC, 0xEB, 0xEC,
+    ];
+    READ_OPCODES.contains(&opcode)
 }
 
 // ---------------------------------------------------------------------------

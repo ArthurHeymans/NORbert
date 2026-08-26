@@ -7,6 +7,43 @@
 use zerocopy::{Immutable, IntoBytes};
 
 pub const PROTOCOL_VERSION: u8 = 5;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 3;
+
+pub const fn is_supported_protocol_version(version: u8) -> bool {
+    version >= MIN_SUPPORTED_PROTOCOL_VERSION && version <= PROTOCOL_VERSION
+}
+
+pub const fn supports_emulation_control(version: u8) -> bool {
+    version >= 4
+}
+
+pub const fn supports_hold_control(version: u8) -> bool {
+    version >= 4
+}
+
+pub const fn supports_activity_log(version: u8) -> bool {
+    version >= 5
+}
+
+pub const fn supports_toctou(version: u8) -> bool {
+    version >= 5
+}
+
+/// Convert a flash capacity to the FPGA's combined erase-count/address-mask
+/// field. The mask representation only works for power-of-two capacities.
+pub const fn capacity_erase_bursts(total_size: u32) -> Option<u32> {
+    if total_size < 8 || !total_size.is_power_of_two() {
+        return None;
+    }
+
+    let bursts = total_size / 8;
+    let erase_bursts = bursts - 1;
+    if erase_bursts <= 0x007f_ffff {
+        Some(erase_bursts)
+    } else {
+        None
+    }
+}
 
 pub const CMD_VERSION: u8 = 0x30;
 pub const CMD_READ: u8 = 0x31;
@@ -229,6 +266,32 @@ mod tests {
             &[CMD_CHIPCONFIG, 0xef, 0x40, 0x18, 1, 0x12, 0x34, 0x56, 128]
         );
         assert!(ChipConfigHeader::new([0; 3], 0, 0x0080_0000, 0).is_none());
+    }
+
+    #[test]
+    fn capacity_mask_requires_a_representable_power_of_two() {
+        assert_eq!(capacity_erase_bursts(8), Some(0));
+        assert_eq!(capacity_erase_bursts(16 * 1024 * 1024), Some(0x1f_ffff));
+        assert_eq!(capacity_erase_bursts(64 * 1024 * 1024), Some(0x7f_ffff));
+        assert_eq!(capacity_erase_bursts(0), None);
+        assert_eq!(capacity_erase_bursts(4), None);
+        assert_eq!(capacity_erase_bursts(12), None);
+    }
+
+    #[test]
+    fn protocol_capabilities_are_explicit() {
+        assert!(!is_supported_protocol_version(2));
+        assert!(is_supported_protocol_version(3));
+        assert!(is_supported_protocol_version(PROTOCOL_VERSION));
+        assert!(!is_supported_protocol_version(PROTOCOL_VERSION + 1));
+        assert!(!supports_emulation_control(3));
+        assert!(supports_emulation_control(4));
+        assert!(!supports_hold_control(3));
+        assert!(supports_hold_control(4));
+        assert!(!supports_activity_log(4));
+        assert!(supports_activity_log(5));
+        assert!(!supports_toctou(4));
+        assert!(supports_toctou(5));
     }
 
     #[test]

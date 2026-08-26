@@ -7,9 +7,10 @@ use monitor::cmd_monitor;
 use crate::chip::{self, FlashChipExt};
 use crate::cli::{Cli, HoldState, ToctouAction};
 use crate::device::FlashDevice;
+#[cfg(feature = "ftdi")]
+use crate::device::{FT2232H_PID, FTDI_VID};
 use crate::protocol::*;
 use crate::sfdp;
-use crate::transport::{FT2232H_PID, FTDI_VID};
 use anyhow::{Context, Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::File;
@@ -20,6 +21,38 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 // Command implementations
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Eq, PartialEq)]
+struct MismatchSample {
+    offset: usize,
+    expected: u8,
+    actual: u8,
+}
+
+fn summarize_mismatches(
+    expected: &[u8],
+    actual: &[u8],
+    sample_limit: usize,
+) -> (u64, Vec<MismatchSample>) {
+    expected
+        .iter()
+        .zip(actual)
+        .enumerate()
+        .filter(|(_, (expected, actual))| expected != actual)
+        .fold(
+            (0u64, Vec::with_capacity(sample_limit)),
+            |(count, mut samples), (offset, (&expected, &actual))| {
+                if samples.len() < sample_limit {
+                    samples.push(MismatchSample {
+                        offset,
+                        expected,
+                        actual,
+                    });
+                }
+                (count.saturating_add(1), samples)
+            },
+        )
+}
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let mut decoded = Vec::with_capacity(s.len() / 2);
@@ -49,8 +82,13 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 
 fn open_device(cli: &Cli) -> Result<FlashDevice> {
     if cli.ft245 {
-        eprintln!("Opening FT2232H in async FIFO mode (ftdi-nusb)...");
-        return FlashDevice::open_ft245(cli.ft_serial.as_deref());
+        #[cfg(feature = "ftdi")]
+        {
+            eprintln!("Opening FT2232H in async FIFO mode (ftdi-nusb)...");
+            return FlashDevice::open_ft245(cli.ft_serial.as_deref());
+        }
+        #[cfg(not(feature = "ftdi"))]
+        bail!("--ft245 requires the 'ftdi' feature (build with --features ftdi)");
     }
     FlashDevice::open_serial(&cli.port)
 }
@@ -58,12 +96,9 @@ fn open_device(cli: &Cli) -> Result<FlashDevice> {
 fn cmd_version(cli: &Cli) -> Result<()> {
     let mut device = open_device(cli)?;
     let version = device.get_version()?;
-    println!("Protocol version: {}", version);
+    println!("Protocol version: {version}");
     if version != PROTOCOL_VERSION {
-        eprintln!(
-            "Warning: Expected version {}, got {}",
-            PROTOCOL_VERSION, version
-        );
+        eprintln!("Note: connected to compatible protocol version {version}");
     }
     Ok(())
 }
@@ -71,52 +106,51 @@ fn cmd_version(cli: &Cli) -> Result<()> {
 fn cmd_read(cli: &Cli, address: u32, length: u32, output: Option<PathBuf>) -> Result<()> {
     let mut device = open_device(cli)?;
 
-    device.with_emulation_stopped(|device| {
-        let pb = ProgressBar::new(length as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-                )?
-                .progress_chars("#>-"),
-        );
+    let pb = ProgressBar::new(length as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+            )?
+            .progress_chars("#>-"),
+    );
 
-        let result = device.read_with_progress(address, length, |completed| {
-            pb.inc(completed as u64);
-        })?;
-        pb.finish_with_message("done");
+    let result = device.read_with_progress(address, length, |completed| {
+        pb.inc(completed as u64);
+        Ok(())
+    })?;
+    pb.finish_with_message("done");
 
-        match output {
-            Some(path) => {
-                let mut file = File::create(&path)?;
-                file.write_all(&result)?;
-                println!("Wrote {} bytes to {}", result.len(), path.display());
-            }
-            None => {
-                for (i, chunk) in result.chunks(16).enumerate() {
-                    print!("{:08x}: ", address as usize + i * 16);
-                    for b in chunk {
-                        print!("{:02x} ", b);
-                    }
-                    for _ in chunk.len()..16 {
-                        print!("   ");
-                    }
-                    print!(" |");
-                    for b in chunk {
-                        let c = *b as char;
-                        if c.is_ascii_graphic() || c == ' ' {
-                            print!("{}", c);
-                        } else {
-                            print!(".");
-                        }
-                    }
-                    println!("|");
+    match output {
+        Some(path) => {
+            let mut file = File::create(&path)?;
+            file.write_all(&result)?;
+            println!("Wrote {} bytes to {}", result.len(), path.display());
+        }
+        None => {
+            for (i, chunk) in result.chunks(16).enumerate() {
+                print!("{:08x}: ", address as usize + i * 16);
+                for b in chunk {
+                    print!("{:02x} ", b);
                 }
+                for _ in chunk.len()..16 {
+                    print!("   ");
+                }
+                print!(" |");
+                for b in chunk {
+                    let c = *b as char;
+                    if c.is_ascii_graphic() || c == ' ' {
+                        print!("{}", c);
+                    } else {
+                        print!(".");
+                    }
+                }
+                println!("|");
             }
         }
+    }
 
-        Ok(())
-    })
+    Ok(())
 }
 
 fn cmd_write(cli: &Cli, address: u32, data_hex: &str) -> Result<()> {
@@ -128,7 +162,7 @@ fn cmd_write(cli: &Cli, address: u32, data_hex: &str) -> Result<()> {
 
     let mut device = open_device(cli)?;
 
-    device.with_emulation_stopped(|device| device.write(address, &data))?;
+    device.write(address, &data)?;
     println!("Wrote {} bytes to 0x{:08x}", data.len(), address);
     Ok(())
 }
@@ -164,8 +198,9 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
                 )?
                 .progress_chars("#>-"),
         );
-        device.write_with_progress(address, &data, |completed| {
+        device.write_raw_with_progress(address, &data, |completed| {
             progress.inc(completed as u64);
+            Ok(())
         })?;
         progress.finish_with_message("loaded");
         println!("Loaded {} bytes", data.len());
@@ -180,27 +215,29 @@ fn cmd_load(cli: &Cli, file: &PathBuf, address: u32, verify: bool) -> Result<()>
                     )?
                     .progress_chars("#>-"),
             );
-            let readback = device.read_with_progress(address, data.len() as u32, |completed| {
+            let readback = device.read_raw_with_progress(address, data.len() as u32, |completed| {
                 progress.inc(completed as u64);
+                Ok(())
             })?;
             progress.finish_with_message("verified");
-            let mismatches: Vec<_> = data
-                .iter()
-                .zip(&readback)
-                .enumerate()
-                .filter(|(_, (expected, actual))| expected != actual)
-                .collect();
+            let (mismatch_count, mismatch_samples) =
+                summarize_mismatches(&data, &readback, 10);
 
-            for (offset, (expected, actual)) in mismatches.iter().take(10) {
+            for MismatchSample {
+                offset,
+                expected,
+                actual,
+            } in mismatch_samples
+            {
                 eprintln!(
                     "Mismatch at 0x{:08x}: expected 0x{:02x}, got 0x{:02x}",
-                    address + *offset as u32,
+                    address + offset as u32,
                     expected,
                     actual
                 );
             }
-            if !mismatches.is_empty() {
-                bail!("Verification failed: {} byte(s) differ", mismatches.len());
+            if mismatch_count != 0 {
+                bail!("Verification failed: {mismatch_count} byte(s) differ");
             }
             println!("Verification passed!");
         }
@@ -282,7 +319,12 @@ fn cmd_configure(cli: &Cli, chip_db_path: Option<&Path>, chip_name: &str) -> Res
     // Send to FPGA.  Must be stopped while CHIPCONFIG is processed,
     // otherwise spi_trx could read inconsistent cfg_* values mid-transfer.
     let mut device = open_device(cli)?;
-    device.with_emulation_stopped(|device| device.send_chip_config(chip, &sfdp_table))?;
+    device.configure(
+        chip.jedec_id_bytes(),
+        chip.total_size,
+        chip.supports_4byte(),
+        &sfdp_table,
+    )?;
 
     eprintln!("Configuration applied successfully.");
     Ok(())
@@ -428,7 +470,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_hex;
+    use super::{MismatchSample, decode_hex, summarize_mismatches};
 
     #[test]
     fn hex_decoder_accepts_ascii_whitespace() {
@@ -442,5 +484,24 @@ mod tests {
     fn hex_decoder_rejects_invalid_and_incomplete_input() {
         assert!(decode_hex("0g").is_err());
         assert!(decode_hex("abc").is_err());
+    }
+
+    #[test]
+    fn verification_counts_all_mismatches_but_bounds_samples() {
+        let expected = vec![0u8; 100];
+        let actual = vec![1u8; 100];
+        let (count, samples) = summarize_mismatches(&expected, &actual, 10);
+
+        assert_eq!(count, 100);
+        assert_eq!(samples.len(), 10);
+        assert_eq!(
+            samples[0],
+            MismatchSample {
+                offset: 0,
+                expected: 0,
+                actual: 1,
+            }
+        );
+        assert_eq!(samples[9].offset, 9);
     }
 }
