@@ -2,7 +2,7 @@
 
 use egui::Color32;
 use gloo_timers::future::TimeoutFuture;
-use js_sys::{Array, Uint8Array};
+use js_sys::{Array, Function, Uint8Array};
 use spi_flash_tool::WebFlashDevice;
 use spi_flash_tool::chip::{FlashChip, FlashChipExt};
 use spi_flash_tool::sfdp::generate_sfdp;
@@ -11,8 +11,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{Blob, BlobPropertyBag, HtmlAnchorElement, HtmlCanvasElement, HtmlInputElement, Url};
+use wasm_bindgen_futures::spawn_local;
+use web_sys::{
+    Blob, BlobPropertyBag, File, HtmlAnchorElement, HtmlCanvasElement, HtmlInputElement, Url,
+};
 
 #[derive(Default, PartialEq, Clone, Copy)]
 enum Panel {
@@ -43,7 +45,7 @@ struct SharedState {
     hold_enabled: Option<bool>,
     status: String,
     status_error: bool,
-    pending_file: Option<(String, Vec<u8>)>,
+    pending_file: Option<(String, File)>,
     read_data: Option<Vec<u8>>,
     log_output: String,
     log_pending: Vec<u8>,
@@ -99,7 +101,7 @@ struct NorbertWebApp {
     read_length: String,
     write_address: String,
     upload_name: String,
-    upload_data: Option<Vec<u8>>,
+    upload_file: Option<File>,
     verify_upload: bool,
     toctou_index: String,
     toctou_start: String,
@@ -131,7 +133,7 @@ impl NorbertWebApp {
             read_length: "256".to_owned(),
             write_address: "0x000000".to_owned(),
             upload_name: String::new(),
-            upload_data: None,
+            upload_file: None,
             verify_upload: false,
             toctou_index: "0".to_owned(),
             toctou_start: "0x001000".to_owned(),
@@ -183,9 +185,9 @@ impl NorbertWebApp {
                     }
                     .await;
 
-                    let mut shared = state.borrow_mut();
                     match details {
                         Ok((version, emulation_control, activity_log, running)) => {
+                            let mut shared = state.borrow_mut();
                             shared.device = Some(device);
                             shared.connection = ConnectionState::Connected;
                             shared.version = Some(version);
@@ -195,10 +197,20 @@ impl NorbertWebApp {
                             shared.status = "Connected successfully".to_owned();
                             shared.status_error = false;
                         }
-                        Err(error) => set_error(
-                            &mut shared,
-                            format!("Connection failed: {}", js_error(error)),
-                        ),
+                        Err(error) => {
+                            let cleanup = device.disconnect().await;
+                            let message = match cleanup {
+                                Ok(()) => format!("Connection failed: {}", js_error(error)),
+                                Err(cleanup_error) => format!(
+                                    "Connection failed: {}; cleanup also failed: {}",
+                                    js_error(error),
+                                    js_error(cleanup_error)
+                                ),
+                            };
+                            let mut shared = state.borrow_mut();
+                            shared.connection = ConnectionState::Error(message.clone());
+                            set_error(&mut shared, message);
+                        }
                     }
                 }
                 Err(error) => {
@@ -397,23 +409,10 @@ impl NorbertWebApp {
         let onchange = Closure::wrap(Box::new(move |event: web_sys::Event| {
             let input: HtmlInputElement = event.target().unwrap().dyn_into().unwrap();
             if let Some(file) = input.files().and_then(|files| files.get(0)) {
-                let filename = file.name();
-                let state = state.clone();
-                spawn_local(async move {
-                    match JsFuture::from(file.array_buffer()).await {
-                        Ok(buffer) => {
-                            let data = Uint8Array::new(&buffer).to_vec();
-                            let mut shared = state.borrow_mut();
-                            shared.pending_file = Some((filename, data));
-                            shared.status = "File loaded".to_owned();
-                            shared.status_error = false;
-                        }
-                        Err(error) => set_error(
-                            &mut state.borrow_mut(),
-                            format!("File read failed: {}", js_error(error)),
-                        ),
-                    }
-                });
+                let mut shared = state.borrow_mut();
+                shared.pending_file = Some((file.name(), file));
+                shared.status = "File selected".to_owned();
+                shared.status_error = false;
             }
         }) as Box<dyn FnMut(_)>);
         input.set_onchange(Some(onchange.as_ref().unchecked_ref()));
@@ -421,21 +420,20 @@ impl NorbertWebApp {
         input.click();
     }
 
-    fn write_memory(&self, address: u32, data: Vec<u8>, verify: bool, ctx: &egui::Context) {
+    fn write_memory(&self, address: u32, file: File, verify: bool, ctx: &egui::Context) {
         let state = self.state.clone();
         let repaint = ctx.clone();
         state.borrow_mut().busy = true;
         spawn_local(async move {
+            let progress = Closure::<dyn FnMut(f64, f64) -> bool>::new(|_, _| true);
+            let progress_fn: Function = progress.as_ref().unchecked_ref::<Function>().clone();
             let mut device = state.borrow_mut().device.take();
             let result = match device.as_mut() {
-                Some(device) => match device.write(address, data.clone()).await {
-                    Ok(()) if verify => match device.read(address, data.len() as u32).await {
-                        Ok(actual) if actual == data => Ok(()),
-                        Ok(_) => Err(wasm_bindgen::JsValue::from_str(
-                            "Verification failed: device contents differ from the selected file",
-                        )),
-                        Err(error) => Err(error),
-                    },
+                Some(device) => match device
+                    .write_file(address, file.clone(), progress_fn.clone())
+                    .await
+                {
+                    Ok(()) if verify => device.verify_file(address, file, progress_fn).await,
                     result => result,
                 },
                 None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
@@ -445,7 +443,6 @@ impl NorbertWebApp {
             shared.busy = false;
             match result {
                 Ok(()) => {
-                    shared.running = Some(true);
                     shared.status = "Upload complete".to_owned();
                     shared.status_error = false;
                 }
@@ -471,7 +468,6 @@ impl NorbertWebApp {
             match result {
                 Ok(data) => {
                     shared.read_data = Some(data);
-                    shared.running = Some(true);
                     shared.status = "Download complete".to_owned();
                     shared.status_error = false;
                 }
@@ -864,7 +860,9 @@ impl NorbertWebApp {
                     ui.label(format!(
                         "{} ({} bytes)",
                         self.upload_name,
-                        self.upload_data.as_ref().map_or(0, Vec::len)
+                        self.upload_file
+                            .as_ref()
+                            .map_or(0, |file| file.size() as usize)
                     ));
                 }
             });
@@ -874,14 +872,14 @@ impl NorbertWebApp {
                 let parsed = parse_number(&self.write_address);
                 if ui
                     .add_enabled(
-                        self.upload_data.is_some() && parsed.is_some() && !busy,
+                        self.upload_file.is_some() && parsed.is_some() && !busy,
                         egui::Button::new("Upload"),
                     )
                     .clicked()
                 {
                     self.write_memory(
                         parsed.unwrap(),
-                        self.upload_data.clone().unwrap(),
+                        self.upload_file.clone().unwrap(),
                         self.verify_upload,
                         ctx,
                     );
@@ -1078,9 +1076,9 @@ impl eframe::App for NorbertWebApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.selected_chip = self.state.borrow().configured_chip.clone();
 
-        if let Some((name, data)) = self.state.borrow_mut().pending_file.take() {
+        if let Some((name, file)) = self.state.borrow_mut().pending_file.take() {
             self.upload_name = name;
-            self.upload_data = Some(data);
+            self.upload_file = Some(file);
         }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {

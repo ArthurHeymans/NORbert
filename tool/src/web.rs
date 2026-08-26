@@ -20,6 +20,14 @@ const IO_TIMEOUT_MS: u32 = 5_000;
 const SERIAL_QUIET_MS: u32 = 50;
 const FILE_CHUNK_SIZE: usize = 1024 * 1024;
 
+fn file_length(file: &File) -> Result<usize> {
+    let size = file.size();
+    if !size.is_finite() || size <= 0.0 || size > u32::MAX as f64 {
+        bail!("file size must be between 1 byte and 4 GiB");
+    }
+    Ok(size as usize)
+}
+
 fn js_error(error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("{error:#}"))
 }
@@ -575,11 +583,7 @@ impl WebFlashDevice {
         file: File,
         on_progress: Function,
     ) -> Result<(), JsValue> {
-        let size = file.size();
-        if !size.is_finite() || size <= 0.0 || size > u32::MAX as f64 {
-            return Err(js_error("file size must be between 1 byte and 4 GiB"));
-        }
-        let length = size as usize;
+        let length = file_length(&file).map_err(js_error)?;
         let mut session = self
             .inner
             .begin_write(address, length)
@@ -616,6 +620,72 @@ impl WebFlashDevice {
         }
         .await;
         session.finish(operation).await.map_err(js_error)
+    }
+
+    /// Verify a browser File against SDRAM without retaining either the full
+    /// file or a full-device readback in WASM memory.
+    pub async fn verify_file(
+        &mut self,
+        address: u32,
+        file: File,
+        on_progress: Function,
+    ) -> Result<(), JsValue> {
+        let length = file_length(&file).map_err(js_error)?;
+        let was_running = self.inner.prepare_stopped().await.map_err(js_error)?;
+        let operation = async {
+            let mut offset = 0usize;
+            let mut completed = 0usize;
+            while offset < length {
+                let end = (offset + FILE_CHUNK_SIZE).min(length);
+                let blob = file
+                    .slice_with_f64_and_f64(offset as f64, end as f64)
+                    .map_err(|error| anyhow!(js_value_text(&error)))?;
+                let buffer = JsFuture::from(blob.array_buffer())
+                    .await
+                    .map_err(|error| anyhow!(js_value_text(&error)))?;
+                let expected = Uint8Array::new(&buffer).to_vec();
+                if expected.len() != end - offset {
+                    bail!("browser returned a truncated file chunk");
+                }
+
+                let chunk_address = address
+                    .checked_add(offset as u32)
+                    .ok_or_else(|| anyhow!("verification address overflow"))?;
+                self.inner
+                    .read_raw_chunks(chunk_address, expected.len() as u32, |actual_address, actual| {
+                        let expected_offset = (actual_address - chunk_address) as usize;
+                        let expected_chunk = &expected[expected_offset..expected_offset + actual.len()];
+                        if let Some((index, (&wanted, &found))) = expected_chunk
+                            .iter()
+                            .zip(actual)
+                            .enumerate()
+                            .find(|(_, (wanted, found))| wanted != found)
+                        {
+                            bail!(
+                                "verification failed at 0x{:08x}: expected 0x{wanted:02x}, got 0x{found:02x}",
+                                actual_address + index as u32
+                            );
+                        }
+                        completed += actual.len();
+                        let result = on_progress
+                            .call2(
+                                &JsValue::UNDEFINED,
+                                &JsValue::from_f64(completed as f64),
+                                &JsValue::from_f64(length as f64),
+                            )
+                            .map_err(|error| anyhow!(js_value_text(&error)))?;
+                        callback_result(result)
+                    })
+                    .await?;
+                offset = end;
+            }
+            Ok(())
+        }
+        .await;
+        self.inner
+            .finish_stopped(was_running, operation)
+            .await
+            .map_err(js_error)
     }
 
     pub async fn configure(

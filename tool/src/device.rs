@@ -1,6 +1,7 @@
 use crate::protocol::*;
 use anyhow::{Context, Result, bail};
 use std::mem::size_of;
+use std::time::{Duration, Instant};
 use zerocopy::IntoBytes;
 
 #[cfg(any(feature = "ftdi", feature = "wasm"))]
@@ -160,16 +161,28 @@ impl FlashDevice {
     }
 
     async fn read_exact(&mut self, buffer: &mut [u8]) -> Result<()> {
+        const MAX_EMPTY_READS: usize = 64;
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut offset = 0;
+        let mut empty_reads = 0;
+
         while offset < buffer.len() {
             let count = self.transport.read(&mut buffer[offset..]).await?;
             if count == 0 {
+                empty_reads += 1;
+                if empty_reads >= MAX_EMPTY_READS || Instant::now() >= deadline {
+                    bail!(
+                        "transport made no read progress: received {offset} of {} bytes",
+                        buffer.len()
+                    );
+                }
                 continue;
             }
             if count > buffer.len() - offset {
                 bail!("transport returned more bytes than requested");
             }
             offset += count;
+            empty_reads = 0;
         }
         Ok(())
     }
@@ -300,7 +313,7 @@ impl FlashDevice {
         Ok(result)
     }
 
-    async fn read_raw_chunks(
+    pub(crate) async fn read_raw_chunks(
         &mut self,
         address: u32,
         length: u32,
@@ -743,6 +756,17 @@ mod tests {
         fn is_connected(&self) -> bool {
             self.connected
         }
+    }
+
+    #[test]
+    fn repeated_empty_reads_fail_instead_of_hanging() {
+        let (transport, _) = MockTransport::new([]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+
+        let error = device.read_ack("test").unwrap_err().to_string();
+
+        assert!(error.contains("made no read progress"));
     }
 
     #[test]

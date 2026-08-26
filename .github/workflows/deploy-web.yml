@@ -32,6 +32,18 @@ jobs:
         with:
           tool: trunk
 
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libudev-dev pkg-config
+
+      - name: Test native tool
+        run: cargo test --manifest-path tool/Cargo.toml
+
+      - name: Lint native tool
+        run: cargo clippy --manifest-path tool/Cargo.toml --all-targets -- --deny warnings
+
+      - name: Lint WebAssembly tool
+        run: cargo clippy --manifest-path tool/Cargo.toml --target wasm32-unknown-unknown --no-default-features --features wasm -- --deny warnings
+
       - name: Build Web UI
         run: trunk build --release --public-url /NORbert/
 
