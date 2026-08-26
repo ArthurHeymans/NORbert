@@ -1,6 +1,5 @@
 use crate::chip::{self, FlashChipExt};
 use crate::protocol::*;
-#[cfg(any(feature = "d2xx", feature = "ftdi"))]
 use crate::transport::Ft245Transport;
 use crate::transport::{
     BLOCK_SIZE, SDRAM_SIZE_BYTES, SerialTransport, Transport, UART_READ_BLOCK_SIZE,
@@ -42,7 +41,6 @@ impl FlashDevice {
         })
     }
 
-    #[cfg(any(feature = "d2xx", feature = "ftdi"))]
     pub(crate) fn open_ft245(serial: Option<&str>) -> Result<Self> {
         Ok(Self {
             transport: Box::new(Ft245Transport::open(serial)?),
@@ -56,7 +54,7 @@ impl FlashDevice {
     }
 
     /// Read one response byte, transparently skipping stray 0x00 bytes
-    /// that the FT2232H 245 FIFO mode occasionally leaks through D2XX
+    /// that the FT2232H 245 FIFO mode can occasionally leak from USB
     /// (the 2-byte USB IN modem status header).  Used by all single-
     /// byte-ack commands.
     pub(crate) fn read_ack(&mut self, context: &str) -> Result<u8> {
