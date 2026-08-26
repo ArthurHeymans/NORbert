@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify tag matches Rust package version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          package_version="$(python3 - <<'PY'
+          import tomllib
+          with open("tool/Cargo.toml", "rb") as manifest:
+              print(tomllib.load(manifest)["package"]["version"])
+          PY
+          )"
+          test "$TAG_NAME" = "$package_version" || {
+            echo "Tag $TAG_NAME does not match Rust package version $package_version" >&2
+            exit 1
+          }
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Allow Gowin FHS sandbox
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
+      - name: Build FPGA bitstream
+        run: nix develop --command make build
+
+      - name: Package release bitstream
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          cp impl/pnr/spi_flash.fs spi_flash.fs
+          cp impl/pnr/spi_flash.fs "norbert-${TAG_NAME}-tangprimer25k.fs"
+          sha256sum spi_flash.fs "norbert-${TAG_NAME}-tangprimer25k.fs" > SHA256SUMS
+          cat > release-notes.md <<EOF
+          ## Programming the Tang Primer 25K
+
+          Download \`spi_flash.fs\` (or the versioned copy) and program it with [openFPGALoader](https://github.com/trabucayre/openFPGALoader):
+
+          \`\`\`sh
+          # Volatile: runs immediately, lost on power-off
+          openFPGALoader -b tangprimer25k spi_flash.fs
+
+          # Persistent: boots automatically after power-on
+          openFPGALoader -b tangprimer25k -f spi_flash.fs
+          \`\`\`
+
+          You can also open the [NORbert Web UI](https://arthurheymans.github.io/NORbert/), choose **Bitstream**, select the downloaded \`.fs\` file, and program SRAM or flash through WebUSB. Chromium and an HTTPS/localhost page are required.
+
+          The release tag and Rust package version are both \`${TAG_NAME}\`.
+          EOF
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" \
+            --title "NORbert $TAG_NAME" \
+            --notes-file release-notes.md \
+            spi_flash.fs \
+            "norbert-${TAG_NAME}-tangprimer25k.fs" \
+            SHA256SUMS

@@ -10,6 +10,9 @@ pub mod chip;
 pub mod sfdp;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub mod gowin;
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod device;
 
