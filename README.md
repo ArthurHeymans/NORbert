@@ -24,6 +24,23 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 - SPI signals exposed on PMOD connector J5
 - **Optional:** FT2232H breakout board for FT245 high-speed transport (e.g., CJMCU-FT2232H or any FT2232H module)
 
+## SPI Flash Pin Mapping
+
+NORbert exposes the SPI flash interface on the **PMOD J5** connector of the Tang Primer 25K Dock. The table below maps the standard SPI flash signals to the corresponding FPGA I/O pins:
+
+| SPI Signal | FPGA Pin | PMOD J5 Pin | Notes                              |
+|------------|----------|-------------|------------------------------------|
+| `/CS#`     | `T9`     | 1           | Chip Select (active-low)           |
+| `SCK`      | `T8`     | 2           | SPI Clock                          |
+| `D0/DO`    | `R9`     | 3           | Data Out / IO0                     |
+| `D1/DI`    | `R8`     | 4           | Data In / IO1                      |
+| `D2`       | `L8`     | 5           | IO2 (used for Dual/Quad reads)     |
+| `D3`       | `L9`     | 6           | IO3 / `#HOLD#` (shared function)   |
+| `GND`      | —        | 10          | Ground                             |
+| `VCC`      | —        | 9           | 3.3V Power                         |
+
+*Note: D3 and `#HOLD#` share the physical IO3 pin. Asserting `#HOLD` drives it low to silence a real flash on a shared bus. Consult the `.lpf` constraint file for exact pin assignments.*
+
 ## Building
 
 ### Prerequisites
