@@ -404,7 +404,7 @@ impl NorbertWebApp {
             .dyn_into()
             .unwrap();
         input.set_type("file");
-        input.set_accept(".bin,.rom,.img,*");
+        input.set_accept(".bin,.rom,.img,*/*");
         let state = self.state.clone();
         let onchange = Closure::wrap(Box::new(move |event: web_sys::Event| {
             let input: HtmlInputElement = event.target().unwrap().dyn_into().unwrap();

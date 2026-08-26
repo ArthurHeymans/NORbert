@@ -276,7 +276,11 @@ impl FlashDevice {
         length: u32,
         mut progress: impl FnMut(usize) -> Result<()>,
     ) -> Result<Vec<u8>> {
-        let mut result = Vec::with_capacity(length as usize);
+        validate_sdram_range(address, length as usize, "read")?;
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(length as usize)
+            .context("failed to reserve read result buffer")?;
         self.read_chunks(address, length, |_, chunk| {
             result.extend_from_slice(chunk);
             progress(chunk.len())
@@ -756,6 +760,21 @@ mod tests {
         fn is_connected(&self) -> bool {
             self.connected
         }
+    }
+
+    #[test]
+    fn out_of_range_read_is_rejected_before_transport_io() {
+        let (transport, writes) = MockTransport::new([]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+
+        let error = device
+            .read(SDRAM_SIZE_BYTES as u32, 1)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("exceeds 64 MiB SDRAM"));
+        assert!(writes.borrow().is_empty());
     }
 
     #[test]
