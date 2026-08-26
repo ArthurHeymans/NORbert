@@ -4,7 +4,6 @@ use super::*;
 // Probe command -- ftdi-nusb backend
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "ftdi")]
 pub(super) fn cmd_probe(cli: &Cli) -> Result<()> {
     // Open FT2232H via rs-ftdi
     eprintln!("Opening FT2232H for probe (ftdi-nusb)...");
@@ -143,19 +142,9 @@ pub(super) fn cmd_probe(cli: &Cli) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Probe command -- no FT245 backend
-// ---------------------------------------------------------------------------
-
-#[cfg(not(feature = "ftdi"))]
-pub(super) fn cmd_probe(_cli: &Cli) -> Result<()> {
-    bail!("Probe requires the 'ftdi' feature");
-}
-
-// ---------------------------------------------------------------------------
 // FT-list command
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "ftdi")]
 pub(super) fn cmd_ft_list() -> Result<()> {
     let devices = ftdi::find_devices(FTDI_VID, FT2232H_PID)
         .map_err(|e| anyhow!(e))
@@ -185,9 +174,4 @@ pub(super) fn cmd_ft_list() -> Result<()> {
     println!("Use --ft-serial <SERIAL> to select a specific device.");
     println!("Channel A is used by default for async FIFO.");
     Ok(())
-}
-
-#[cfg(not(feature = "ftdi"))]
-pub(super) fn cmd_ft_list() -> Result<()> {
-    bail!("ft-list requires the 'ftdi' feature");
 }

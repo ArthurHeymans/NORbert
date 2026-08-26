@@ -9,7 +9,6 @@ use crate::cli::{Cli, HoldState, ToctouAction};
 use crate::device::FlashDevice;
 use crate::protocol::*;
 use crate::sfdp;
-#[cfg(feature = "ftdi")]
 use crate::transport::{FT2232H_PID, FTDI_VID};
 use anyhow::{Context, Result, anyhow, bail};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -50,13 +49,8 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 
 fn open_device(cli: &Cli) -> Result<FlashDevice> {
     if cli.ft245 {
-        #[cfg(feature = "ftdi")]
-        {
-            eprintln!("Opening FT2232H in async FIFO mode (ftdi-nusb)...");
-            return FlashDevice::open_ft245(cli.ft_serial.as_deref());
-        }
-        #[cfg(not(feature = "ftdi"))]
-        bail!("--ft245 requires the 'ftdi' feature (enabled by default)");
+        eprintln!("Opening FT2232H in async FIFO mode (ftdi-nusb)...");
+        return FlashDevice::open_ft245(cli.ft_serial.as_deref());
     }
     FlashDevice::open_serial(&cli.port)
 }

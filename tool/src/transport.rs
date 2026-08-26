@@ -1,12 +1,10 @@
 use crate::protocol::CMD_VERSION;
-#[cfg(feature = "ftdi")]
 use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use serialport::SerialPort;
 use std::io::{Read, Write};
 use std::thread;
 use std::time::Duration;
-#[cfg(feature = "ftdi")]
 use std::time::Instant;
 
 const BAUD_RATE: u32 = 2_000_000;
@@ -26,9 +24,7 @@ pub(crate) const UART_READ_BLOCK_SIZE: usize = 4096; // 512 bursts * 8 bytes
 pub(crate) const SDRAM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
 // FT2232H USB identifiers
-#[cfg(feature = "ftdi")]
 pub(crate) const FTDI_VID: u16 = 0x0403;
-#[cfg(feature = "ftdi")]
 pub(crate) const FT2232H_PID: u16 = 0x6010;
 
 // ---------------------------------------------------------------------------
@@ -146,12 +142,10 @@ impl Transport for SerialTransport {
 // FT245 transport -- ftdi-nusb backend (pure Rust)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "ftdi")]
 pub(crate) struct Ft245Transport {
     dev: ftdi::FtdiDevice,
 }
 
-#[cfg(feature = "ftdi")]
 impl Ft245Transport {
     pub(crate) fn open(serial: Option<&str>) -> Result<Self> {
         // Open the FT2232H Channel A.  The EEPROM must already be
@@ -211,7 +205,6 @@ impl Ft245Transport {
     }
 }
 
-#[cfg(feature = "ftdi")]
 impl Transport for Ft245Transport {
     fn write_all(&mut self, data: &[u8]) -> Result<()> {
         self.dev.write_all(data).map_err(|e| anyhow!(e))?;

@@ -1,6 +1,5 @@
 use crate::chip::{self, FlashChipExt};
 use crate::protocol::*;
-#[cfg(feature = "ftdi")]
 use crate::transport::Ft245Transport;
 use crate::transport::{
     BLOCK_SIZE, SDRAM_SIZE_BYTES, SerialTransport, Transport, UART_READ_BLOCK_SIZE,
@@ -42,7 +41,6 @@ impl FlashDevice {
         })
     }
 
-    #[cfg(feature = "ftdi")]
     pub(crate) fn open_ft245(serial: Option<&str>) -> Result<Self> {
         Ok(Self {
             transport: Box::new(Ft245Transport::open(serial)?),
