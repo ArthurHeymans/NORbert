@@ -146,19 +146,19 @@ impl Transport for SerialTransport {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "ftdi")]
-pub(crate) fn open_ft2232h(serial: Option<&str>) -> Result<ftdi_nusb::FtdiDevice> {
+pub(crate) fn open_ft2232h(serial: Option<&str>) -> Result<ftdi_nusb::blocking::FtdiDevice> {
     if let Some(serial) = serial {
         let filter = ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).serial(serial);
-        return ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
+        return ftdi_nusb::blocking::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
             .with_context(|| format!("No FT2232H with serial '{serial}'"));
     }
 
     // DeviceFilter matches the USB product string configured in ft2232h.conf;
     // the interface is selected separately below.
     let filter = ftdi_nusb::DeviceFilter::new(FTDI_VID, FT2232H_PID).description("NORbert FT245");
-    ftdi_nusb::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
+    ftdi_nusb::blocking::FtdiDevice::open_with_filter(&filter, ftdi_nusb::Interface::A)
         .or_else(|_| {
-            ftdi_nusb::FtdiDevice::open_with_interface(
+            ftdi_nusb::blocking::FtdiDevice::open_with_interface(
                 FTDI_VID,
                 FT2232H_PID,
                 ftdi_nusb::Interface::A,
@@ -169,7 +169,7 @@ pub(crate) fn open_ft2232h(serial: Option<&str>) -> Result<ftdi_nusb::FtdiDevice
 
 #[cfg(feature = "ftdi")]
 pub(crate) struct Ft245Transport {
-    dev: ftdi_nusb::FtdiDevice,
+    dev: ftdi_nusb::blocking::FtdiDevice,
 }
 
 #[cfg(feature = "ftdi")]
