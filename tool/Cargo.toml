@@ -14,7 +14,7 @@ cli = [
     "dep:rflasher-chips",
     "dep:ctrlc",
 ]
-ftdi = ["cli", "dep:ftdi-nusb", "ftdi-nusb/std", "dep:nusb"]
+ftdi = ["cli", "dep:ftdi-nusb", "dep:nusb"]
 wasm = [
     "dep:async-trait",
     "dep:eframe",
@@ -23,7 +23,6 @@ wasm = [
     "dep:tracing-wasm",
     "dep:rflasher-chips",
     "dep:ftdi-nusb",
-    "ftdi-nusb/wasm",
     "dep:nusb",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
@@ -36,7 +35,7 @@ wasm = [
 [dependencies]
 anyhow = "1.0"
 async-trait = { version = "0.1.92", optional = true }
-ftdi-nusb = { version = "0.2", default-features = false, optional = true }
+ftdi-nusb = { version = "0.3.0", default-features = false, optional = true }
 nusb = { version = "0.2.7", optional = true }
 zerocopy = { version = "=0.8.55", features = ["derive"] }
 wasm-bindgen = { version = "0.2.127", optional = true }
