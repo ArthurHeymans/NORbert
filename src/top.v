@@ -213,6 +213,7 @@ module top(
     wire spi_ram_inhibit_refresh;
     wire spi_ram_activate;
     wire spi_ram_read;
+    wire spi_ram_continuation;
     wire [22:0] spi_ram_addr;    // 23-bit for 64MB addressing
     
     wire spi_write_cmd;
@@ -232,6 +233,7 @@ module top(
     wire log_cmd_valid;
     wire [7:0] log_cmd_opcode;
     wire log_addr_valid;
+    wire log_addr_toggle;
     wire [31:0] log_addr_out;
     wire [23:0] log_byte_count;
     
@@ -269,6 +271,7 @@ module top(
         .ram_inhibit_refresh(spi_ram_inhibit_refresh),
         .ram_activate(spi_ram_activate),
         .ram_read(spi_ram_read),
+        .ram_continuation(spi_ram_continuation),
         
         .ram_addr(spi_ram_addr),
         .ram_read_buffer(sdram_read_buffer),
@@ -297,6 +300,7 @@ module top(
         .log_cmd_valid(log_cmd_valid),
         .log_cmd_opcode(log_cmd_opcode),
         .log_addr_valid(log_addr_valid),
+        .log_addr_toggle(log_addr_toggle),
         .log_addr_out(log_addr_out),
         .log_byte_count(log_byte_count)
     );
@@ -310,25 +314,21 @@ module top(
     // them into the system clock domain with edge detection in glue.
     // -----------------------------------------------------------
     
-    reg log_addr_toggle_spi = 0;
-    reg [31:0] log_addr_hold_spi = 0;
-    always @(posedge spi_clk_in) begin
-        if (log_addr_valid) begin
-            log_addr_hold_spi <= log_addr_out;
-            log_addr_toggle_spi <= !log_addr_toggle_spi;
-        end
-    end
-
+    // spi_trx captures the address and toggles its event on the FINAL
+    // address bit, without waiting another SPI edge. That head start is
+    // needed for no-dummy reads near the end of a burst: their next
+    // ACTIVATE can be posted on the very first data clock.
     reg [2:0] log_addr_toggle_sys;
     reg [1:0] spi_active_sys;
-    reg [31:0] log_addr_latched;
     
     always @(posedge clk) begin
-        log_addr_toggle_sys <= {log_addr_toggle_sys[1:0], log_addr_toggle_spi};
+        log_addr_toggle_sys <= {log_addr_toggle_sys[1:0], log_addr_toggle};
         spi_active_sys      <= {spi_active_sys[0], spi_active};
-        if (log_addr_toggle_sys[2] != log_addr_toggle_sys[1])
-            log_addr_latched <= log_addr_hold_spi;
     end
+
+    // The SPI-side address is held stable before its synchronized toggle
+    // arrives. Glue captures that payload on the event edge itself;
+    // re-latching here on that same edge would give glue the PREVIOUS address.
 
     wire log_addr_valid_pulse_sys = log_addr_toggle_sys[2] != log_addr_toggle_sys[1];
     
@@ -341,16 +341,17 @@ module top(
     //   new_addr = (redirect_base & redirect_mask) |
     //              (original_addr & ~redirect_mask)
     //
-    // The first 8 bytes of a redirected read use the original
-    // address (the SDRAM pipeline fires before the trap check
-    // completes).  All subsequent bursts use the redirected address.
+    // The first SDRAM burst always uses the original address. The SPI
+    // engine marks subsequent requests explicitly, so a trap completing
+    // between a refresh-delayed initial ACTIVATE and READ cannot mix an
+    // original row/bank with a replacement column.
     // -----------------------------------------------------------
     
     wire redirect_active;
     wire [22:0] redirect_mask;
     wire [22:0] redirect_base;
     
-    wire [22:0] spi_ram_addr_final = redirect_active ?
+    wire [22:0] spi_ram_addr_final = (redirect_active && spi_ram_continuation) ?
         ((redirect_base & redirect_mask) | (spi_ram_addr & ~redirect_mask)) :
         spi_ram_addr;
     
@@ -536,6 +537,7 @@ module top(
     glue glue_i(
         .clk(clk),
         .reset(reset),
+        .spi_clk(spi_clk_in),   // SFDP BSRAM read-port clock
         
         // UART byte interface
         .rxd_strobe(uart_rxd_strobe),
@@ -599,7 +601,7 @@ module top(
 
 
         .log_addr_valid_sync(log_addr_valid_pulse_sys),
-        .log_addr_sync(log_addr_latched[23:0]),
+        .log_addr_sync(log_addr_out[23:0]),
         .spi_active_sync(spi_active_sys[1]),
 
         .redirect_active(redirect_active),

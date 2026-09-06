@@ -74,14 +74,15 @@ module glue(
     output reg [22:0] cfg_chip_erase_bursts,
     
     // SFDP table read interface (for spi_trx)
+    input wire spi_clk,              // SPI clock: read-port clock for the SFDP BSRAM
     input wire [6:0] sfdp_raddr,
-    output wire [7:0] sfdp_rdata,
+    output wire [7:0] sfdp_rdata,     // Synchronous BSRAM read, invalid bytes read as 0xFF
     
     // SPI emulation enable (1 = running, 0 = stopped).
     // Exported to top.v which uses it to gate spi_reset feeding both
     // spi_trx and back into this module -- so while stopped the SPI pins
     // are ignored and serial commands always have a clear path.
-    output reg spi_running,
+    output wire spi_running,
 
     // Target flash HOLD control (active high: 1 = assert #HOLD on target)
     output reg hold_out,
@@ -260,28 +261,61 @@ module glue(
     reg [3:0] i_spi_write_state;
     reg [22:0] i_spi_len;
     
-    // Page program buffer (256 bytes + write flags)
-    reg [8:0] i_spi_write_data [0:255];
+    // Page program buffer: 256 bytes + write flags in one BSRAM.
+    // Prefetch eight entries while SDRAM activates/reads the old burst,
+    // hiding the synchronous byte-wide RAM latency behind the SDRAM access.
+    reg [8:0] pp_mem [0:255];
+    reg [7:0] pp_waddr;
+    reg [8:0] pp_wdata;
+    reg pp_wren;
+    reg [7:0] pp_raddr;
+    reg [8:0] pp_rdata;
+    reg pp_prefetch;
+    reg pp_capture_valid;
+    reg [2:0] pp_capture_idx;
+    reg [71:0] pp_burst;
+    reg pp_burst_ready;
+    reg [8:0] pp_init_cnt;      // boot init cursor (zero all 256 entries)
+    reg pp_init_done;
+    reg spi_run_requested;
+    // START may arrive during initialization, but SPI cannot fill the
+    // page buffer until its final initialization write has committed.
+    assign spi_running = spi_run_requested && pp_init_done;
     reg [1:0] spi_write_buf_strobe_buf;
     reg spi_write_buf_ack;
     
     reg [7:0] spi_write_buf_offset_reg;
     reg [7:0] spi_write_buf_val_reg;
 
-    // SFDP table storage (128 bytes, written by CHIPCONFIG, read by spi_trx)
+    // SFDP table storage: 128 bytes in a dual-clock BSRAM.  A valid
+    // length makes unwritten bytes read as 0xFF without a boot scrub
+    // competing with CHIPCONFIG for the write port.  Configuration is
+    // stable while SPI runs; a zero/shorter table hides old contents.
     reg [7:0] sfdp_mem [0:127];
-    assign sfdp_rdata = sfdp_mem[sfdp_raddr];
+    reg [6:0] sfdp_waddr;
+    reg [7:0] sfdp_wdata;
+    reg sfdp_wren;
+    reg [7:0] sfdp_valid_len;
+    reg [7:0] sfdp_read_byte;
+    reg sfdp_read_valid;
+    assign sfdp_rdata = sfdp_read_valid ? sfdp_read_byte : 8'hFF;
     
     // CHIPCONFIG state
     reg [6:0] sfdp_wr_pos;
     reg [7:0] cfg_sfdp_remaining;
     
     // TOCTOU trap table (4 entries)
-    reg [23:0] trap_start [0:3];     // Byte address match value
+    reg [23:0] trap_start [0:3];     // Byte address match value, pre-masked at SET
     reg [23:0] trap_mask  [0:3];     // Byte address mask (1 = must match)
     reg [23:0] trap_replace [0:3];   // Byte address replacement base
     reg [3:0]  trap_armed;           // Trap is active
     reg [3:0]  trap_triggered;       // First read has occurred, next read redirects
+
+    // Separate address comparison from the priority/redirect mux. This
+    // adds one system clock, well inside the first (unredirected) SPI
+    // burst; subsequent bursts still see the replacement address.
+    reg [3:0] trap_match_pending;
+    reg trap_check_pending;
     
     // TOCTOU command parsing state
     reg [7:0]  toctou_sub_cmd;
@@ -293,9 +327,6 @@ module glue(
     reg log_addr_valid_prev;
     wire log_addr_event = log_addr_valid_sync && !log_addr_valid_prev;
     
-    // SPI active edge detection for redirect clear
-    reg spi_active_prev;
-    
     // Convert 23-bit burst address to 25-bit access_addr for SDRAM controller
     // Burst address: [22]=chip, [21:9]=row, [8:7]=bank, [6:0]=col_burst
     // Access addr:   [24]=chip, [23:11]=row, [10:9]=bank, [8:0]=col
@@ -303,6 +334,20 @@ module glue(
     wire [24:0] addr_to_access = {addr[22], addr[21:9], addr[8:7], addr[6:0], 2'b00};
 
     integer i;
+
+    // Page-buffer BSRAM read port (system clock domain -- same domain as
+    // the write port, so this infers single-clock simple-dual-port RAM).
+    always @(posedge clk) begin
+        pp_rdata <= pp_mem[pp_raddr];
+    end
+
+    // SFDP BSRAM read port (SPI clock domain -- same domain as the
+    // sfdp_raddr source and sfdp_rdata consumer in spi_trx, so there is
+    // no clock-domain crossing on this path).
+    always @(posedge spi_clk) begin
+        sfdp_read_byte <= sfdp_mem[sfdp_raddr];
+        sfdp_read_valid <= {1'b0, sfdp_raddr} < sfdp_valid_len;
+    end
 
     always @(posedge clk) begin
         if (reset) begin
@@ -373,7 +418,8 @@ module glue(
             toctou_index <= 0;
             
             log_addr_valid_prev <= 0;
-            spi_active_prev <= 0;
+            trap_match_pending <= 0;
+            trap_check_pending <= 0;
             
             cfg_jedec_id <= {8'h17, 8'h40, 8'hEF};  // Default: W25Q64FV (EF 40 17)
             cfg_4byte <= 0;
@@ -384,11 +430,8 @@ module glue(
             // Start with SPI emulation STOPPED so the host can always
             // reach the FPGA regardless of target-board state; the host
             // tool sends START explicitly after loading firmware.
-            spi_running <= 0;
+            spi_run_requested <= 0;
 
-            for (i = 0; i < 256; i = i + 1)
-                i_spi_write_data[i][8] <= 0;
-            
             for (i = 0; i < 4; i = i + 1) begin
                 trap_start[i] <= 0;
                 trap_mask[i] <= 0;
@@ -397,12 +440,30 @@ module glue(
             
             tx_wait <= 0;
 
-            for (i = 0; i < 128; i = i + 1)
-                sfdp_mem[i] <= 8'hFF;
+            // Scrub page-buffer flags after reset before enabling SPI.
+            // SFDP needs only a validity reset, not physical RAM writes.
+            pp_waddr <= 0;
+            pp_wdata <= 0;
+            pp_wren <= 0;
+            pp_raddr <= 0;
+            pp_prefetch <= 0;
+            pp_capture_valid <= 0;
+            pp_capture_idx <= 0;
+            pp_burst <= 0;
+            pp_burst_ready <= 0;
+            pp_init_cnt <= 0;
+            pp_init_done <= 0;
+
+            sfdp_waddr <= 0;
+            sfdp_wdata <= 8'hFF;
+            sfdp_wren <= 0;
+            sfdp_valid_len <= 0;
         end
         else begin
             txd_strobe_buf <= 0;
             log_fifo_read_strobe <= 0;
+            pp_wren <= 0;
+            sfdp_wren <= 0;
 
             // TX pipeline cooldown
             if (txd_strobe_buf)
@@ -447,6 +508,33 @@ module glue(
                 if (ft_rx_hold) ft_rx_hold <= 0;
             end
             
+            // Keep SPI disabled until all 256 flag clears have reached RAM.
+            if (!pp_init_done) begin
+                if (pp_init_cnt == 9'd256) begin
+                    pp_init_done <= 1'b1;
+                    // A boot-time START is acknowledged only once SPI
+                    // can actually run, not while its buffer is dirty.
+                    if (spi_run_requested) begin
+                        txd_strobe_buf <= 1;
+                        txd_data_buf <= 8'h01;
+                    end
+                end else begin
+                    pp_waddr <= pp_init_cnt[7:0];
+                    pp_wdata <= 9'h000;
+                    pp_wren <= 1'b1;
+                    pp_init_cnt <= pp_init_cnt + 1'b1;
+                end
+            end
+
+            // BSRAM write ports: one shared statement per RAM covers the
+            // boot init, the SPI fill / CHIPCONFIG protocol writes, and
+            // the prefetch self-clear (all arbitrated via pp_wren/sfdp_wren
+            // above and below -- later assignments win the port regs).
+            if (pp_wren)
+                pp_mem[pp_waddr] <= pp_wdata;
+            if (sfdp_wren)
+                sfdp_mem[sfdp_waddr] <= sfdp_wdata;
+
             sdram_access_addr <= addr_to_access;
             // Snapshot write_buffer into sdram_write_buffer.
             //
@@ -502,23 +590,27 @@ module glue(
             
             // -------------------------------------------------------
             // TOCTOU trap check: on address phase completion, compare
-            // against all 4 trap entries.  First match wins.
+            // against all 4 trap entries. All matches trigger; the highest
+            // already-triggered matching index selects the redirect.
             //
             // - Armed && !Triggered: mark triggered (serve original data)
             // - Armed && Triggered:  activate redirect (serve replacement)
             // -------------------------------------------------------
             log_addr_valid_prev <= log_addr_valid_sync;
-            spi_active_prev <= spi_active_sync;
+            trap_check_pending <= log_addr_event;
             trap_notify_strobe <= 0;
-            
+
             if (log_addr_event) begin
-                // Check read commands only (opcodes 0x03, 0x0B, 0x0C, 0x13,
-                // 0x3B, 0x6B, 0xBB, 0xEB and SFDP 0x5A).
-                // We check all traps; the address comparison handles filtering.
+                // Address payload and match bits advance together. The
+                // logger consumes the payload only with the later strobe.
+                trap_notify_addr <= log_addr_sync;
+                for (i = 0; i < 4; i = i + 1)
+                    trap_match_pending[i] <= trap_armed[i] &&
+                        ((log_addr_sync & trap_mask[i]) == trap_start[i]);
+            end
+            if (trap_check_pending) begin
                 for (i = 0; i < 4; i = i + 1) begin
-                    if (trap_armed[i] &&
-                        ((log_addr_sync & trap_mask[i]) ==
-                         (trap_start[i] & trap_mask[i]))) begin
+                    if (trap_match_pending[i]) begin
                         if (!trap_triggered[i]) begin
                             // First access: mark triggered, serve original data
                             trap_triggered[i] <= 1;
@@ -533,14 +625,14 @@ module glue(
                             
                             trap_notify_strobe <= 1;
                             trap_notify_index  <= i[1:0];
-                            trap_notify_addr   <= log_addr_sync;
                         end
                     end
                 end
             end
             
-            // Clear redirect when SPI transaction ends (CS deasserts)
-            if (spi_active_prev && !spi_active_sync)
+            // Also suppress a pending redirect that completes after CS
+            // deasserts; it must not leak into the following transaction.
+            if (!spi_active_sync)
                 redirect_active <= 0;
                 
             // SPI write buffer handling
@@ -554,8 +646,14 @@ module glue(
             if (!spi_write_buf_strobe_buf[1])
                 spi_write_buf_ack <= 0;
                 
-            if (spi_write_buf_strobe_buf[1] && !spi_write_buf_ack) begin
-                i_spi_write_data[spi_write_buf_offset_reg] <= {1'b1, spi_write_buf_val_reg};
+            // Page-buffer fill: single-cycle BSRAM write pulse.  Never
+            // overlaps the RMW prefetch for a compliant master:
+            // a new data phase cannot start until WIP clears, i.e.
+            // until spi_writing drops.
+            if (spi_write_buf_strobe_buf[1] && !spi_write_buf_ack && pp_init_done) begin
+                pp_waddr <= spi_write_buf_offset_reg;
+                pp_wdata <= {1'b1, spi_write_buf_val_reg};
+                pp_wren <= 1'b1;
                 spi_write_buf_ack <= 1;
             end
             
@@ -565,7 +663,8 @@ module glue(
             if (!spi_cmd_write_buf[1])
                 spi_write_ack <= 0;
 
-            if (spi_cmd_write_buf[1] && !spi_write_ack && spi_csel_buf[1]) begin
+            // The page buffer must be initialized before accepting writes.
+            if (spi_cmd_write_buf[1] && !spi_write_ack && spi_csel_buf[1] && pp_init_done) begin
                 spi_writing <= 1;
                 spi_write_ack <= 1;
                 
@@ -584,6 +683,27 @@ module glue(
                     write_buffer <= 64'hFFFFFFFFFFFFFFFF;
             end
             
+            // Stream the page-buffer burst independently of sdram_busy.
+            // pp_raddr is registered, then pp_rdata: skip the first cycle
+            // before capturing byte 0.  Consumed flags are cleared through
+            // the write port, behind the advancing read address.
+            if (pp_prefetch) begin
+                pp_capture_valid <= 1'b1;
+                if (pp_raddr[2:0] != 3'd7)
+                    pp_raddr <= pp_raddr + 1'b1;
+                if (pp_capture_valid) begin
+                    pp_burst[pp_capture_idx*9 +: 9] <= pp_rdata;
+                    pp_waddr <= {addr[4:0], pp_capture_idx};
+                    pp_wdata <= 9'h000;
+                    pp_wren <= 1'b1;
+                    if (pp_capture_idx == 3'd7) begin
+                        pp_prefetch <= 0;
+                        pp_burst_ready <= 1;
+                    end else
+                        pp_capture_idx <= pp_capture_idx + 1'b1;
+                end
+            end
+
             // SPI write state machine
             if (spi_writing && !sdram_busy) begin
                 if (i_spi_write_state == 0) begin
@@ -623,14 +743,8 @@ module glue(
                 else if (i_spi_write_state == 5) begin
                     spi_writing <= 0;
                     spi_write_done <= !spi_write_done;
-                    
-                    // Clear page buffer write flags after SPI-originated
-                    // programs so the next program starts with a clean flag
-                    // state and cannot reuse stale bytes.
-                    if (i_spi_write_type == 2'd0 || i_spi_write_type == 2'd2) begin
-                        for (i = 0; i < 256; i = i + 1)
-                            i_spi_write_data[i][8] <= 0;
-                    end
+                    // The prefetch cleared all consumed flags.  PP visits
+                    // all 32 bursts; AAI accepts only one aligned word.
                 end
                 // ---------------------------------------------------------
                 // SPI program Read-Modify-Write (page program or AAI).
@@ -641,13 +755,17 @@ module glue(
                 // Programmed bytes are merged as old & new to preserve NOR
                 // flash semantics (program can clear bits, not set them).
                 //
-                // State 6: Activate row for read
+                // State 6: Activate SDRAM row and start BSRAM prefetch
                 // State 7: Issue SDRAM read command
-                // State 8: Merge page buffer bytes into read data,
-                //          then continue to state 2 (activate for write)
+                // State 8: Merge both bursts, then activate for write
                 // ---------------------------------------------------------
                 else if (i_spi_write_state == 6) begin
-                    // Activate for read
+                    // Fetch the page-buffer bytes during SDRAM latency.
+                    pp_raddr <= {addr[4:0], 3'b000};
+                    pp_prefetch <= 1;
+                    pp_capture_valid <= 0;
+                    pp_capture_idx <= 0;
+                    pp_burst_ready <= 0;
                     sdram_access_cmd <= 2'b11;
                     i_spi_write_state <= 7;
                 end
@@ -657,15 +775,15 @@ module glue(
                     i_spi_write_state <= 8;
                 end
                 else if (i_spi_write_state == 8) begin
-                    // Merge: for each byte in the burst, use page buffer
-                    // data if its write flag is set, otherwise keep SDRAM data.
-                    for (i = 0; i < 8; i = i + 1) begin
-                        if (i_spi_write_data[{addr[4:0], 3'b000} + i][8])
-                            write_buffer[i*8 +: 8] <= sdram_read_buffer[i*8 +: 8] & i_spi_write_data[{addr[4:0], 3'b000} + i][7:0];
-                        else
-                            write_buffer[i*8 +: 8] <= sdram_read_buffer[i*8 +: 8];
+                    if (pp_burst_ready) begin
+                        for (i = 0; i < 8; i = i + 1) begin
+                            if (pp_burst[i*9 + 8])
+                                write_buffer[i*8 +: 8] <= sdram_read_buffer[i*8 +: 8] & pp_burst[i*9 +: 8];
+                            else
+                                write_buffer[i*8 +: 8] <= sdram_read_buffer[i*8 +: 8];
+                        end
+                        i_spi_write_state <= 2;
                     end
-                    i_spi_write_state <= 2;  // Activate for write
                 end
             end
             
@@ -703,12 +821,17 @@ module glue(
                     txd_data_buf <= VERSION;
                 end
                 CMD_START: begin
-                    spi_running <= 1;
-                    txd_strobe_buf <= 1;
-                    txd_data_buf <= 8'h01;
+                    spi_run_requested <= 1;
+                    // The init completion path replies to an earlier START.
+                    // Include this edge's final write to avoid losing an
+                    // ACK when START coincides with initialization completion.
+                    if (pp_init_done || pp_init_cnt == 9'd256) begin
+                        txd_strobe_buf <= 1;
+                        txd_data_buf <= 8'h01;
+                    end
                 end
                 CMD_STOP: begin
-                    spi_running <= 0;
+                    spi_run_requested <= 0;
                     txd_strobe_buf <= 1;
                     txd_data_buf <= 8'h01;
                 end
@@ -792,7 +915,7 @@ module glue(
             // chip config) plus all multi-byte continuations and the
             // serial SDRAM read/write state machines.  Gated on SPI bus
             // idle so we never race with an in-flight SPI transaction,
-            // and initial commands are additionally gated on !spi_running
+            // and initial commands are additionally gated on !spi_run_requested
             // so the host cannot accidentally disturb live emulation.
             // -----------------------------------------------------------
             if ((spi_reset || spi_csel_buf[1]) && !spi_writing) begin
@@ -820,7 +943,7 @@ module glue(
                             cmd <= CMD_TOCTOU;
                             in_count <= 1;
                         end
-                        else if (!spi_running) begin
+                        else if (!spi_run_requested) begin
                             if (rxd_data_buf == CMD_RAMREAD ||
                                 rxd_data_buf == CMD_RAMWRITE) begin
                                 cmd <= rxd_data_buf;
@@ -871,11 +994,18 @@ module glue(
                             cfg_chip_erase_bursts[7:0] <= rxd_data_buf;
                         else if (in_count == 8'd8) begin
                             cfg_sfdp_remaining <= rxd_data_buf;
+                            sfdp_valid_len <= 0;
                             sfdp_wr_pos <= 0;
                         end
-                        // SFDP data bytes
+                        // SFDP data bytes: single-cycle BSRAM write pulse.
                         else begin
-                            sfdp_mem[sfdp_wr_pos] <= rxd_data_buf;
+                            sfdp_waddr <= sfdp_wr_pos;
+                            sfdp_wdata <= rxd_data_buf;
+                            sfdp_wren <= 1'b1;
+                            // Only received bytes are valid, even if an
+                            // incomplete CHIPCONFIG later times out.
+                            if (sfdp_valid_len < 8'd128)
+                                sfdp_valid_len <= sfdp_valid_len + 1'b1;
                             sfdp_wr_pos <= sfdp_wr_pos + 1;
                             cfg_sfdp_remaining <= cfg_sfdp_remaining - 1;
                         end
@@ -942,6 +1072,8 @@ module glue(
                         if (in_count == 1) begin
                             toctou_sub_cmd <= rxd_data_buf;
                             if (rxd_data_buf == TOCTOU_RESET_ALL) begin
+                                // Cancel comparisons captured on this edge too.
+                                trap_match_pending <= 0;
                                 trap_armed <= 0;
                                 trap_triggered <= 0;
                                 redirect_active <= 0;
@@ -963,6 +1095,7 @@ module glue(
                                 cmd <= CMD_NOP;
                             end
                             else if (toctou_sub_cmd == TOCTOU_DISARM) begin
+                                trap_match_pending[rxd_data_buf[1:0]] <= 0;
                                 trap_armed[rxd_data_buf[1:0]] <= 0;
                                 txd_strobe_buf <= 1;
                                 txd_data_buf <= 8'h01;
@@ -970,6 +1103,7 @@ module glue(
                                 cmd <= CMD_NOP;
                             end
                             else if (toctou_sub_cmd == TOCTOU_RESET) begin
+                                trap_match_pending[rxd_data_buf[1:0]] <= 0;
                                 trap_triggered[rxd_data_buf[1:0]] <= 0;
                                 txd_strobe_buf <= 1;
                                 txd_data_buf <= 8'h01;
@@ -987,7 +1121,7 @@ module glue(
                         else if (in_count == 7)  begin toctou_mask_buf[15:8]   <= rxd_data_buf; in_count <= 8; end
                         else if (in_count == 8)  begin toctou_mask_buf[7:0]    <= rxd_data_buf; in_count <= 9; end
                         else if (in_count == 9)  begin
-                            trap_start[toctou_index] <= toctou_start_buf;
+                            trap_start[toctou_index] <= toctou_start_buf & toctou_mask_buf;
                             trap_mask[toctou_index]  <= toctou_mask_buf;
                             trap_replace[toctou_index][23:16] <= rxd_data_buf;
                             in_count <= 10;
@@ -995,6 +1129,7 @@ module glue(
                         else if (in_count == 10) begin trap_replace[toctou_index][15:8] <= rxd_data_buf; in_count <= 11; end
                         else if (in_count == 11) begin
                             trap_replace[toctou_index][7:0] <= rxd_data_buf;
+                            trap_match_pending[toctou_index] <= 0;
                             trap_triggered[toctou_index] <= 0;
                             txd_strobe_buf <= 1;
                             txd_data_buf <= 8'h01;

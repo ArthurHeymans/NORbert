@@ -67,3 +67,6 @@ jobs:
 
       - name: Run Yosys and Verilator checks
         run: make lint
+
+      - name: Simulate SPI, SDRAM and TOCTOU
+        run: make test

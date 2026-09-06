@@ -33,6 +33,7 @@ module spi_trx(
     output reg ram_inhibit_refresh = 0,
     output reg ram_activate = 0,
     output reg ram_read = 0,
+    output reg ram_continuation = 0, // Only subsequent bursts may be redirected
     
     output reg [22:0] ram_addr,       // 23-bit burst address for 64MB
     input wire [63:0] ram_read_buffer,
@@ -67,6 +68,9 @@ module spi_trx(
     output reg log_cmd_valid = 0,       // Pulse: command byte decoded
     output reg [7:0] log_cmd_opcode = 0,// The opcode that was decoded
     output reg log_addr_valid = 0,      // Pulse: address phase complete
+    output reg log_addr_toggle = 0,     // Changes on the final address bit
+    // Held across CS/reset until the next address event, so the system
+    // domain can capture this payload using the synchronized toggle.
     output reg [31:0] log_addr_out = 0, // Full flash byte address
     output reg [23:0] log_byte_count = 0// Running count of bytes read in current transaction
 );
@@ -197,6 +201,7 @@ module spi_trx(
     // AAI (Auto Address Increment) state -- persists across CS cycles
     reg aai_active = 0;         // In AAI word program mode
     reg is_aai = 0;             // Current transaction is AAI (per-CS flag)
+    reg [1:0] aai_bytes_left;   // Ignore data beyond the two-byte AAI word
     
     reg [31:0] addr;
     reg [4:0] addr_count;
@@ -249,6 +254,7 @@ module spi_trx(
                 is_quad_read <= 0;
                 is_sfdp_read <= 0;
                 is_aai <= 0;
+                aai_bytes_left <= 0;
                 status_read_sel2 <= 0;
                 mode_count <= 0;
                 
@@ -261,6 +267,7 @@ module spi_trx(
                 ram_inhibit_refresh <= 0;
                 ram_activate <= 0;
                 ram_read <= 0;
+                ram_continuation <= 0;
                 
                 write_cmd <= 0;
                 
@@ -477,6 +484,7 @@ module spi_trx(
                             end else begin
                                 // Subsequent AAI: skip address, go to data
                                 state <= STA_AAI_DATA;
+                                aai_bytes_left <= 2;
                                 write_cmd <= 1;
                                 write_type <= 2'd2;
                                 write_addr <= wrap_burst_addr(addr[25:3]);
@@ -541,6 +549,7 @@ module spi_trx(
                     
                     if (addr_count == 0) begin
                         log_addr_valid <= 1;
+                        log_addr_toggle <= !log_addr_toggle;
                         log_addr_out <= addr;
                         log_addr_out[0] <= spi_io0_in;
                         
@@ -573,7 +582,7 @@ module spi_trx(
                     if (dummy_count == 0) begin
                         if (is_sfdp_read) begin
                             // SFDP read: output from internal SFDP table.
-                            // sfdp_raddr was preloaded at dummy_count==1,
+                            // sfdp_raddr was preloaded at dummy_count==2,
                             // so sfdp_rdata is valid now.
                             state <= STA_READSFDP;
                             spi_io1_oe_ff <= 1;
@@ -601,9 +610,12 @@ module spi_trx(
                     end
                     else begin
                         dummy_count <= dummy_count - 1;
-                        // Preload SFDP address one cycle before transition
-                        // so sfdp_rdata is valid when we enter STA_READSFDP.
-                        if (dummy_count == 1 && is_sfdp_read)
+                        // Preload SFDP address two cycles before transition:
+                        // the table is a sync BSRAM, so the address is
+                        // sampled on the next SPI clock and data is valid
+                        // the clock after that, just in time for the
+                        // STA_READSFDP entry below.
+                        if (dummy_count == 2 && is_sfdp_read)
                             sfdp_raddr <= addr[6:0];
                     end
                 end
@@ -613,6 +625,7 @@ module spi_trx(
                     // replace ram_read_buffer before byte 7 is transmitted.
                     if (addr[2:0] == 6) begin
                         if (bit_count_in == 7) begin
+                            ram_continuation <= 1;
                             ram_inhibit_refresh <= 1;
                             ram_activate <= 1;
                             ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
@@ -625,6 +638,7 @@ module spi_trx(
 
                     if (addr[2:0] == 7) begin
                         if (bit_count_in == 7 && !ram_activate) begin
+                            ram_continuation <= 1;
                             // Fallback when a read starts directly at byte 7.
                             ram_inhibit_refresh <= 1;
                             ram_activate <= 1;
@@ -665,6 +679,7 @@ module spi_trx(
                 else if (state == STA_ADDR_ERASE) begin
                     if (addr_count == 0) begin
                         log_addr_valid <= 1;
+                        log_addr_toggle <= !log_addr_toggle;
                         log_addr_out <= addr;
                         log_addr_out[0] <= spi_io0_in;
                         
@@ -696,16 +711,16 @@ module spi_trx(
                 else if (state == STA_ADDR_WRITE) begin
                     if (addr_count == 0) begin
                         log_addr_valid <= 1;
+                        log_addr_toggle <= !log_addr_toggle;
                         log_addr_out <= addr;
                         log_addr_out[0] <= spi_io0_in;
 
                         if (is_aai) begin
-                            // AAI: single-burst RMW, don't clear WEL
-                            // (address is word-aligned per SST spec;
-                            // A0 is shifted in below but only addr[25:3]
-                            // is used for write_addr, and addr[2:1] index
-                            // into the page buffer correctly).
+                            // SST AAI ignores transmitted A0: the two bytes
+                            // occupy an aligned word within one SDRAM burst.
+                            // Don't clear WEL between AAI words.
                             state <= STA_AAI_DATA;
+                            aai_bytes_left <= 2;
                             write_cmd <= 1;
                             write_type <= 2'd2;
                             write_addr <= wrap_burst_addr(addr[25:3]);
@@ -725,7 +740,10 @@ module spi_trx(
                         end
                     end
                     
-                    addr[addr_count] <= spi_io0_in;
+                    if (is_aai && addr_count == 0)
+                        addr[0] <= 0;
+                    else
+                        addr[addr_count] <= spi_io0_in;
                     addr_count <= addr_count - 1;
                     
                     if (bit_count_in == 0) begin
@@ -742,17 +760,20 @@ module spi_trx(
                 end
                 // ---------------------------------------------------------
                 // AAI data reception (2 bytes per CS cycle)
-                // Bytes are written to the page buffer at addr[7:0].
-                // Full 32-bit address auto-increments (crosses pages).
-                // Master deasserts CS after 2 bytes; glue.v performs
-                // read-modify-write of the single 8-byte SDRAM burst.
+                // Keep addr word-aligned until both bytes arrive, then
+                // advance the full address (including across pages).
+                // A short transaction must not misalign the next AAI word.
+                // Only two bytes are accepted, even if CS remains low:
+                // flags outside this burst must not leak into a later PP.
                 // ---------------------------------------------------------
-                else if ((state == STA_AAI_DATA) && (bit_count_in == 0)) begin
+                else if ((state == STA_AAI_DATA) && (bit_count_in == 0) &&
+                         (aai_bytes_left != 0)) begin
+                    aai_bytes_left <= aai_bytes_left - 1'b1;
                     write_buf_strobe <= 1;
-                    write_buf_offset <= addr[7:0];
+                    write_buf_offset <= {addr[7:1], (aai_bytes_left == 1)};
                     write_buf_val <= {mosi_byte[7:1], spi_io0_in};
-                    
-                    addr <= addr + 1;  // Full address auto-increment
+                    if (aai_bytes_left == 1)
+                        addr <= addr + 2;
                 end
                 else if (state == STA_LOG) begin
                     if (bit_count_in == 0) begin
@@ -790,6 +811,7 @@ module spi_trx(
                     // Transition when last 2 bits received (addr_count was 1)
                     if (addr_count == 1) begin
                         log_addr_valid <= 1;
+                        log_addr_toggle <= !log_addr_toggle;
                         log_addr_out <= addr;
                         log_addr_out[1] <= spi_io1_in;
                         log_addr_out[0] <= spi_io0_in;
@@ -871,6 +893,7 @@ module spi_trx(
                     // clocks (~32 sys clocks) of margin before fresh_read,
                     // vs the ~14 sys clocks the SDRAM path needs.
                     if (addr[2:0] == 6 && bit_count_in == 3) begin
+                        ram_continuation <= 1;
                         ram_inhibit_refresh <= 1;  // Also here for short first bursts
                         ram_activate <= 1;
                         ram_read <= 1;
@@ -880,6 +903,7 @@ module spi_trx(
                     // Pipeline phase 3: deassert during last byte
                     if (addr[2:0] == 7) begin
                         if (bit_count_in == 3 && !ram_activate) begin
+                            ram_continuation <= 1;
                             // Fallback for very short first bursts (addr starts at 7)
                             // Only fires if byte 6 activate didn't happen
                             ram_inhibit_refresh <= 1;
@@ -945,6 +969,7 @@ module spi_trx(
                     // Transition when last 4 bits received (addr_count was 3)
                     if (addr_count == 3) begin
                         log_addr_valid <= 1;
+                        log_addr_toggle <= !log_addr_toggle;
                         log_addr_out <= addr;
                         log_addr_out[3] <= spi_io3_in;
                         log_addr_out[2] <= spi_io2_in;
@@ -979,6 +1004,7 @@ module spi_trx(
                     
                     // Pipeline phase 2: activate + read
                     if (addr[2:0] == 6 && bit_count_in == 1) begin
+                        ram_continuation <= 1;
                         ram_inhibit_refresh <= 1;
                         ram_activate <= 1;
                         ram_read <= 1;
@@ -988,6 +1014,7 @@ module spi_trx(
                     // Pipeline phase 3: deassert during last byte
                     if (addr[2:0] == 7) begin
                         if (bit_count_in == 1 && !ram_activate) begin
+                            ram_continuation <= 1;
                             // Fallback for very short first bursts (addr starts at 7)
                             ram_inhibit_refresh <= 1;
                             ram_activate <= 1;
@@ -1025,11 +1052,14 @@ module spi_trx(
                 // SFDP data output phase (CMD 0x5A)
                 // One byte per 8 SPI clocks, like normal single read.
                 // Data comes from SFDP table in glue.v via sfdp_rdata.
-                // Address preloaded 1 cycle ahead via sfdp_raddr.
+                // Address preloaded 2 SPI clocks ahead via sfdp_raddr
+                // (synchronous BSRAM read latency).
                 // ---------------------------------------------------------
                 else if (state == STA_READSFDP) begin
-                    if (bit_count_in == 1) begin
-                        // Preload next byte address for sfdp_rdata
+                    if (bit_count_in == 2) begin
+                        // Preload next byte address two SPI clocks ahead:
+                        // BSRAM samples it at bit 1, data is stable a full
+                        // clock before miso_byte loads it at bit 0.
                         sfdp_raddr <= addr[6:0] + 1;
                     end
                     else if (bit_count_in == 0) begin

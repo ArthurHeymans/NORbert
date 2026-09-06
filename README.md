@@ -58,8 +58,8 @@ Without Nix, you'll need:
 - [Gowin IDE Education Edition](https://www.gowinsemi.com/en/support/home/) v1.9.11.03 (`gw_sh` on PATH)
 - [openFPGALoader](https://github.com/trabucayre/openFPGALoader)
 - [yosys](https://github.com/YosysHQ/yosys) (optional, for linting)
+- [Verilator](https://verilator.org/) and a C++ toolchain (for linting/simulation)
 - Rust toolchain (for the host tool)
-
 
 ### FPGA bitstream
 
@@ -68,6 +68,18 @@ make build                  # synthesize + place & route
 make prog                   # program FPGA (volatile, lost on power cycle)
 make flash                  # program to flash (persistent)
 ```
+
+### RTL checks
+
+```sh
+make lint                   # Yosys synthesis checks and Verilator lint
+make test                   # SPI, SDRAM coordination and TOCTOU simulations
+```
+
+The tests cover SFDP startup/reconfiguration, page-program and AAI semantics,
+program latency/refresh, and accepted SDRAM addresses during redirected reads.
+They use a burst-level memory model or a clock-only PLL stub; they do not replace
+Gowin timing analysis or hardware validation of SDRAM pin timing.
 
 ### Host tool
 
@@ -183,7 +195,7 @@ The monitor also tracks double-reads of the same (opcode, address) pair and flag
 
 ### TOCTOU traps
 
-Four independent trap entries redirect matching reads to a different SDRAM location on the second (and subsequent) access. The first matching read is let through unchanged -- it arms the trap. The first 8 bytes of the redirected read come from the original address because the SDRAM prefetch pipeline fires before the trap check completes; bytes 8+ come from the replacement.
+Four independent trap entries redirect matching reads to a different SDRAM location on the second (and subsequent) access. The first matching read is let through unchanged -- it arms the trap. The first SDRAM burst (up to 8 bytes, depending on starting alignment) always comes from the original address; subsequent bursts come from the replacement. All matching entries become triggered, and the highest-index already-triggered match selects the replacement when traps overlap.
 
 ```sh
 # Configure: any read in 0x001000-0x001FFF gets redirected to 0x101000-0x101FFF

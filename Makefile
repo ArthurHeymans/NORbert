@@ -29,14 +29,14 @@ BITSTREAM = impl/pnr/spi_flash.fs
 # generated PLL wrapper can be elaborated without the proprietary simulator.
 GOWIN_CELLS = $(shell yosys-config --datdir)/gowin/cells_xtra_gw5a.v
 
-.PHONY: all build lint lint-yosys lint-verilator prog flash clean tool webui webui-serve ftdi-setup help
+.PHONY: all build lint lint-yosys lint-verilator test prog flash clean tool webui webui-serve ftdi-setup help
 
 all: build
 
 # Full build: synthesis + PnR via Gowin CLI
 build: $(BITSTREAM)
 
-$(BITSTREAM): $(VERILOG_FILES) $(CST_FILE) build.tcl
+$(BITSTREAM): $(VERILOG_FILES) $(CST_FILE) tangprimer25k.sdc build.tcl
 	gw_sh build.tcl
 
 # Open-source syntax, elaboration, and synthesis checks.
@@ -54,6 +54,21 @@ lint-verilator:
 		-Wno-CASEINCOMPLETE -Wno-DEFPARAM -Wno-PINMISSING \
 		-Wno-WIDTHTRUNC -Wno-WIDTHEXPAND \
 		$(GOWIN_CELLS) $(VERILOG_FILES)
+
+# Behavioral tests use a clock-only PLL stub, not proprietary primitives.
+# Keep generated C++ and binaries outside the working tree.
+test:
+	@set -eu; build=$$(mktemp -d); trap 'rm -rf "$$build"' EXIT; \
+	for test in spi_flash sdram_controller toctou; do \
+		echo "Testing $$test"; \
+		verilator --binary --timing -j 2 --top-module $${test}_tb \
+			-Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD \
+			-Wno-WIDTHTRUNC -Wno-WIDTHEXPAND \
+			--Mdir "$$build/$$test" tests/$${test}_tb.sv tests/pll_stub.v \
+			$(filter-out src/pll.v,$(VERILOG_FILES)) >"$$build/$$test.log" 2>&1 \
+			|| { cat "$$build/$$test.log"; exit 1; }; \
+		"$$build/$$test/V$${test}_tb"; \
+	done
 
 # Program the device (volatile - lost on power cycle)
 prog: $(BITSTREAM)
@@ -91,6 +106,7 @@ help:
 	@echo "  make prog    - Program FPGA (volatile)"
 	@echo "  make flash   - Program to flash (persistent)"
 	@echo "  make lint    - Check Verilog with Yosys and Verilator"
+	@echo "  make test    - Simulate SPI, SDRAM coordination, and TOCTOU"
 	@echo "  make tool    - Build spi-flash-tool (ftdi-nusb backend, default)"
 	@echo "  make webui  - Build the WebUSB/Web Serial browser UI"
 	@echo "  make webui-serve - Build and serve the UI at http://localhost:8081"
