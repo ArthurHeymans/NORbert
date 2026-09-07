@@ -101,6 +101,9 @@ module top(
     // -----------------------------------------------------------
     
     wire [63:0] sdram_read_buffer;
+    wire [63:0] sdram_read_buffer_b;
+    wire sdram_read_valid_a;
+    wire sdram_read_valid_b;
     wire sdram_read_busy;
     wire [63:0] sdram_write_buffer;
     
@@ -214,6 +217,7 @@ module top(
     wire spi_ram_activate;
     wire spi_ram_read;
     wire spi_ram_continuation;
+    wire spi_ram_post_toggle;
     wire [22:0] spi_ram_addr;    // 23-bit for 64MB addressing
     
     wire spi_write_cmd;
@@ -272,10 +276,16 @@ module top(
         .ram_activate(spi_ram_activate),
         .ram_read(spi_ram_read),
         .ram_continuation(spi_ram_continuation),
+        .ram_post_toggle(spi_ram_post_toggle),
         
         .ram_addr(spi_ram_addr),
         .ram_read_buffer(sdram_read_buffer),
+        .ram_read_buffer_b(sdram_read_buffer_b),
+        .ram_read_valid_a(sdram_read_valid_a),
+        .ram_read_valid_b(sdram_read_valid_b),
         .ram_read_busy(sdram_read_busy),
+        .prefetch_underrun(),
+        .prefetch_thin(),
         
         .write_cmd(spi_write_cmd),
         .write_type(spi_write_type),
@@ -388,6 +398,7 @@ module top(
         .spi_cmd_activate(spi_ram_activate),
         .spi_cmd_read(spi_ram_read),
         .spi_addr(spi_ram_addr_final),
+        .spi_cmd_post_toggle(spi_ram_post_toggle),
         
         // Serial path control
         .access_cmd(sdram_access_cmd),
@@ -396,6 +407,9 @@ module top(
         .cmd_busy(sdram_cmd_busy),
         
         .read_buffer(sdram_read_buffer),
+        .read_buffer_b(sdram_read_buffer_b),
+        .read_valid_a(sdram_read_valid_a),
+        .read_valid_b(sdram_read_valid_b),
         .read_busy(sdram_read_busy),
         
         .write_buffer(sdram_write_buffer)

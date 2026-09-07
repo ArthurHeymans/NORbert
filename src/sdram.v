@@ -5,15 +5,18 @@
 // CS=LOW selects chip 0, CS=HIGH selects chip 1 (module has onboard inverter).
 //
 // Per chip: 4 banks, 8192 rows (13-bit), 512 columns (9-bit), 16-bit data
-// CAS latency = 3, burst length = 4 (4 x 16-bit = 64 bits = 8 bytes per burst)
+// CAS latency = 2, burst length = 4 (4 x 16-bit = 64 bits = 8 bytes per burst)
 //
-// Memory data is stored interleaved to optimize SPI FLASH emulation:
-// Within each 8-byte burst (4 x 16-bit words):
-//   Word 0: dq[7:0] = bit 7 of each byte, dq[15:8] = bit 6 of each byte
-//   Word 1: dq[7:0] = bit 5 of each byte, dq[15:8] = bit 4 of each byte
-//   Word 2: dq[7:0] = bit 3 of each byte, dq[15:8] = bit 2 of each byte
-//   Word 3: dq[7:0] = bit 1 of each byte, dq[15:8] = bit 0 of each byte
-// This ensures the MSB of every byte is always received first from SDRAM.
+// Memory data is stored byte-serially to minimize first-byte latency:
+// SDRAM burst beat w (4 x 16-bit words per 8-byte burst) carries bytes
+// 2w and 2w+1 whole (dq[7:0] = byte 2w, dq[15:8] = byte 2w+1). The first
+// beat therefore already completes bytes 0-1, which the controller
+// publishes immediately; bytes 2-7 follow with beats 1-3 and publish with
+// the final beat as before. First-byte latency is CAS+1 instead of
+// CAS+BL, which is what makes dummy-less reads (0x03) and tiny first
+// bursts (high start offsets) closable at fast SCLK. Later bytes are only
+// ever consumed long after their beats arrive, so progressive publish is
+// race-free (beats of one READ command arrive back-to-back).
 //
 // Clock and timing architecture:
 //   - SDRAM clock is a separate PLL output (CLKOUT1) with PE_COARSE=9
@@ -23,8 +26,8 @@
 //     shift is used instead.
 //   - Read data is captured using aux_clk (CLKOUT2 with PE_COARSE=6,
 //     ~2.5ns phase shift) to sample DQ in the middle of the valid window.
-//   - With the ~3.75ns SDRAM clock delay and CAS=3, read data arrives
-//     ~4 logic clock cycles after the READ command. RD_PIPELINE_DELAY=0
+//   - With the ~3.75ns SDRAM clock delay and CAS=2, read data arrives
+//     ~3 logic clock cycles after the READ command. RD_PIPELINE_DELAY=0
 //     with the `readcount > tCAS` capture condition matches this timing.
 //
 // Address mapping (23-bit burst address, 8 bytes per burst = 64MB):
@@ -56,6 +59,7 @@ module sdram(
     input wire spi_cmd_activate,
     input wire spi_cmd_read,
     input wire [22:0] spi_addr,      // 23-bit burst address (64MB)
+    input wire spi_cmd_post_toggle, // Toggles on every SPI prefetch post
 
     // Control signals from glue (serial path)
     input wire [1:0] access_cmd,     // 00=nop 01=read 10=write 11=activate
@@ -64,6 +68,9 @@ module sdram(
     output reg cmd_busy,
 
     output reg [63:0] read_buffer,
+    output reg [63:0] read_buffer_b,
+    output reg read_valid_a,
+    output reg read_valid_b,
     output reg read_busy,
 
     input wire [63:0] write_buffer
@@ -91,7 +98,12 @@ module sdram(
     localparam integer tRCD         = 2;   // 16.7ns RAS to CAS delay (min 15ns for -6)
     localparam integer tDPL         = 2;   // Write recovery (min 2 tCK)
     localparam integer tRAS         = 6;   // 50ns row active time (min 42ns for -6)
-    localparam integer tCAS         = 3;   // CAS latency = 3 for W9825G6KH
+    // CAS latency 2: the W9825G6KH-6 is rated CL2 to 133MHz, so CL2 at
+    // 120MHz is in spec and saves a full cycle of first-byte latency
+    // versus CL3. This is load-bearing for dummy-less reads (0x03)
+    // and tiny first bursts at fast SCLK. The MRS below programs the
+    // same value into both chips, and tREAD/capture track it.
+    localparam integer tCAS         = 2;   // CAS latency = 2 for W9825G6KH
 
     // Read pipeline delay: compensates for SDRAM clock phase shift and capture pipeline.
     // With PE_COARSE=9 on SDRAM clock and aux_clk capture, RD_PIPELINE_DELAY=0 is correct.
@@ -148,6 +160,32 @@ module sdram(
     reg spi_cmd_read_ack;
     reg spi_abort_pending;
 
+    // One-burst lookahead (ping-pong) for the SPI fast path. The SPI side
+    // consumes one 64-bit buffer while the controller fills the other, so a
+    // completing SDRAM read never overwrites data still shifted out.
+    // fill_sel selects the target of the next SPI fill (0=A=read_buffer,
+    // 1=B=read_buffer_b) and toggles on every SPI READ completion. The SPI
+    // side keeps its own consume toggle; the two march in lockstep because
+    // serial-path reads are impossible while SPI is active (glue
+    // serial_gate) and both sides restart at buffer A on every CS drop.
+    reg fill_sel;
+    reg fill_reset_armed;
+    reg serial_read_active;
+    // Edge-arming for the SPI fast path. A dispatch additionally requires
+    // the request level to have been observed LOW while selected since the
+    // last dispatch (or reset). Stale-high levels left over from a previous
+    // transaction therefore cannot dispatch spuriously at the next select
+    // and consume the pairing reset; every legitimate post follows a drop
+    // (reset clear, address-end, mode-count-2, or byte-6 gaps), so arming
+    // is always satisfied before a real post arrives.
+    reg spi_act_armed;
+    reg spi_read_armed;
+    // Post-toggle synchronizer. Each edge invalidates the upcoming fill
+    // target, so a burst that never fills can never alias a stale buffer.
+    // The toggle always wins the race against its own fill: sync settles
+    // in ~2 sysclks, the fill needs ~12.
+    reg [2:0] spi_post_sync;
+
     wire spi_deselect_event = !spi_active_buf[1] && spi_active_buf[2];
     
     // Track whether ACTIVATE has been dispatched for the current SPI burst.
@@ -187,7 +225,6 @@ module sdram(
     reg [4:0] readcount;
     reg [1:0] rdbuf_write_ptr;
     reg [2:0] wrbuf_read_ptr;
-    reg [63:0] read_buffer_work;
 
     // Read data capture: DQ sampled on aux_clk (phase-shifted for proper timing)
     // then used directly in the main clock domain read logic.
@@ -222,7 +259,9 @@ module sdram(
             refresh_chip <= 0;
             
             read_buffer <= 0;
-            read_buffer_work <= 0;
+            read_buffer_b <= 0;
+            read_valid_a <= 0;
+            read_valid_b <= 0;
             read_busy <= 0;
             readcount <= 0;
 
@@ -239,6 +278,12 @@ module sdram(
             spi_abort_pending <= 0;
             spi_activate_done <= 0;
             spi_addr_latched <= 0;
+            fill_sel <= 0;
+            fill_reset_armed <= 0;
+            serial_read_active <= 0;
+            spi_act_armed <= 1;
+            spi_read_armed <= 1;
+            spi_post_sync <= 0;
         end
         else begin
             refreshcount <= refreshcount + 1;
@@ -258,6 +303,43 @@ module sdram(
             // dispatched, close the open row once tRAS has safely elapsed.
             if (spi_deselect_event && spi_activate_done && !spi_cmd_read_ack)
                 spi_abort_pending <= 1;
+            // A CS drop ends the burst chain. The reset itself is deferred
+            // to the next ACTIVATE dispatch: a fill posted just before the
+            // drop may still complete afterwards, and must land before the
+            // pairing restarts (the controller is strictly sequential, so no
+            // new-transaction fill can overtake it).
+            if (spi_deselect_event) fill_reset_armed <= 1;
+            // A transaction can end with request levels still asserted (the
+            // over-fetch post after the last burst). The level/ack handshake
+            // would then stay settled-high across the deselect, and the next
+            // transaction's posts would find the acks set and never dispatch.
+            // Clear both acks here so every fresh post dispatches; the abort
+            // path below keeps working because it keys off activate_done
+            // (deliberately not cleared) with the now-zero read ack.
+            if (spi_deselect_event) begin
+                spi_cmd_activate_ack <= 0;
+                spi_cmd_read_ack <= 0;
+            end
+            // Deselect also disarms: the low levels during the idle gap must
+            // not re-arm a stale-high post. The next transaction re-arms
+            // when its reset clear propagates through the synchronizers,
+            // strictly before any post can arrive (posts need a full command
+            // byte first).
+            if (spi_deselect_event) begin
+                spi_act_armed <= 0;
+                spi_read_armed <= 0;
+            end
+            else begin
+                if (!spi_cmd_activate_buf[1] && spi_active_buf[1]) spi_act_armed <= 1;
+                if (!spi_cmd_read_buf[1] && spi_active_buf[1]) spi_read_armed <= 1;
+            end
+            // A post always precedes its fill by ~10 sysclks, so
+            // invalidating here can never clobber a completed fill.
+            spi_post_sync <= {spi_post_sync[1:0], spi_cmd_post_toggle};
+            if (spi_post_sync[1] ^ spi_post_sync[2]) begin
+                if (fill_sel) read_valid_b <= 0;
+                else read_valid_a <= 0;
+            end
             
             if (spi_cmd_activate_ack && !spi_cmd_activate_buf[1]) begin
                 spi_cmd_activate_ack <= 0;
@@ -304,16 +386,18 @@ module sdram(
 
                 if (state == STA_WRITE) begin
                     if (cmdcount < BURST_LEN) begin
-                        // Feed write data (16-bit at a time, interleaved)
+                        // Feed write data (16-bit at a time, byte-serial)
                         dq_oe_o <= 1;
                         
-                        // Interleaved data layout for 16-bit bus:
-                        // wrbuf_read_ptr counts 0..3 (4 words per burst)
-                        // Each word carries 2 bits per byte
-                        for (i = 0; i < 8; i = i + 1) begin
-                            dq_o[i]   <= write_buffer[i*8 + 7 - wrbuf_read_ptr*2];
-                            dq_o[i+8] <= write_buffer[i*8 + 6 - wrbuf_read_ptr*2];
-                        end
+                        // Byte-serial layout: word w carries bytes 2w/2w+1.
+                        // wrbuf_read_ptr counts 1..3 here (word 0 went out
+                        // at dispatch above). Explicit lanes, see read path.
+                        case (wrbuf_read_ptr)
+                            2'd1: dq_o <= write_buffer[31:16];
+                            2'd2: dq_o <= write_buffer[47:32];
+                            2'd3: dq_o <= write_buffer[63:48];
+                            default: dq_o <= write_buffer[15:0];
+                        endcase
                         dqm_o <= 2'b00;
 
                         wrbuf_read_ptr <= wrbuf_read_ptr + 1;
@@ -357,7 +441,7 @@ module sdram(
                         a_o <= 0;
                         a_o[9] <= 1'b0;         // Write burst: programmed length
                         a_o[8:7] <= 2'b00;      // Standard operation
-                        a_o[6:4] <= tCAS;       // CAS latency = 3
+                        a_o[6:4] <= tCAS;       // CAS latency = 2 (tCAS)
                         a_o[3] <= 1'b0;         // Burst type: sequential
                         a_o[2:0] <= BURST_MODE; // Burst length = 4
                     end
@@ -507,13 +591,20 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
-                else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack) begin
+                else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed) begin
                     // SPI fast-path activate
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
                     spi_cmd_activate_ack <= 1;
                     spi_activate_done <= 1;
                     spi_addr_latched <= spi_addr;
+                    spi_act_armed <= 0;
+                    if (fill_reset_armed) begin
+                        fill_sel <= 0;
+                        read_valid_a <= 0;
+                        read_valid_b <= 0;
+                        fill_reset_armed <= 0;
+                    end
 
                     // ACTIVATE command
                     cs_o <= spi_addr[22];
@@ -524,12 +615,18 @@ module sdram(
                     ba_o <= spi_addr[8:7];
                     a_o <= spi_addr[21:9];
                 end
-                else if (spi_cmd_read_buf[1] && !spi_cmd_read_ack && spi_activate_done) begin
+                else if (spi_cmd_read_buf[1] && !spi_cmd_read_ack && spi_activate_done && spi_read_armed) begin
                     // SPI fast-path read
                     state <= STA_READ;
                     cmdtarget <= tREAD;
                     read_busy <= 1;
                     spi_cmd_read_ack <= 1;
+                    spi_read_armed <= 0;
+                    serial_read_active <= 0;
+                    // Invalidate the fill target up front; set again below
+                    // when the final beat publishes.
+                    if (fill_sel) read_valid_b <= 0;
+                    else read_valid_a <= 0;
 
                     // READ command with auto-precharge
                     cs_o <= spi_chip_sel;
@@ -562,6 +659,8 @@ module sdram(
                     state <= STA_READ;
                     cmdtarget <= tREAD + 2;
                     read_busy <= 1;
+                    serial_read_active <= 1;
+                    read_valid_a <= 0;
 
                     // READ command with auto-precharge
                     cs_o <= access_chip_sel;
@@ -592,11 +691,8 @@ module sdram(
                     a_o[10] <= 1;            // Auto precharge
                     dq_oe_o <= 1;
                     
-                    // First write data word (interleaved for 16-bit bus)
-                    for (i = 0; i < 8; i = i + 1) begin
-                        dq_o[i]   <= write_buffer[i*8 + 7];
-                        dq_o[i+8] <= write_buffer[i*8 + 6];
-                    end
+                    // First write data word (byte-serial: bytes 0-1)
+                    dq_o <= write_buffer[15:0];
                     dqm_o <= 2'b00;
                 end
                 else if ((refreshcount >= tREFRESH) && !do_inhibit_refresh) begin
@@ -627,26 +723,68 @@ module sdram(
             // cases) so they take priority over SPI and serial command
             // dispatches in the same cycle.
             
-            // Read data capture (de-interleave 16-bit data to 64-bit buffer).
-            // Assemble the burst in a private work register and publish all
-            // 64 bits only when the final SDRAM beat arrives. This prevents
-            // the SPI clock domain from observing a partially-updated buffer.
+            // Read data capture: each beat's bytes publish straight into
+            // the target buffer (progressive publish, see layout note at the
+            // top of this file). Beats of one READ arrive back-to-back, and
+            // the ping-pong target is always the idle half, so the SPI side
+            // never observes a torn burst.
             if ((readcount > tCAS + RD_PIPELINE_DELAY) && (readcount <= tCAS + RD_PIPELINE_DELAY + BURST_LEN)) begin
                 // rdbuf_write_ptr counts 0..3 (4 words in burst).
-                if (rdbuf_write_ptr == BURST_LEN - 1) begin
-                    read_buffer <= read_buffer_work;
-                    for (i = 0; i < 8; i = i + 1) begin
-                        read_buffer[i*8 + 1] <= dq_captured[i];
-                        read_buffer[i*8]     <= dq_captured[i+8];
+                // Byte-serial progressive publish: beat w completes bytes
+                // 2w/2w+1 straight into the target buffer (serial: A; SPI:
+                // ping-pong fill target). Beats of one READ arrive
+                // back-to-back, so later bytes are always ready long before
+                // the SPI side shifts them out; only the first byte(s) of a
+                // burst are timing-critical. Validity (bytes 0-1 ready) is
+                // therefore set with beat 0; the underrun check only ever
+                // inspects a buffer whose full fill completed a whole burst
+                // earlier, so early-valid is conservative-safe.
+                // (Explicit lanes rather than variable part-selects: safest
+                // across Yosys, Verilator, and Gowin synthesis.)
+                case (rdbuf_write_ptr)
+                    2'd0: begin
+                        if (serial_read_active) begin
+                            read_buffer[15:0] <= dq_captured;
+                            read_valid_a <= 1;
+                        end
+                        else if (fill_sel) begin
+                            read_buffer_b[15:0] <= dq_captured;
+                            read_valid_b <= 1;
+                        end
+                        else begin
+                            read_buffer[15:0] <= dq_captured;
+                            read_valid_a <= 1;
+                        end
                     end
-                    read_busy <= 0;
-                end
-                else begin
-                    for (i = 0; i < 8; i = i + 1) begin
-                        read_buffer_work[i*8 + 7 - rdbuf_write_ptr*2] <= dq_captured[i];
-                        read_buffer_work[i*8 + 6 - rdbuf_write_ptr*2] <= dq_captured[i+8];
+                    2'd1: begin
+                        if (serial_read_active) read_buffer[31:16] <= dq_captured;
+                        else if (fill_sel) read_buffer_b[31:16] <= dq_captured;
+                        else read_buffer[31:16] <= dq_captured;
                     end
-                end
+                    2'd2: begin
+                        if (serial_read_active) read_buffer[47:32] <= dq_captured;
+                        else if (fill_sel) read_buffer_b[47:32] <= dq_captured;
+                        else read_buffer[47:32] <= dq_captured;
+                    end
+                    2'd3: begin
+                        if (serial_read_active) begin
+                            read_buffer[63:48] <= dq_captured;
+                            read_valid_a <= 1;
+                            read_valid_b <= 0;
+                            fill_sel <= 0;
+                            serial_read_active <= 0;
+                        end
+                        else if (fill_sel) begin
+                            read_buffer_b[63:48] <= dq_captured;
+                            fill_sel <= 0;
+                        end
+                        else begin
+                            read_buffer[63:48] <= dq_captured;
+                            fill_sel <= 1;
+                        end
+                        read_busy <= 0;
+                    end
+                endcase
 
                 rdbuf_write_ptr <= rdbuf_write_ptr + 1;
             end

@@ -59,7 +59,7 @@ lint-verilator:
 # Keep generated C++ and binaries outside the working tree.
 test:
 	@set -eu; build=$$(mktemp -d); trap 'rm -rf "$$build"' EXIT; \
-	for test in spi_flash sdram_controller toctou; do \
+	for test in spi_flash sdram_controller toctou quad_fast; do \
 		echo "Testing $$test"; \
 		verilator --binary --timing -j 2 --top-module $${test}_tb \
 			-Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD \
