@@ -58,6 +58,7 @@ module quad_fast_tb;
         .dqm_o(dqm), .dq_io(dq_nc),
         .spi_active(!cs), .spi_inhibit_refresh(ram_inh),
         .spi_cmd_activate(ram_act), .spi_cmd_read(ram_read), .spi_addr(ram_addr),
+        .spi_cmd_post_toggle(post_toggle),
         .access_cmd(2'b00), .access_addr(25'b0), .inhibit_refresh(1'b0),
         .read_buffer(read_buffer_a), .read_buffer_b(read_buffer_b),
         .read_valid_a(read_valid_a), .read_valid_b(read_valid_b),

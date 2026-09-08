@@ -379,8 +379,8 @@ module spi_trx(
                         ram_read <= 1;
                         ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
                         posted_this_burst <= 1;
+                        ram_post_toggle <= ~ram_post_toggle;
                     end
-                    ram_post_toggle <= ~ram_post_toggle;
                 end
 
                 if ((state == STA_CMD) && (bit_count_in == 0)) begin
