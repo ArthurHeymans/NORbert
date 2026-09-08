@@ -145,6 +145,9 @@ module quad_fast_tb;
     // SPI master tasks (mode 0). Data changes on negedge (FPGA side),
     // sampled mid-high here.
     // ---------------------------------------------------------------
+    // The sweep uses sclk_half >= 7.143 ns, so even half-step samples
+    // exceed the 1 ps precision. Variable delays here never schedule #0.
+    /* verilator lint_off ZERODLY */
     task sclk_tick;
         #(sclk_half); sck = 1;
         #(sclk_half); sck = 0;
@@ -207,6 +210,8 @@ module quad_fast_tb;
     task deselect_spi;
         #(sclk_half*2 + 35); cs = 1; #(sclk_half*2 + 70);
     endtask
+
+    /* verilator lint_on ZERODLY */
 
     // must_pass=1 cells $fatal on any mismatch/underrun. must_pass=0
     // (explore) cells log the failure, skip the rest of the read, and let
