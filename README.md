@@ -161,6 +161,13 @@ programming because they also claim FT2232H interface A. On Linux, unbind the
 interface. On Windows, interface A must use the WinUSB driver (for example,
 configured with Zadig); leave interface B on its normal driver.
 
+Flash programming requires a readable JEDEC SFDP Basic Flash Parameter Table
+and checks the write and sector-erase range against the reported capacity
+(and the programmer's 24-bit address limit) before changing protection or
+issuing an erase. Chips without supported SFDP data are rejected rather than
+assuming a capacity. Incomplete `.fs` configuration data is rejected before
+opening the JTAG adapter.
+
 Browser device APIs are unavailable when opening `web/index.html` directly as
 a `file://` URL. WebUSB requires Chromium and a secure context (HTTPS or
 localhost).
