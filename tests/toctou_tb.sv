@@ -139,10 +139,11 @@ module toctou_tb;
         read_flash(24'h0015f2, 4'b0011, 1, 1, 24'h00f000, 24'h002000);
         // No-dummy reads at offsets 6/7 prefetch immediately. Sweep the
         // SPI/system phase, checking the accepted row/bank AND column.
+        // Fixed nonzero steps avoid variable-delay #0 scheduling warnings.
         for (integer phase = 0; phase < 9; phase++) begin
-            #(phase+1);
+            repeat (phase + 1) #1;
             read_flash(24'h0015f6, 4'b0011, 1, 1, 24'h00f000, 24'h002000, 8'h03);
-            #(phase+1);
+            repeat (phase + 1) #1;
             read_flash(24'h0015f7, 4'b0011, 1, 1, 24'h00f000, 24'h002000, 8'h13);
         end
 
