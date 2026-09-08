@@ -34,10 +34,38 @@ module spi_trx(
     output reg ram_activate = 0,
     output reg ram_read = 0,
     output reg ram_continuation = 0, // Only subsequent bursts may be redirected
+    // Toggles on every prefetch post (first-clock, dummy, and mode posts).
+    // The controller invalidates the upcoming fill target on each edge, so
+    // a burst that never fills (blocked post, lost race) is always flagged
+    // by the underrun check instead of aliasing a stale buffer.
+    output reg ram_post_toggle = 0,
     
     output reg [22:0] ram_addr,       // 23-bit burst address for 64MB
     input wire [63:0] ram_read_buffer,
+    input wire [63:0] ram_read_buffer_b,
+    input wire ram_read_valid_a,
+    input wire ram_read_valid_b,
     input wire ram_read_busy,
+    // Sticky diagnostic: set when a burst ends before the prefetched next
+    // burst validated, cleared on CS/power reset. The check is conservative
+    // (flags if validity arrived <2 SPI clocks before the swap), so a set
+    // flag means "no timing margin left", not necessarily wrong data.
+    output reg prefetch_underrun = 0,
+    // Thin-margin indicator (sticky, cleared on CS/power reset): set when the
+    // UPCOMING buffer's unsynchronized valid is clear at a burst-end advance.
+    // Unlike prefetch_underrun (previous buffer, synchronized: zero false
+    // positives), this can fire while data still arrives in time, precisely
+    // because it skips the 2-SCLK sync lag. Async sampling is benign here: a
+    // transition means its fill just completed (data is fine either way);
+    // only a stable 0 - a genuinely missing fill - flags.
+    output reg prefetch_thin = 0,
+    // Thin-margin indicator (sticky, cleared on CS/power reset): set when the
+    // UPCOMING buffer's unsynchronized valid is clear at a burst-end advance.
+    // Unlike prefetch_underrun (previous buffer, synchronized: zero false
+    // positives), this can fire while data still arrives in time, precisely
+    // because it samples without the 2-SCLK sync lag. Async sampling is
+    // benign here: a transition means its fill just completed (data is fine
+    // either way); only a stable 0 - a genuinely missing fill - flags.
     
     // For writing
     output reg write_cmd,
@@ -208,7 +236,32 @@ module spi_trx(
     reg addr_4byte;
     
     reg fresh_read = 0;
-    reg [7:0] saved_last_byte;  // Byte 7 saved before SDRAM read overwrites buffer
+    // One-burst lookahead state. The SDRAM controller ping-pongs fills
+    // between ram_read_buffer (A) and ram_read_buffer_b (B); consume_sel
+    // tracks the half currently shifted out and toggles at every burst-end
+    // advance, in lockstep with the controller's fill toggle. Both restart
+    // at A on every CS drop (reset_cs/reset_power here, deferred re-arm in
+    // the controller), so pairing cannot drift across transactions.
+    reg consume_sel = 0;
+    // Set whenever the next burst has been requested during the current
+    // one (dummy/mode post, first-clock post, or the byte-7 fallback below)
+    // and cleared at every burst start. The fallback may therefore only
+    // fire for a first burst that started at offset 7 with no post yet;
+    // otherwise it would bump ram_addr a second time without a matching
+    // dispatch and walk the ping-pong pairing out of phase.
+    reg posted_this_burst = 0;
+    // Set when the second burst was already posted during a dummy/mode
+    // phase: the first data clock then only clears the flag instead of
+    // posting a duplicate request.
+    reg prefetch_pending = 0;
+    // Two-cycle delayed fresh_read: the lookahead post fires here so the
+    // burst-end drop (below) always precedes it by >= 2 SPI clocks.
+    reg post_arm1 = 0;
+    reg post_arm2 = 0;
+    // Live burst buffer selected by consume_sel. The controller only ever
+    // writes the idle half, so this view is stable while shifted out and
+    // the old saved_last_byte shadow register is gone.
+    wire [63:0] live_buffer = consume_sel ? ram_read_buffer_b : ram_read_buffer;
     
     // Status registers
     reg [7:0] status_reg = 8'b00000000;
@@ -268,6 +321,14 @@ module spi_trx(
                 ram_activate <= 0;
                 ram_read <= 0;
                 ram_continuation <= 0;
+                ram_post_toggle <= 0;
+                consume_sel <= 0;
+                posted_this_burst <= 0;
+                prefetch_pending <= 0;
+                post_arm1 <= 0;
+                post_arm2 <= 0;
+                prefetch_underrun <= 0;
+                prefetch_thin <= 0;
                 
                 write_cmd <= 0;
                 
@@ -292,6 +353,35 @@ module spi_trx(
                 write_buf_strobe <= 0;
                 
                 mosi_byte[bit_count_in] <= spi_io0_in;
+
+
+                // One-burst lookahead post. fresh_read pulses on the edge
+                // that starts a new burst; post_arm2 delays this by two SPI
+                // clocks so the drop at the burst-end advance (see the
+                // phase-3 sites below) always re-arms the controller
+                // handshake across a >=2-clock gap, even for 2-clock
+                // offset-7 first bursts that have no byte 6 to drop on.
+                // The next burst's ACTIVATE+READ is therefore in flight for
+                // (nearly) the whole burst: ~16 SPI clocks for quad instead
+                // of the old 3.5.
+                post_arm1 <= fresh_read;
+                post_arm2 <= post_arm1;
+                if (post_arm2 &&
+                    (state == STA_READ || state == STA_READ_DUAL || state == STA_READ_QUAD)) begin
+                    // Dummy/mode-posted second burst: nothing to post, just
+                    // clear the flag (the advance drop already re-armed).
+                    if (prefetch_pending)
+                        prefetch_pending <= 0;
+                    else if (!posted_this_burst) begin
+                        ram_continuation <= 1;
+                        ram_inhibit_refresh <= 1;
+                        ram_activate <= 1;
+                        ram_read <= 1;
+                        ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
+                        posted_this_burst <= 1;
+                        ram_post_toggle <= ~ram_post_toggle;
+                    end
+                end
 
                 if ((state == STA_CMD) && (bit_count_in == 0)) begin
                     
@@ -554,9 +644,18 @@ module spi_trx(
                         log_addr_out[0] <= spi_io0_in;
                         
                         if (!is_sfdp_read) begin
-                            ram_inhibit_refresh <= 0;
                             ram_activate <= 0;
                             ram_read <= 0;
+                        end
+                        // Keep refresh inhibited across the dummy phase for
+                        // fast reads: the second burst posts mid-dummy and a
+                        // refresh starting in the gap would delay it past its
+                        // need. (Slow 0x03 drops here as before, preserving
+                        // the refresh-overlap window its first burst relies
+                        // on for trap timing coverage.) Inhibit is released
+                        // at the dummy end instead (see STA_DUMMY below).
+                        if (!is_sfdp_read && !is_fast_read) begin
+                            ram_inhibit_refresh <= 0;
                         end
 
                         if (is_fast_read) begin
@@ -580,6 +679,11 @@ module spi_trx(
                 end
                 else if (state == STA_DUMMY) begin
                     if (dummy_count == 0) begin
+                        // Release the refresh inhibit held across the dummy
+                        // phase (see address end above). The second burst is
+                        // already dispatched by now; later bursts re-assert
+                        // per burst with refresh gaps between them.
+                        ram_inhibit_refresh <= 0;
                         if (is_sfdp_read) begin
                             // SFDP read: output from internal SFDP table.
                             // sfdp_raddr was preloaded at dummy_count==2,
@@ -610,6 +714,22 @@ module spi_trx(
                     end
                     else begin
                         dummy_count <= dummy_count - 1;
+                        // One-burst lookahead: post the second burst midway
+                        // through the dummy phase so short first bursts (high
+                        // start offsets) still meet SDRAM latency at fast
+                        // SCLK. Skipped for SFDP, which never touches SDRAM.
+                        // K=0's levels were dropped at the address end, so
+                        // the handshake re-arms across a multi-clock gap.
+                        if (dummy_count == 5 && !is_sfdp_read) begin
+                            ram_continuation <= 1;
+                            ram_inhibit_refresh <= 1;
+                            ram_activate <= 1;
+                            ram_read <= 1;
+                            ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
+                            prefetch_pending <= 1;
+                            posted_this_burst <= 1;
+                            ram_post_toggle <= ~ram_post_toggle;
+                        end
                         // Preload SFDP address two cycles before transition:
                         // the table is a sync BSRAM, so the address is
                         // sampled on the next SPI clock and data is valid
@@ -620,51 +740,71 @@ module spi_trx(
                     end
                 end
                 else if (state == STA_READ) begin
-                    // Prefetch the next burst while byte 6 is shifted out.
-                    // Save byte 7 first because the completed SDRAM read will
-                    // replace ram_read_buffer before byte 7 is transmitted.
-                    if (addr[2:0] == 6) begin
-                        if (bit_count_in == 7) begin
-                            ram_continuation <= 1;
-                            ram_inhibit_refresh <= 1;
-                            ram_activate <= 1;
-                            ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
-                            saved_last_byte <= ram_read_buffer[7*8 +: 8];
-                        end
-                        else if (bit_count_in == 6) begin
-                            ram_read <= 1;
-                        end
+                    // One-burst lookahead: the next burst was posted on the
+                    // first clock of this one (or during the dummy phase) and
+                    // fills the idle ping-pong half, so the live half shifted
+                    // out here is never overwritten mid-burst. Drop the
+                    // request levels on the last clock of byte 6; the gap
+                    // across byte 7 re-arms the controller handshake for the
+                    // next post and also leaves room for a refresh half.
+                    if (addr[2:0] == 6 && bit_count_in == 0) begin
+                        ram_inhibit_refresh <= 0;
+                        ram_activate <= 0;
+                        ram_read <= 0;
                     end
 
                     if (addr[2:0] == 7) begin
-                        if (bit_count_in == 7 && !ram_activate) begin
+                        if (bit_count_in == 7 && !ram_activate && !posted_this_burst) begin
                             ram_continuation <= 1;
                             // Fallback when a read starts directly at byte 7.
                             ram_inhibit_refresh <= 1;
                             ram_activate <= 1;
                             ram_read <= 1;
                             ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
-                            saved_last_byte <= ram_read_buffer[7*8 +: 8];
+                            posted_this_burst <= 1;
                         end
                         else if (bit_count_in == 0) begin
+                            consume_sel <= ~consume_sel;
+                            // Both flags sample the system-clock valids
+                            // directly (async). Benign: these are sticky
+                            // diagnostics, never data-path. A transitioning
+                            // sample means its fill just completed (data is
+                            // fine either way); only a stable 0 flags.
+                            // Robust check (buffer just consumed = OLD
+                            // consume_sel: filled at least a full burst ago,
+                            // so a clear bit means the fill never happened).
+                            if (consume_sel ? !ram_read_valid_b
+                                            : !ram_read_valid_a)
+                                prefetch_underrun <= 1;
+                            // Margin check (upcoming buffer = ~OLD
+                            // consume_sel): a clear bit means its fill hasn't
+                            // completed yet. Data may still arrive in time
+                            // (beats land progressively), so this flags thin
+                            // margin, not corruption.
+                            if (consume_sel ? !ram_read_valid_a
+                                            : !ram_read_valid_b)
+                                prefetch_thin <= 1;
+                            // Burst-end drop: re-arms the controller handshake
+                            // for the delayed post two clocks later, and
+                            // restarts the posted flag for the next burst.
+                            // (Offset-7 first bursts have no byte 6; this is
+                            // their only drop.)
                             ram_inhibit_refresh <= 0;
                             ram_activate <= 0;
                             ram_read <= 0;
+                            posted_this_burst <= 0;
                             fresh_read <= 1;
                         end
                     end
 
                     if (bit_count_in == 0) begin
-                        if (addr[2:0] == 6)
-                            miso_byte <= saved_last_byte;
-                        else if (addr[2:0] != 7)
-                            miso_byte <= ram_read_buffer[(addr[2:0]+1)*8 +: 8];
+                        miso_byte <= live_buffer[(addr[2:0]+1)*8 +: 8];
                         addr <= addr + 1;
                         log_byte_count <= log_byte_count + 1;
                     end
 
                     if (fresh_read)
-                        miso_byte <= ram_read_buffer[addr[2:0]*8 +: 8];
+                        miso_byte <= live_buffer[addr[2:0]*8 +: 8];
                 end
                 else if (state == STA_READID) begin
                     if (bit_count_in == 0) begin
@@ -825,13 +965,39 @@ module spi_trx(
                 // Mode+dummy phase for multi-IO reads (0xBB and 0xEB)
                 // Dual 0xBB: 4 clocks (mode byte M[7:0])
                 // Quad 0xEB: 6 clocks (2 mode + 4 dummy)
-                // SDRAM read signals remain asserted; deassert at end.
+                // K=0's levels drop mid-phase and the second burst posts
+                // one clock later (one-burst lookahead); the mode end keeps
+                // those levels up for the still-filling second burst.
                 // ---------------------------------------------------------
                 else if (state == STA_MODE_MULTI) begin
-                    if (mode_count == 0) begin
+                    // One-burst lookahead for 0xBB/0xEB: drop K=0's levels
+                    // mid-phase to re-arm the handshake, then post the
+                    // second burst one clock later. This covers short first
+                    // bursts at fast SCLK the same way the dummy post does.
+                    if (mode_count == 3) begin
                         ram_inhibit_refresh <= 0;
                         ram_activate <= 0;
                         ram_read <= 0;
+                    end
+                    else if (mode_count == 1) begin
+                        ram_continuation <= 1;
+                        ram_inhibit_refresh <= 1;
+                        ram_activate <= 1;
+                        ram_read <= 1;
+                        ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
+                        prefetch_pending <= 1;
+                        posted_this_burst <= 1;
+                        ram_post_toggle <= ~ram_post_toggle;
+                    end
+                    if (mode_count == 0) begin
+                        // Keep the dummy-posted levels up: the second burst
+                        // is still filling and byte 6 of the first burst will
+                        // drop them for the next post.
+                        if (!prefetch_pending) begin
+                            ram_inhibit_refresh <= 0;
+                            ram_activate <= 0;
+                            ram_read <= 0;
+                        end
                         
                         if (is_quad_read) begin
                             state <= STA_READ_QUAD;
@@ -856,85 +1022,76 @@ module spi_trx(
                 // 2 data bits per clock on IO0+IO1, 4 clocks per byte.
                 // bit_count_in cycles 3->2->1->0->3->... in this state.
                 //
-                // SDRAM pipeline timing (dual, 4 clocks/byte):
-                //   Byte 5, bit 3: inhibit_refresh + save byte 7
-                //   Byte 6, bit 3: activate + ram_read + new ram_addr
-                //   Byte 7, bit 0: deassert all + fresh_read
-                //
-                // ram_read is asserted at byte 6 (with activate) to give 8
-                // SPI clocks (~32 sys clocks @120MHz) before fresh_read.
-                // The SDRAM controller dispatches ACTIVATE first (priority),
-                // waits tRCD, then READ — total ~14 sys clocks, leaving
-                // ~18 sys clocks of margin.
-                //
-                // Byte 7 is saved at byte 5 because ram_read_buffer is a
-                // live register: the SDRAM read completes within ~14 sys
-                // clocks, overwriting the buffer before byte 7 can be
-                // loaded into miso_byte at byte 6 bit 0.
+                // One-burst lookahead (see STA_READ): the next burst is
+                // posted on the first clock of this one, giving a full
+                // 32 SPI clocks of lead time instead of the old 8.
                 // ---------------------------------------------------------
                 else if (state == STA_READ_DUAL) begin
                     
-                    // Pipeline phase 1: inhibit refresh + save byte 7
-                    // Save byte 7 from ram_read_buffer BEFORE the SDRAM read
-                    // (phase 2) overwrites it with the next burst's data.
-                    // ram_read_buffer is a live register updated by the SDRAM
-                    // controller; the read completes within ~14 sys clocks,
-                    // which is faster than the 3 SPI clocks between phase 2
-                    // and the byte 7 preload at byte 6 bit 0.
-                    if (addr[2:0] == 5 && bit_count_in == 3) begin
-                        ram_inhibit_refresh <= 1;
-                        saved_last_byte <= ram_read_buffer[7*8 +: 8];
+                    // Drop the request levels on the last clock of byte 6
+                    // to re-arm the controller handshake for the next post.
+                    if (addr[2:0] == 6 && bit_count_in == 0) begin
+                        ram_inhibit_refresh <= 0;
+                        ram_activate <= 0;
+                        ram_read <= 0;
                     end
                     
-                    // Pipeline phase 2: activate + read 1 byte early
-                    // Both signals are asserted simultaneously. The SDRAM
-                    // controller's priority dispatch processes ACTIVATE first,
-                    // waits tRCD, then dispatches READ. This gives 8 SPI
-                    // clocks (~32 sys clocks) of margin before fresh_read,
-                    // vs the ~14 sys clocks the SDRAM path needs.
-                    if (addr[2:0] == 6 && bit_count_in == 3) begin
-                        ram_continuation <= 1;
-                        ram_inhibit_refresh <= 1;  // Also here for short first bursts
-                        ram_activate <= 1;
-                        ram_read <= 1;
-                        ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
-                    end
-                    
-                    // Pipeline phase 3: deassert during last byte
+                    // Fallback for very short first bursts (addr starts at 7)
+                    // Only fires if the first-clock post didn't happen.
                     if (addr[2:0] == 7) begin
-                        if (bit_count_in == 3 && !ram_activate) begin
+                        if (bit_count_in == 3 && !ram_activate && !posted_this_burst) begin
                             ram_continuation <= 1;
                             // Fallback for very short first bursts (addr starts at 7)
-                            // Only fires if byte 6 activate didn't happen
+                            // Only fires if the first-clock post didn't happen.
                             ram_inhibit_refresh <= 1;
                             ram_activate <= 1;
                             ram_read <= 1;
                             ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
-                            saved_last_byte <= ram_read_buffer[7*8 +: 8];
+                            posted_this_burst <= 1;
                         end
                         else if (bit_count_in == 0) begin
+                            consume_sel <= ~consume_sel;
+                            // Both flags sample the system-clock valids
+                            // directly (async). Benign: these are sticky
+                            // diagnostics, never data-path. A transitioning
+                            // sample means its fill just completed (data is
+                            // fine either way); only a stable 0 flags.
+                            // Robust check (buffer just consumed = OLD
+                            // consume_sel: filled at least a full burst ago,
+                            // so a clear bit means the fill never happened).
+                            if (consume_sel ? !ram_read_valid_b
+                                            : !ram_read_valid_a)
+                                prefetch_underrun <= 1;
+                            // Margin check (upcoming buffer = ~OLD
+                            // consume_sel): a clear bit means its fill hasn't
+                            // completed yet. Data may still arrive in time
+                            // (beats land progressively), so this flags thin
+                            // margin, not corruption.
+                            if (consume_sel ? !ram_read_valid_a
+                                            : !ram_read_valid_b)
+                                prefetch_thin <= 1;
+                            // Burst-end drop: re-arms the controller handshake
+                            // for the delayed post two clocks later, and
+                            // restarts the posted flag for the next burst.
+                            // (Offset-7 first bursts have no byte 6; this is
+                            // their only drop.)
                             ram_inhibit_refresh <= 0;
                             ram_activate <= 0;
                             ram_read <= 0;
-                            
+                            posted_this_burst <= 0;
                             fresh_read <= 1;
                         end
                     end
                     
                     // Byte advance every 4 clocks
-                    // Use saved_last_byte for byte 7 since ram_read_buffer
-                    // may already contain the next burst's data by this point.
                     if (bit_count_in == 0) begin
-                        if (addr[2:0] == 6)
-                            miso_byte <= saved_last_byte;
-                        else
-                            miso_byte <= ram_read_buffer[(addr[2:0]+1)*8 +: 8];
+                        miso_byte <= live_buffer[(addr[2:0]+1)*8 +: 8];
                         addr <= addr + 1;
                         log_byte_count <= log_byte_count + 1;
                     end
                     
                     if (fresh_read)
-                        miso_byte <= ram_read_buffer[addr[2:0]*8 +: 8];
+                        miso_byte <= live_buffer[addr[2:0]*8 +: 8];
                 end
                 // ---------------------------------------------------------
                 // Quad I/O address phase (1-4-4 mode, CMD 0xEB)
@@ -986,63 +1143,76 @@ module spi_trx(
                 // 4 data bits per clock on IO[3:0], 2 clocks per byte.
                 // bit_count_in cycles 1->0->1->0->... in this state.
                 //
-                // SDRAM pipeline timing (quad, 2 clocks/byte):
-                //   Byte 5, bit 1: inhibit_refresh + save byte 7
-                //   Byte 6, bit 1: activate + ram_read + new ram_addr
-                //   Byte 7, bit 0: deassert all + fresh_read
-                //
-                // From activate to fresh_read: 4 SPI clocks = 48 sys clocks
-                // SDRAM path needs ~14 sys clocks, leaving ~34 of margin.
+                // One-burst lookahead (see STA_READ): the next burst is
+                // posted on the first clock of this one, giving a full
+                // 16 SPI clocks of lead time instead of the old 3.5.
                 // ---------------------------------------------------------
                 else if (state == STA_READ_QUAD) begin
                     
-                    // Pipeline phase 1: inhibit refresh + save byte 7
-                    if (addr[2:0] == 5 && bit_count_in == 1) begin
-                        ram_inhibit_refresh <= 1;
-                        saved_last_byte <= ram_read_buffer[7*8 +: 8];
+                    // Drop the request levels on the last clock of byte 6
+                    // to re-arm the controller handshake for the next post.
+                    if (addr[2:0] == 6 && bit_count_in == 0) begin
+                        ram_inhibit_refresh <= 0;
+                        ram_activate <= 0;
+                        ram_read <= 0;
                     end
                     
-                    // Pipeline phase 2: activate + read
-                    if (addr[2:0] == 6 && bit_count_in == 1) begin
-                        ram_continuation <= 1;
-                        ram_inhibit_refresh <= 1;
-                        ram_activate <= 1;
-                        ram_read <= 1;
-                        ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
-                    end
-                    
-                    // Pipeline phase 3: deassert during last byte
+                    // Fallback for very short first bursts (addr starts at 7)
+                    // Only fires if the first-clock post didn't happen.
                     if (addr[2:0] == 7) begin
-                        if (bit_count_in == 1 && !ram_activate) begin
+                        if (bit_count_in == 1 && !ram_activate && !posted_this_burst) begin
                             ram_continuation <= 1;
                             // Fallback for very short first bursts (addr starts at 7)
+                            // Only fires if the first-clock post didn't happen.
                             ram_inhibit_refresh <= 1;
                             ram_activate <= 1;
                             ram_read <= 1;
                             ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
-                            saved_last_byte <= ram_read_buffer[7*8 +: 8];
+                            posted_this_burst <= 1;
                         end
                         else if (bit_count_in == 0) begin
+                            consume_sel <= ~consume_sel;
+                            // Both flags sample the system-clock valids
+                            // directly (async). Benign: these are sticky
+                            // diagnostics, never data-path. A transitioning
+                            // sample means its fill just completed (data is
+                            // fine either way); only a stable 0 flags.
+                            // Robust check (buffer just consumed = OLD
+                            // consume_sel: filled at least a full burst ago,
+                            // so a clear bit means the fill never happened).
+                            if (consume_sel ? !ram_read_valid_b
+                                            : !ram_read_valid_a)
+                                prefetch_underrun <= 1;
+                            // Margin check (upcoming buffer = ~OLD
+                            // consume_sel): a clear bit means its fill hasn't
+                            // completed yet. Data may still arrive in time
+                            // (beats land progressively), so this flags thin
+                            // margin, not corruption.
+                            if (consume_sel ? !ram_read_valid_a
+                                            : !ram_read_valid_b)
+                                prefetch_thin <= 1;
+                            // Burst-end drop: re-arms the controller handshake
+                            // for the delayed post two clocks later, and
+                            // restarts the posted flag for the next burst.
+                            // (Offset-7 first bursts have no byte 6; this is
+                            // their only drop.)
                             ram_inhibit_refresh <= 0;
                             ram_activate <= 0;
                             ram_read <= 0;
-                            
+                            posted_this_burst <= 0;
                             fresh_read <= 1;
                         end
                     end
                     
                     // Byte advance every 2 clocks
                     if (bit_count_in == 0) begin
-                        if (addr[2:0] == 6)
-                            miso_byte <= saved_last_byte;
-                        else
-                            miso_byte <= ram_read_buffer[(addr[2:0]+1)*8 +: 8];
+                        miso_byte <= live_buffer[(addr[2:0]+1)*8 +: 8];
                         addr <= addr + 1;
                         log_byte_count <= log_byte_count + 1;
                     end
                     
                     if (fresh_read)
-                        miso_byte <= ram_read_buffer[addr[2:0]*8 +: 8];
+                        miso_byte <= live_buffer[addr[2:0]*8 +: 8];
                 end
                 // ---------------------------------------------------------
                 // Write Status Register data reception (CMD 0x01)
@@ -1112,10 +1282,10 @@ module spi_trx(
             // IO3 = MSB of nibble, IO0 = LSB of nibble
             // bit_count_in=1: high nibble [7:4], bit_count_in=0: low nibble [3:0]
             if (fresh_read) begin
-                spi_io3_out <= ram_read_buffer[addr[2:0]*8 + 7];
-                spi_io2_out <= ram_read_buffer[addr[2:0]*8 + 6];
-                spi_io1_out <= ram_read_buffer[addr[2:0]*8 + 5];
-                spi_io0_out <= ram_read_buffer[addr[2:0]*8 + 4];
+                spi_io3_out <= live_buffer[addr[2:0]*8 + 7];
+                spi_io2_out <= live_buffer[addr[2:0]*8 + 6];
+                spi_io1_out <= live_buffer[addr[2:0]*8 + 5];
+                spi_io0_out <= live_buffer[addr[2:0]*8 + 4];
             end
             else begin
                 spi_io3_out <= miso_byte[{bit_count_in[0], 2'b11}];
@@ -1128,8 +1298,8 @@ module spi_trx(
             // Dual output: 2 bits per clock
             // IO1 = high bit of pair, IO0 = low bit of pair
             if (fresh_read) begin
-                spi_io1_out <= ram_read_buffer[addr[2:0]*8 + 7];
-                spi_io0_out <= ram_read_buffer[addr[2:0]*8 + 6];
+                spi_io1_out <= live_buffer[addr[2:0]*8 + 7];
+                spi_io0_out <= live_buffer[addr[2:0]*8 + 6];
             end
             else begin
                 spi_io1_out <= miso_byte[{bit_count_in[1:0], 1'b1}];
@@ -1139,7 +1309,7 @@ module spi_trx(
         else begin
             // Single output on IO1 (MISO)
             if (fresh_read)
-                spi_io1_out <= ram_read_buffer[addr[2:0]*8 + 7];
+                spi_io1_out <= live_buffer[addr[2:0]*8 + 7];
             else
                 spi_io1_out <= miso_byte[bit_count_in];
         end

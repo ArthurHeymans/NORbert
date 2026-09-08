@@ -9,7 +9,8 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 - **SPI NOR flash emulation** with full command support: read, fast read, page program, sector/block/chip erase, JEDEC ID, status registers, SFDP
 - **Configurable chip identity** at runtime -- load any chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database to set JEDEC ID, size, and SFDP parameters (defaults to Winbond W25Q64FV)
 - **Multi-I/O modes**: 1-1-1, 1-1-2, 1-2-2, 1-1-4, and 1-4-4 SPI read modes
-- **64MB backing store** using two SDRAM chips with bit-interleaved storage for zero-overhead serial output
+- **Fast SPI reads**: one-burst lookahead with ping-pong SDRAM buffers sustains 50 MHz single/dual/quad reads and 60-70 MHz quad reads (see limits below)
+- **64MB backing store** using two SDRAM chips with byte-serial burst layout for minimal first-byte latency
 - **Pipelined prefetch**: SDRAM reads are issued during SPI address/dummy phases so data is ready on the first clock edge
 - **2 Mbaud UART** interface for loading and dumping images from a host PC
 - **FT245 asynchronous FIFO** via FT2232H for faster bulk transfers (requires one-time EEPROM configuration)
@@ -252,46 +253,42 @@ Note: H11 is a core board button pin, repurposed for FT245 (buttons are unused b
 
 ## SPI read performance
 
-Sustained SPI clock limits are set by the SDRAM prefetch pipeline in `spi_trx.v`.
-Each 8-byte SDRAM burst takes ~12 system clock cycles (120 MHz) from activate to
-data valid (tRCD=2 + tREAD=8 + 2-FF sync). The maximum SPI clock is determined by
-how many SPI clocks the pipeline has between triggering the next SDRAM read and
-needing the data (`fresh_read`):
+Sustained SPI clock limits are set by the SDRAM prefetch pipeline (`spi_trx.v`
+- `sdram.v`). Each 8-byte SDRAM burst takes ~12 system clock cycles (120 MHz)
+from post to data valid. Instead of posting just-in-time, the SPI engine keeps
+one burst in flight at all times (one-burst lookahead with ping-pong buffers),
+so the limit is throughput (one burst per ~12 sysclks), not single-burst
+latency. SDRAM runs at CAS latency 2 (in spec to 133 MHz for the W9825G6KH-6)
+with a byte-serial burst layout, so the first beat already completes bytes 0-1.
 
-**f_spi_max = 120 MHz x N_spi / 12**
+Validated by simulation (`make test`, `tests/quad_fast_tb.sv`: all start
+offsets 0-7, row/bank crossings, refresh coexistence). 60-70 MHz operation
+also needs timing closure past the default 30 MHz `spi_clk` constraint plus
+signal-integrity validation on the PMOD leads -- simulated margins below do
+not replace that.
 
-### Sustained streaming (continuous sequential read)
+| Command | Mode | Simulated max (all offsets) | Notes |
+|---------|------|-----------------------------|-------|
+| 0x03 Read | 1-1-1 | 50 MHz | No dummy clocks; hardest first burst |
+| 0x0B Fast Read | 1-1-1 | 70 MHz | 8 dummy clocks |
+| 0x3B Dual Output | 1-1-2 | 50 MHz (spot) | 8 dummy clocks |
+| 0xBB Dual I/O | 1-2-2 | 60 MHz | 4 mode clocks |
+| 0x6B Quad Output | 1-1-4 | 70 MHz | 8 dummy clocks |
+| 0xEB Quad I/O | 1-4-4 | 50 MHz | 6 mode clocks; offset 7 flags thin |
 
-| Command | Mode | Bits/clk | N_spi | Max SPI clock | Throughput |
-|---------|------|----------|-------|---------------|------------|
-| 0x03 Read | 1-1-1 | 1 | 4 | ~40 MHz | ~5.0 MB/s |
-| 0x0B Fast Read | 1-1-1 | 1 | 4 | ~40 MHz | ~5.0 MB/s |
-| 0x3B Dual Output | 1-1-2 | 2 | 8 | ~80 MHz | ~20 MB/s |
-| 0xBB Dual I/O | 1-2-2 | 2 | 8 | ~80 MHz | ~20 MB/s |
-| 0x6B Quad Output | 1-1-4 | 4 | 4 | ~40 MHz | ~20 MB/s |
-| 0xEB Quad I/O | 1-4-4 | 4 | 4 | ~40 MHz | ~20 MB/s |
+Known corners (all loudly flagged by `prefetch_underrun` / `prefetch_thin`,
+never silent):
 
-The single-width data pipeline (STA_READ) triggers the next SDRAM burst during byte
-7 of the current burst (4 SPI clocks of headroom). The dual pipeline (STA_READ_DUAL)
-triggers at byte 6 (8 SPI clocks), while quad (STA_READ_QUAD) also triggers at byte
-6 but with only 4 SPI clocks due to 2 clocks/byte. This means dual and quad modes
-hit the same ~20 MB/s throughput ceiling, but dual can clock 2x faster.
+- **Quad-I/O reads starting at offset 7 above 50 MHz** need the second burst
+  ~30 ns before a single SDRAM controller can physically produce it. Use
+  offset <= 6 or <= 50 MHz for 0xEB.
+- **Slow reads above ~60 MHz** run out of first-burst window (3.5 clocks, no
+  dummy). Real NOR flashes cap 0x03 the same way (f_R < f_C).
+- **70 MHz dual-I/O offset 7** passes with thin margin flagged.
 
-### First-burst limits
-
-The initial SDRAM read is pipelined during the address/dummy phase. Commands with
-dummy clocks get more headroom for the first burst:
-
-| Command | N_spi (initial) | Max SPI (initial) |
-|---------|-----------------|-------------------|
-| 0x03 / 0x13 (no dummy) | 4 | ~40 MHz |
-| 0x0B / 0x3B / 0x6B (8 dummy clocks) | 12 | ~120 MHz |
-| 0xBB (dual addr + 4 mode/dummy) | 5 | ~50 MHz |
-| 0xEB (quad addr + 6 mode/dummy) | 6 | ~60 MHz |
-
-After the first burst, sustained rates apply. Commands with single-bit address
-phases (0x0B, 0x3B, 0x6B) benefit most from dummy clocks. The multi-bit address
-commands (0xBB, 0xEB) use fewer SPI clocks for the address, leaving less headroom.
+If you need more: the levers are open-row (skip re-ACTIVATE on same-row
+bursts, saves ~2 sysclks per burst) and master-configured extra dummy clocks
+for 0xEB/0xBB, not a faster SDRAM clock.
 
 ## Project structure
 
@@ -299,7 +296,7 @@ commands (0xBB, 0xEB) use fewer SPI clocks for the address, leaving less headroo
 src/
   top.v        Top-level module, clock/reset, bus wiring, TOCTOU address mux
   spi_trx.v    SPI flash transceiver (command decoder + data path)
-  sdram.v      Dual-chip SDRAM controller with interleaved storage
+  sdram.v      Dual-chip SDRAM controller, byte-serial bursts, ping-pong prefetch
   glue.v       Protocol handler, UART/FT245 I/O, SPI write engine, TOCTOU trap engine, LOGPOLL state machine, LED control
   logger.v     SPI event capture into a 512-byte ring FIFO drained by CMD_LOGPOLL
   uart.v       UART TX/RX (2 Mbaud)
