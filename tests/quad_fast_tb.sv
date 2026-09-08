@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 
 // Fast-SCLK data-path test: real spi_trx against the real sdram controller
-// with a functional (CAS=3, BL=4) DQ model behind it.
+// with a functional (CAS=2, BL=4) DQ model behind it.
 //
 // Covers single/dual/quad reads at 30-70MHz SCLK, all start offsets 0-7,
 // multi-burst runs across row/bank/chip boundaries, refresh coexistence,
@@ -55,7 +55,7 @@ module quad_fast_tb;
     sdram #(.CLK_FREQ_MHZ(120), .BURST_LEN(4)) ram (
         .clk(clk), .aux_clk(clk), .reset(reset),
         .ba_o(ba), .a_o(a), .cs_o(cs_n), .ras_o(ras), .cas_o(cas), .we_o(we),
-        .dqm_o(dqm), .dq_io(dq_nc),
+        .dqm_o(dqm), .dq_io(dq),
         .spi_active(!cs), .spi_inhibit_refresh(ram_inh),
         .spi_cmd_activate(ram_act), .spi_cmd_read(ram_read), .spi_addr(ram_addr),
         .spi_cmd_post_toggle(post_toggle),
@@ -81,8 +81,6 @@ module quad_fast_tb;
                  + burst[22:16] * 8'd3 + 8'h51;
     endfunction
 
-    // Interleave must match sdram.v: word w carries bit (7-2w) of every
-    // byte in dq[7:0] and bit (6-2w) in dq[15:8], dq[i] <=> byte i.
     // Byte-serial layout must match sdram.v: beat w carries bytes
     // 2w (dq[7:0]) and 2w+1 (dq[15:8]) whole.
     function [15:0] enc_word(input [22:0] burst, input [1:0] w);
@@ -93,16 +91,15 @@ module quad_fast_tb;
 
     reg [15:0] dq_drv = 0;
     reg dq_en = 0;
-    // No writes happen in this tb, so the controller never drives dq_io
-    // (it stays Z). Feed read beats straight into its capture net.
-    wire [15:0] dq_nc;
-    assign dq_nc = 16'hzzzz;
+    // Register each outgoing beat before driving the physical bus. A force
+    // of beat_pipe[0] follows its NBA shift on some simulators, skipping
+    // the first beat instead of holding the sampled value for this cycle.
+    assign dq = dq_en ? dq_drv : 16'hzzzz;
 
     always @(negedge clk) begin
         if (reset) begin
             for (integer i = 0; i < 8; i++) beat_valid[i] <= 0;
             dq_en <= 0;
-            release ram.dq_i;
         end
         else begin
             // Shift the beat pipeline every cycle.
@@ -116,11 +113,9 @@ module quad_fast_tb;
                 3'b101: begin // READ
                     automatic logic [22:0] burst =
                         {cs_n, active_row[cs_n][ba], ba, a[8:2]};
-                    // Controller captures beats 4 clocks after dispatch
-                    // (CAS=3 plus one pipeline stage), but its capture
-                    // register samples the same posedge in simulation
-                    // (aux==clk here; on HW aux is phase-shifted), costing
-                    // one more cycle: drive from the negedges at slots 2..5.
+                    // Queue the first beat two negedges after READ (CAS=2).
+                    // dq_drv holds each beat for aux_clk's posedge capture;
+                    // the main-clock logic consumes it one cycle later.
                     for (integer w = 0; w < 4; w++) begin
                         beat_pipe[1+w] <= enc_word(burst, w[1:0]);
                         beat_valid[1+w] <= 1;
@@ -131,8 +126,6 @@ module quad_fast_tb;
             endcase
             dq_en <= beat_valid[0];
             dq_drv <= beat_pipe[0];
-            if (beat_valid[0]) force ram.dq_i = beat_pipe[0];
-            else release ram.dq_i;
         end
     end
 
