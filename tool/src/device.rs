@@ -1,7 +1,7 @@
 use crate::protocol::*;
 use anyhow::{Context, Result, bail};
 use std::mem::size_of;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 use zerocopy::IntoBytes;
 
 #[cfg(any(feature = "ftdi", feature = "wasm"))]
