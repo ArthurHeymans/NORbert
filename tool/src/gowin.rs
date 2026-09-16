@@ -618,11 +618,7 @@ impl GowinProgrammer {
         for index in 0..=u32::from(header[6]) {
             let parameter = self.read_sfdp(8 + index * 8, 8).await?;
             // JEDEC Basic Flash Parameter Table, major version 1, >= 2 DWORDs.
-            if parameter[0] != 0
-                || parameter[7] != 0xff
-                || parameter[2] != 1
-                || parameter[3] < 2
-            {
+            if parameter[0] != 0 || parameter[7] != 0xff || parameter[2] != 1 || parameter[3] < 2 {
                 continue;
             }
             let table = u32::from_le_bytes([parameter[4], parameter[5], parameter[6], 0]);
@@ -763,11 +759,15 @@ impl FtdiJtag {
         this.sync_mpsse().await?;
         // openFPGALoader's `ft2232` cable config for Tang Primer boards.
         this.ctx
-            .set_gpio_low(&mut this.dev, 0x08, 0x0b)
+            .session(&mut this.dev)
+            .map_err(|e| format!("failed to start MPSSE GPIO session: {e}"))?
+            .set_gpio_low(0x08, 0x0b)
             .await
             .map_err(|e| format!("failed to configure FTDI low GPIO: {e}"))?;
         this.ctx
-            .set_gpio_high(&mut this.dev, 0x08, 0x0b)
+            .session(&mut this.dev)
+            .map_err(|e| format!("failed to start MPSSE GPIO session: {e}"))?
+            .set_gpio_high(0x08, 0x0b)
             .await
             .map_err(|e| format!("failed to configure FTDI high GPIO: {e}"))?;
         this.go_test_logic_reset().await?;
@@ -800,7 +800,9 @@ impl FtdiJtag {
 
     async fn set_clock(&mut self, hz: u32) -> Result<(), String> {
         self.ctx
-            .set_clock(&mut self.dev, hz)
+            .session(&mut self.dev)
+            .map_err(|e| format!("failed to start MPSSE clock session: {e}"))?
+            .set_clock(hz)
             .await
             .map_err(|e| format!("failed to set JTAG clock: {e}"))
     }
