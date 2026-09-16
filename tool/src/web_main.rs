@@ -1302,6 +1302,9 @@ impl eframe::App for NorbertWebApp {
 
         let pending_bitstream = self.state.borrow_mut().pending_bitstream_file.take();
         if let Some((name, data)) = pending_bitstream {
+            self.bitstream_name.clear();
+            self.bitstream_info.clear();
+            self.bitstream_data = None;
             match gowin::inspect_bitstream(&data) {
                 Ok(info) => {
                     self.bitstream_info = format!(

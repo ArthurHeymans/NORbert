@@ -9,7 +9,9 @@
 //! volatile SRAM programming, and external SPI flash programming through the
 //! GW5A JTAG-SPI bridge.
 
-use crate::gowin_validation::{GowinBitstream, flash_capacity, validate_flash_range};
+use crate::gowin_validation::{
+    GowinBitstream, find_erase_opcode, flash_capacity, validate_flash_range,
+};
 use ftdi_nusb::constants::mpsse;
 use ftdi_nusb::mpsse::MpsseContext;
 use ftdi_nusb::{FtdiDevice, Interface};
@@ -43,7 +45,6 @@ const FLASH_PP: u8 = 0x02;
 const FLASH_READ: u8 = 0x03;
 const FLASH_RDSR: u8 = 0x05;
 const FLASH_WREN: u8 = 0x06;
-const FLASH_SE: u8 = 0x20;
 const FLASH_POWER_UP: u8 = 0xab;
 const FLASH_CE: u8 = 0xc7;
 const FLASH_RSTEN: u8 = 0x66;
@@ -497,6 +498,32 @@ impl GowinProgrammer {
         Err(format!("timeout waiting for SPI flash {context}"))
     }
 
+    /// Wait for a write-enabled command (erase, program, write status) to
+    /// finish. Short operations can complete before the first status read over
+    /// WebUSB, so busy is not required to be observed. A flash that accepts a
+    /// command clears WEL together with WIP; WEL still set afterwards means the
+    /// command was ignored.
+    async fn spi_wait_mutation(&mut self, timeout: u32, context: &str) -> Result<(), String> {
+        let mut status = 0;
+        for attempt in 0..timeout {
+            status = self.spi_read_status().await?;
+            if (status & FLASH_RDSR_WIP) == 0 {
+                if (status & FLASH_RDSR_WEL) != 0 {
+                    return Err(format!(
+                        "SPI flash ignored {context} (status=0x{status:02x})"
+                    ));
+                }
+                return Ok(());
+            }
+            if attempt % 32 == 0 {
+                sleep_ms(0).await;
+            }
+        }
+        Err(format!(
+            "timeout waiting for SPI flash {context} (status=0x{status:02x})"
+        ))
+    }
+
     async fn program_spi_flash(
         &mut self,
         data: &[u8],
@@ -512,7 +539,7 @@ impl GowinProgrammer {
         let jedec = (u32::from(id[0]) << 16) | (u32::from(id[1]) << 8) | u32::from(id[2]);
         // Establish physical capacity before changing protection or erasing flash.
         // Fail closed rather than guessing a capacity for unknown/non-SFDP chips.
-        let capacity = self.spi_flash_capacity().await?;
+        let (capacity, sector_erase_opcode) = self.spi_flash_geometry().await?;
         let end_addr = validate_flash_range(options.offset, data.len(), capacity)?;
 
         let status = self.spi_read_status().await?;
@@ -528,18 +555,19 @@ impl GowinProgrammer {
         if options.chip_erase {
             self.spi_write_enable().await?;
             self.spi_transfer(FLASH_CE, &[], 0).await?;
-            self.spi_wait(FLASH_RDSR, FLASH_RDSR_WIP, 0, 2_000_000, "chip erase")
-                .await?;
+            self.spi_wait_mutation(2_000_000, "chip erase").await?;
         } else {
+            let erase_opcode = sector_erase_opcode.ok_or(
+                "flash SFDP does not advertise a 4 KiB erase command; use whole-chip erase",
+            )?;
             let start = options.offset & !0xfff;
             let end = (end_addr + 0xfff) & !0xfff;
             let total = (end - start) as usize;
             let mut erased = 0usize;
             for addr in (start..end).step_by(0x1000) {
                 self.spi_write_enable().await?;
-                self.spi_transfer(FLASH_SE, &addr24(addr), 0).await?;
-                self.spi_wait(FLASH_RDSR, FLASH_RDSR_WIP, 0, 200_000, "sector erase")
-                    .await?;
+                self.spi_transfer(erase_opcode, &addr24(addr), 0).await?;
+                self.spi_wait_mutation(200_000, "sector erase").await?;
                 erased += 0x1000;
                 progress(ProgramProgress {
                     stage: "Erasing flash",
@@ -561,8 +589,7 @@ impl GowinProgrammer {
             payload.extend_from_slice(chunk);
             self.spi_write_enable().await?;
             self.spi_transfer(FLASH_PP, &payload, 0).await?;
-            self.spi_wait(FLASH_RDSR, FLASH_RDSR_WIP, 0, 1000, "page program")
-                .await?;
+            self.spi_wait_mutation(1000, "page program").await?;
             written += chunk_len;
             progress(ProgramProgress {
                 stage: "Writing flash",
@@ -608,7 +635,7 @@ impl GowinProgrammer {
         self.spi_transfer(0x5a, &payload, len).await
     }
 
-    async fn spi_flash_capacity(&mut self) -> Result<u64, String> {
+    async fn spi_flash_geometry(&mut self) -> Result<(u64, Option<u8>), String> {
         let header = self.read_sfdp(0, 8).await?;
         if &header[..4] != b"SFDP" || header[5] != 1 {
             return Err(
@@ -623,9 +650,16 @@ impl GowinProgrammer {
             }
             let table = u32::from_le_bytes([parameter[4], parameter[5], parameter[6], 0]);
             let density = self.read_sfdp(table + 4, 4).await?;
-            return flash_capacity(u32::from_le_bytes(
+            let capacity = flash_capacity(u32::from_le_bytes(
                 density.try_into().map_err(|_| "short SFDP density read")?,
-            ));
+            ))?;
+            let erase_opcode = if parameter[3] >= 9 {
+                let descriptors = self.read_sfdp(table + 7 * 4, 8).await?;
+                find_erase_opcode(&descriptors, 4096)?
+            } else {
+                None
+            };
+            return Ok((capacity, erase_opcode));
         }
         Err("flash has no supported SFDP Basic Flash Parameter Table".to_string())
     }
@@ -657,8 +691,7 @@ impl GowinProgrammer {
     async fn spi_write_status(&mut self, status: u8) -> Result<(), String> {
         self.spi_write_enable().await?;
         self.spi_transfer(FLASH_WRSR, &[status], 0).await?;
-        self.spi_wait(FLASH_RDSR, FLASH_RDSR_WIP, 0, 1000, "write status")
-            .await
+        self.spi_wait_mutation(1000, "write status").await
     }
 }
 
