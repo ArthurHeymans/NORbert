@@ -161,6 +161,26 @@ programming because they also claim FT2232H interface A. On Linux, unbind the
 interface. On Windows, interface A must use the WinUSB driver (for example,
 configured with Zadig); leave interface B on its normal driver.
 
+#### Browser JTAG wiring
+
+The Dock's onboard debugger is a BL616, not an FT2232H. Browser programming
+therefore needs an external FT2232H connected to the Dock's external-JTAG
+header. On Dock schematic revision 60033 this connector is J7:
+
+| FT2232H channel A | J7 pin | Signal |
+|-------------------|--------|--------|
+| AD3 / CS           | 1      | TMS    |
+| AD1 / DO           | 2      | TDI    |
+| AD0 / SK           | 3      | TCK    |
+| AD2 / DI           | 5      | TDO    |
+| GND                | 6      | GND    |
+| VIO reference      | 7      | 3.3 V  |
+| GND                | 8      | BL616_EN |
+
+Leave J7 pin 4 (`+5V`) unconnected. Grounding `BL616_EN` disables the onboard
+debugger while the external adapter is attached. Pin 7 is a logic-voltage
+reference; do not use it to power the Dock or target from the adapter.
+
 Flash programming requires a readable JEDEC SFDP Basic Flash Parameter Table
 and checks the write and sector-erase range against the reported capacity
 (and the programmer's 24-bit address limit) before changing protection or
@@ -292,7 +312,7 @@ Note: H11 is a core board button pin, repurposed for FT245 (buttons are unused b
 ## SPI read performance
 
 Sustained SPI clock limits are set by the SDRAM prefetch pipeline (`spi_trx.v`
-- `sdram.v`). Each 8-byte SDRAM burst takes ~12 system clock cycles (120 MHz)
+and `sdram.v`). Each 8-byte SDRAM burst takes ~12 system clock cycles (120 MHz)
 from post to data valid. Instead of posting just-in-time, the SPI engine keeps
 one burst in flight at all times (one-burst lookahead with ping-pong buffers),
 so the limit is throughput (one burst per ~12 sysclks), not single-burst

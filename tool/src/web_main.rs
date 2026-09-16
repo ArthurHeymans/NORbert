@@ -772,7 +772,7 @@ impl NorbertWebApp {
         ui.heading("FPGA Bitstream");
         ui.separator();
         ui.label(
-            "Program the Tang Primer 25K directly from the browser using its FT2232H JTAG adapter. This ports the Gowin GW5A subset of openFPGALoader to Rust/WASM on top of ftdi-nusb and WebUSB.",
+            "Program the Tang Primer 25K from the browser using an external FT2232H wired to the Dock's external-JTAG header. This ports the Gowin GW5A subset of openFPGALoader to Rust/WASM on top of ftdi-nusb and WebUSB.",
         );
         ui.label(
             "Download spi_flash.fs from the latest GitHub release, or choose a locally built .fs file.",
@@ -781,6 +781,41 @@ impl NorbertWebApp {
             "Download latest release bitstream",
             "https://github.com/ArthurHeymans/NORbert/releases/latest/download/spi_flash.fs",
         );
+
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("FT2232H to Dock JTAG wiring")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    "Dock schematic revision 60033 calls the external-JTAG connector J7. Use FT2232H channel A in MPSSE mode:",
+                );
+                egui::Grid::new("jtag_wiring")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("FT2232H A");
+                        ui.strong("J7 pin");
+                        ui.strong("Signal");
+                        ui.end_row();
+                        for (ftdi, pin, signal) in [
+                            ("AD3 / CS", "1", "TMS"),
+                            ("AD1 / DO", "2", "TDI"),
+                            ("AD0 / SK", "3", "TCK"),
+                            ("AD2 / DI", "5", "TDO"),
+                            ("GND", "6", "GND"),
+                            ("VIO reference", "7", "3V3"),
+                            ("GND", "8", "BL616_EN"),
+                        ] {
+                            ui.monospace(ftdi);
+                            ui.monospace(pin);
+                            ui.monospace(signal);
+                            ui.end_row();
+                        }
+                    });
+                ui.colored_label(
+                    Color32::YELLOW,
+                    "Leave J7 pin 4 (+5V) unconnected. Grounding BL616_EN disables the onboard debugger while the external adapter is attached. Do not use 3V3 as a target power output.",
+                );
+            });
 
         ui.add_space(12.0);
         ui.horizontal(|ui| {

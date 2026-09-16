@@ -61,7 +61,7 @@ jobs:
           openFPGALoader -b tangprimer25k -f spi_flash.fs
           \`\`\`
 
-          You can also open the [NORbert Web UI](https://arthurheymans.github.io/NORbert/), choose **Bitstream**, select the downloaded \`.fs\` file, and program SRAM or flash through WebUSB. Chromium and an HTTPS/localhost page are required.
+          You can also open the [NORbert Web UI](https://arthurheymans.github.io/NORbert/), choose **Bitstream**, select the downloaded \`.fs\` file, and program SRAM or flash through WebUSB. This path requires an external FT2232H connected to the Dock's external-JTAG header; see the [browser JTAG wiring guide](https://github.com/ArthurHeymans/NORbert#browser-jtag-wiring). Chromium and an HTTPS/localhost page are required.
 
           The release tag and Rust package version are both \`${TAG_NAME}\`.
           EOF
