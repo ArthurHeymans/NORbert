@@ -63,6 +63,7 @@ jobs:
 
       - uses: YosysHQ/setup-oss-cad-suite@v4
         with:
+          version: '2026-09-08'
           github-token: ${{ github.token }}
 
       - name: Run Yosys and Verilator checks
