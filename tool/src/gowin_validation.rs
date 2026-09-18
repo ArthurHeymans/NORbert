@@ -230,6 +230,22 @@ pub(crate) fn flash_capacity(density: u32) -> Result<u64, String> {
     Ok(bits / 8)
 }
 
+pub(crate) fn find_erase_opcode(descriptors: &[u8], erase_size: u64) -> Result<Option<u8>, String> {
+    if descriptors.len() != 8 {
+        return Err("invalid SFDP erase descriptor length".to_string());
+    }
+    Ok(descriptors
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .find_map(|descriptor| {
+            let exponent = u32::from(descriptor[0]);
+            let opcode = descriptor[1];
+            (opcode != 0 && opcode != 0xff && 1u64.checked_shl(exponent) == Some(erase_size))
+                .then_some(opcode)
+        }))
+}
+
 pub(crate) fn validate_flash_range(offset: u32, len: usize, capacity: u64) -> Result<u32, String> {
     // This programmer only sends three-byte addresses and erases 4 KiB sectors.
     let limit = capacity.min(0x0100_0000);
@@ -291,6 +307,16 @@ mod tests {
         assert_eq!(flash_capacity(0x8000_001a).unwrap(), 8 * 1024 * 1024);
         assert!(flash_capacity(0).is_err());
         assert!(flash_capacity(0x8000_0040).is_err());
+    }
+
+    #[test]
+    fn selects_only_the_requested_sfdp_erase_size() {
+        let descriptors = [12, 0x20, 15, 0x52, 16, 0xd8, 0, 0xff];
+        assert_eq!(find_erase_opcode(&descriptors, 4096).unwrap(), Some(0x20));
+        assert_eq!(find_erase_opcode(&descriptors, 32768).unwrap(), Some(0x52));
+        assert_eq!(find_erase_opcode(&descriptors, 65536).unwrap(), Some(0xd8));
+        assert_eq!(find_erase_opcode(&descriptors, 8192).unwrap(), None);
+        assert!(find_erase_opcode(&descriptors[..6], 4096).is_err());
     }
 
     #[test]
