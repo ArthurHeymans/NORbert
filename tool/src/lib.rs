@@ -12,6 +12,9 @@ pub mod sfdp;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod gowin;
 
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub mod spi_log;
+
 #[cfg(any(test, all(feature = "wasm", target_arch = "wasm32")))]
 mod gowin_validation;
 

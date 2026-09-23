@@ -7,8 +7,8 @@ use spi_flash_tool::WebFlashDevice;
 use spi_flash_tool::chip::{FlashChip, FlashChipExt};
 use spi_flash_tool::gowin::{self, FlashOptions, ProgramProgress};
 use spi_flash_tool::sfdp::generate_sfdp;
+use spi_flash_tool::spi_log::{ActivityLog, HEADER};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -51,12 +51,7 @@ struct SharedState {
     pending_bitstream_file: Option<(String, Vec<u8>)>,
     read_data: Option<(u32, Vec<u8>)>,
     log_output: String,
-    log_pending: Vec<u8>,
-    log_txn_count: u32,
-    log_opcode: u8,
-    log_address: u32,
-    log_line_open: bool,
-    log_accesses: HashMap<(u32, u8), u32>,
+    activity: ActivityLog,
     monitoring: bool,
     configured_chip: Option<Rc<FlashChip>>,
 }
@@ -78,12 +73,7 @@ impl Default for SharedState {
             pending_bitstream_file: None,
             read_data: None,
             log_output: String::new(),
-            log_pending: Vec::new(),
-            log_txn_count: 0,
-            log_opcode: 0,
-            log_address: 0,
-            log_line_open: false,
-            log_accesses: HashMap::new(),
+            activity: ActivityLog::default(),
             monitoring: false,
             configured_chip: None,
         }
@@ -695,10 +685,10 @@ impl NorbertWebApp {
             let mut shared = state.borrow_mut();
             shared.busy = true;
             shared.monitoring = true;
-            shared.log_pending.clear();
-            shared.log_accesses.clear();
-            shared.log_txn_count = 0;
-            shared.log_line_open = false;
+            shared.activity = ActivityLog::default();
+            if shared.log_output.is_empty() {
+                shared.log_output = format!("{HEADER}\n");
+            }
             shared.status = "Starting SPI activity capture...".to_owned();
             shared.status_error = false;
         }
@@ -1412,95 +1402,8 @@ fn set_wiring_visible(visible: bool) {
 }
 
 fn decode_log_packets(state: &mut SharedState, data: &[u8]) {
-    const LOG_CMD: u8 = 0xA1;
-    const LOG_ADDR: u8 = 0xA2;
-    const LOG_END: u8 = 0xA3;
-    const LOG_TRAP: u8 = 0xA4;
-
-    state.log_pending.extend_from_slice(data);
-    let mut position = 0;
-    while position < state.log_pending.len() {
-        let remaining = state.log_pending.len() - position;
-        match state.log_pending[position] {
-            LOG_CMD if remaining >= 2 => {
-                if state.log_line_open {
-                    state.log_output.push('\n');
-                }
-                state.log_opcode = state.log_pending[position + 1];
-                state.log_txn_count += 1;
-                state.log_output.push_str(&format!(
-                    "{:<6} 0x{:02X} {:<18}",
-                    state.log_txn_count,
-                    state.log_opcode,
-                    spi_opcode_name(state.log_opcode),
-                ));
-                state.log_line_open = true;
-                position += 2;
-            }
-            LOG_ADDR if remaining >= 5 => {
-                let address = u32::from_be_bytes([
-                    state.log_pending[position + 1],
-                    state.log_pending[position + 2],
-                    state.log_pending[position + 3],
-                    state.log_pending[position + 4],
-                ]);
-                state.log_address = address;
-                state.log_output.push_str(&format!(" 0x{address:08X}"));
-                if is_read_opcode(state.log_opcode) {
-                    let count = state
-                        .log_accesses
-                        .entry((address, state.log_opcode))
-                        .or_insert(0);
-                    *count += 1;
-                    if *count == 2 {
-                        state
-                            .log_output
-                            .push_str("  ** DOUBLE READ (TOCTOU candidate)");
-                    } else if *count > 2 {
-                        state.log_output.push_str(&format!("  ** READ #{count}"));
-                    }
-                }
-                state.log_output.push('\n');
-                state.log_line_open = false;
-                position += 5;
-            }
-            LOG_END if remaining >= 4 => {
-                let count = u32::from_be_bytes([
-                    0,
-                    state.log_pending[position + 1],
-                    state.log_pending[position + 2],
-                    state.log_pending[position + 3],
-                ]);
-                if state.log_line_open {
-                    state.log_output.push('\n');
-                    state.log_line_open = false;
-                }
-                if count > 1 {
-                    state.log_output.push_str(&format!(
-                        "       end: {count} bytes from 0x{:08X}\n",
-                        state.log_address,
-                    ));
-                }
-                position += 4;
-            }
-            LOG_TRAP if remaining >= 6 => {
-                let index = state.log_pending[position + 1];
-                let address = u32::from_be_bytes([
-                    0,
-                    state.log_pending[position + 2],
-                    state.log_pending[position + 3],
-                    state.log_pending[position + 4],
-                ]);
-                state.log_output.push_str(&format!(
-                    "!! TOCTOU TRAP #{index} FIRED at 0x{address:06X}\n",
-                ));
-                position += 6;
-            }
-            0xA1..=0xAF => break,
-            _ => position += 1,
-        }
-    }
-    state.log_pending.drain(..position);
+    let text = state.activity.feed(data);
+    state.log_output.push_str(&text);
     const MAX_LOG: usize = 2 * 1024 * 1024;
     if state.log_output.len() > MAX_LOG {
         let excess = state.log_output.len() - MAX_LOG;
@@ -1509,48 +1412,6 @@ fn decode_log_packets(state: &mut SharedState, data: &[u8]) {
             .map_or(excess, |offset| excess + offset + 1);
         state.log_output.drain(..boundary);
     }
-}
-
-fn spi_opcode_name(opcode: u8) -> &'static str {
-    match opcode {
-        0x01 => "WRITE_STATUS",
-        0x02 => "PAGE_PROGRAM",
-        0x03 => "READ",
-        0x04 => "WRITE_DISABLE",
-        0x05 => "READ_STATUS",
-        0x06 => "WRITE_ENABLE",
-        0x0B => "FAST_READ",
-        0x0C => "FAST_READ_4B",
-        0x12 => "PAGE_PROGRAM_4B",
-        0x13 => "READ_4B",
-        0x20 => "SECTOR_ERASE_4K",
-        0x21 => "SECTOR_ERASE_4K_4B",
-        0x35 => "READ_STATUS2",
-        0x3B => "DUAL_READ",
-        0x3C => "DUAL_READ_4B",
-        0x52 => "BLOCK_ERASE_32K",
-        0x5A => "READ_SFDP",
-        0x60 | 0xC7 => "CHIP_ERASE",
-        0x6B => "QUAD_READ",
-        0x6C => "QUAD_READ_4B",
-        0x9E | 0x9F => "READ_JEDEC_ID",
-        0xB7 => "4BYTE_ENABLE",
-        0xBB => "DUAL_IO_READ",
-        0xBC => "DUAL_IO_READ_4B",
-        0xD8 => "BLOCK_ERASE_64K",
-        0xDC => "BLOCK_ERASE_64K_4B",
-        0xE9 => "4BYTE_DISABLE",
-        0xEB => "QUAD_IO_READ",
-        0xEC => "QUAD_IO_READ_4B",
-        _ => "UNKNOWN",
-    }
-}
-
-fn is_read_opcode(opcode: u8) -> bool {
-    matches!(
-        opcode,
-        0x03 | 0x0B | 0x0C | 0x13 | 0x3B | 0x3C | 0x5A | 0x6B | 0x6C | 0xBB | 0xBC | 0xEB | 0xEC
-    )
 }
 
 fn set_error(state: &mut SharedState, message: String) {
