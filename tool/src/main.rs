@@ -4,6 +4,7 @@ mod commands;
 mod device;
 mod protocol;
 mod sfdp;
+mod spi_log;
 mod transport;
 
 use anyhow::Result;
