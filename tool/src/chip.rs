@@ -15,6 +15,8 @@ pub trait FlashChipExt {
     fn supports_quad(&self) -> bool;
     fn aai_word(&self) -> bool;
     fn write_byte(&self) -> bool;
+
+    /// Whether the emulated chip should expose an SFDP table.
     fn supports_sfdp(&self) -> bool;
 
     /// Erase operations sorted by block size, excluding chip erase.
@@ -52,7 +54,11 @@ impl FlashChipExt for FlashChip {
     }
 
     fn supports_sfdp(&self) -> bool {
-        self.features.contains(Features::SFDP)
+        // rflasher's database never sets the SFDP feature, so assume SFDP
+        // unless the chip is an SST25 AAI part. Those predate JESD216, and
+        // a fabricated table would make SFDP-probing tools override their
+        // correct chip-table handling.
+        self.features.contains(Features::SFDP) || !self.aai_word()
     }
 
     fn sector_erase_ops(&self) -> Vec<&EraseBlock> {
