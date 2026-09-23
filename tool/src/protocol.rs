@@ -3,6 +3,9 @@
 //! These types intentionally contain only byte arrays and `u8` fields. This
 //! makes their `repr(C)` layout identical to the wire format, while zerocopy's
 //! derives verify that the complete value can safely be viewed as bytes.
+//!
+//! The constants mirror `src/host_protocol.vh`; `rtl_sync` tests keep them
+//! in sync with the RTL.
 
 use zerocopy::{Immutable, IntoBytes};
 
@@ -60,6 +63,7 @@ pub const CMD_LOGPOLL: u8 = 0x3A;
 pub const LOG_POLL_TERMINATOR: u8 = 0xA0;
 pub const LOG_POLL_ESCAPE: u8 = 0xA5;
 
+pub const TOCTOU_SET: u8 = 0x01;
 pub const TOCTOU_ARM: u8 = 0x02;
 pub const TOCTOU_DISARM: u8 = 0x03;
 pub const TOCTOU_RESET: u8 = 0x04;
@@ -222,7 +226,7 @@ impl ToctouSetRequest {
         (index <= 3 && start <= BeU24::MAX && mask <= BeU24::MAX && replace <= BeU24::MAX).then(
             || Self {
                 command: CMD_TOCTOU,
-                subcommand: 0x01,
+                subcommand: TOCTOU_SET,
                 index,
                 start: BeU24::new(start),
                 mask: BeU24::new(mask),

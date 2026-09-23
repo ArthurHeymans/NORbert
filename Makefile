@@ -20,6 +20,11 @@ VERILOG_FILES = \
 	src/util.v \
 	src/pll.v
 
+# Included by the sources above
+VERILOG_HEADERS = \
+	src/spi_flash_cmds.vh \
+	src/host_protocol.vh
+
 # Constraints
 CST_FILE = tangprimer25k.cst
 
@@ -37,7 +42,7 @@ all: build
 # Full build: synthesis + PnR via Gowin CLI
 build: $(BITSTREAM)
 
-$(BITSTREAM): $(VERILOG_FILES) $(CST_FILE) tangprimer25k.sdc build.tcl
+$(BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) tangprimer25k.sdc build.tcl
 	gw_sh build.tcl
 
 # Open-source syntax, elaboration, and synthesis checks.
@@ -48,10 +53,10 @@ lint-yosys:
 		-w "define gw1n not used.*" \
 		-w "Yosys has only limited support for tri-state logic.*" \
 		-e ".*" \
-		-p "read_verilog -lib $(GOWIN_CELLS); read_verilog $(VERILOG_FILES); synth_gowin -family gw5a -top top -noflatten; check"
+		-p "read_verilog -lib $(GOWIN_CELLS); read_verilog -Isrc $(VERILOG_FILES); synth_gowin -family gw5a -top top -noflatten; check"
 
 lint-verilator:
-	verilator --lint-only --top-module top \
+	verilator --lint-only --top-module top -Isrc \
 		-Wno-CASEINCOMPLETE -Wno-DEFPARAM -Wno-PINMISSING \
 		-Wno-WIDTHTRUNC -Wno-WIDTHEXPAND \
 		$(GOWIN_CELLS) $(VERILOG_FILES)
@@ -62,7 +67,7 @@ test:
 	@set -eu; build=$$(mktemp -d); trap 'rm -rf "$$build"' EXIT; \
 	for test in spi_flash sdram_controller toctou quad_fast; do \
 		echo "Testing $$test"; \
-		verilator --binary --timing -j 2 --top-module $${test}_tb \
+		verilator --binary --timing -j 2 --top-module $${test}_tb -Isrc \
 			-Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD \
 			-Wno-WIDTHTRUNC -Wno-WIDTHEXPAND \
 			--Mdir "$$build/$$test" tests/$${test}_tb.sv tests/pll_stub.v \

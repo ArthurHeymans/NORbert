@@ -138,43 +138,7 @@ module spi_trx(
         end
     endfunction
     
-    // SPI Flash command definitions
-    localparam
-        CMD_WRITESTATUS     = 8'h01,  // Write Status Register (1-2 data bytes)
-        CMD_PAGEPROGRAM     = 8'h02,
-        CMD_READ            = 8'h03,
-        CMD_WRITEDISABLE    = 8'h04,
-        CMD_READSTATUS      = 8'h05,
-        CMD_WRITEENABLE     = 8'h06,
-        CMD_FASTREAD        = 8'h0B,
-        CMD_FASTREAD_4B     = 8'h0C,
-        CMD_PAGEPROGRAM_4B  = 8'h12,
-        CMD_READ_4B         = 8'h13,
-        CMD_DUALREAD_4B     = 8'h3C,  // Dual Output Read with 4-byte address
-        CMD_SECTORERASE_4K  = 8'h20,
-        CMD_SECTORERASE_4K_4B = 8'h21,
-        CMD_READSTATUS2     = 8'h35,  // Read Status Register 2
-        CMD_DUALREAD        = 8'h3B,  // Dual Output Read (1-1-2)
-        CMD_BLOCKERASE_32K  = 8'h52,
-        CMD_BLOCKERASE_32K_4B = 8'h5C,
-        CMD_CHIPERASE1      = 8'h60,
-        CMD_QUADREAD        = 8'h6B,  // Quad Output Read (1-1-4)
-        CMD_QUADREAD_4B     = 8'h6C,  // Quad Output Read with 4-byte address
-        CMD_READID1         = 8'h9E,
-        CMD_READSFDP        = 8'h5A,  // Read SFDP table
-        CMD_READID2         = 8'h9F,
-        CMD_4BYTEENABLE     = 8'hB7,
-        CMD_DUALIOREAD      = 8'hBB,  // Dual I/O Read (1-2-2)
-        CMD_DUALIOREAD_4B   = 8'hBC,  // Dual I/O Read with 4-byte address
-        CMD_CHIPERASE2      = 8'hC7,
-        CMD_BLOCKERASE_64K  = 8'hD8,
-        CMD_BLOCKERASE_64K_4B = 8'hDC,
-        CMD_EWSR            = 8'h50,  // Enable Write Status Register (SST)
-        CMD_AAI_WORD        = 8'hAD,  // AAI Word Program (SST)
-        CMD_4BYTEDISABLE    = 8'hE9,
-        CMD_QUADIOREAD      = 8'hEB,  // Quad I/O Read (1-4-4)
-        CMD_QUADIOREAD_4B   = 8'hEC,  // Quad I/O Read with 4-byte address
-        CMD_LOG             = 8'hF2;
+    `include "spi_flash_cmds.vh"
     
     // State machine states
     localparam
@@ -646,12 +610,13 @@ module spi_trx(
                                 // Mode+dummy phase: 4 clocks for 0xBB,
                                 // 6 (2 mode + 4 dummy) for 0xEB.
                                 state <= STA_MODE_MULTI;
-                                mode_count <= addr_quad ? 3'd5 : 3'd3;
+                                mode_count <= addr_quad ? QUAD_IO_MODE_CLKS + QUAD_IO_DUMMY_CLKS - 1
+                                                        : DUAL_IO_MODE_CLKS - 1;
                             end
                             else begin
                                 if (is_fast_read) begin
                                     state <= STA_DUMMY;
-                                    dummy_count <= 7;
+                                    dummy_count <= FAST_READ_DUMMY_CLKS - 1;
                                 end
                                 else begin
                                     state <= STA_READ;

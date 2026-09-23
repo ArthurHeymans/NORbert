@@ -118,43 +118,13 @@ module glue(
     output reg [7:0] led
 );
 
-    // Serial protocol commands
-    localparam
-        CMD_NOP          = 8'h00,
-        CMD_VERSION      = 8'h30,
-        CMD_RAMREAD      = 8'h31,
-        CMD_RAMWRITE     = 8'h32,
-        CMD_CHIPCONFIG   = 8'h33,
-        CMD_START        = 8'h34,  // Enable SPI emulation
-        CMD_STOP         = 8'h35,  // Disable SPI emulation
-        CMD_STATUS       = 8'h36,  // Query running state
-        CMD_HOLDCTL      = 8'h37,  // Assert/release target flash #HOLD
-        CMD_LOGCTL       = 8'h38,  // Enable/disable SPI bus logging capture
-        CMD_TOCTOU       = 8'h39,  // TOCTOU trap management
-        CMD_LOGPOLL      = 8'h3A;  // Drain logger ring FIFO
-
-    // Terminator byte appended to every CMD_LOGPOLL response.  Log data
-    // bytes equal to the terminator or escape byte are byte-stuffed as
-    // 0xA5 0x00 (for 0xA0) or 0xA5 0x05 (for 0xA5), so the terminator is
-    // unambiguous even when raw packet payloads contain 0xA0.
-    localparam LOG_POLL_TERMINATOR = 8'hA0;
-    localparam LOG_POLL_ESCAPE     = 8'hA5;
+    `include "host_protocol.vh"
 
     // Max log bytes sent per poll.  Bounds response length so the host
     // cannot be starved by a busy SPI master filling the FIFO faster
     // than it can be drained.  Remaining data is delivered on the next
     // poll.
     localparam [7:0] LOG_POLL_MAX = 8'd255;
-
-    localparam VERSION = 8'h05;  // Version 5: HOLDCTL + logging + TOCTOU
-
-    // TOCTOU sub-commands
-    localparam
-        TOCTOU_SET       = 8'h01,
-        TOCTOU_ARM       = 8'h02,
-        TOCTOU_DISARM    = 8'h03,
-        TOCTOU_RESET     = 8'h04,
-        TOCTOU_RESET_ALL = 8'h05;
 
     reg [7:0] cmd;
     reg [7:0] in_count;
