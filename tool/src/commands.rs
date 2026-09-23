@@ -303,9 +303,9 @@ fn cmd_configure(cli: &Cli, chip_db_path: Option<&Path>, chip_name: &str) -> Res
         }
     }
 
-    // Generate SFDP table.  For chips that do not support SFDP in real
-    // hardware (e.g. older SST25VFxxx), the table is all-0xFF so SFDP
-    // probes see no valid signature, matching the real part.
+    // Generate SFDP table.  For chips that predate SFDP (the SST25 AAI
+    // parts), the table is all-0xFF so SFDP probes see no valid signature,
+    // matching the real part.
     let sfdp_table = sfdp::generate_sfdp(chip).context("Failed to generate SFDP table")?;
     if chip.supports_sfdp() {
         eprintln!("  SFDP table: {} bytes (valid)", sfdp_table.len());

@@ -19,8 +19,8 @@ const BFPT_DWORDS: u8 = 16; // JESD216A/B
 
 /// Generate the full SFDP table for a given chip.
 ///
-/// Chips that do not implement SFDP in real hardware (e.g. SST25VFxxx
-/// series) get an all-0xFF table.  A valid SFDP response would mislead
+/// Chips that do not implement SFDP in real hardware (the SST25 AAI parts,
+/// see [`FlashChipExt::supports_sfdp`]) get an all-0xFF table.  A valid SFDP response would mislead
 /// tools like flashprog that probe SFDP before consulting their chip
 /// table -- they would parse a fabricated signature and potentially
 /// override the correct hardcoded behavior.  Returning 0xFF (erased
@@ -344,4 +344,19 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     // 16th DWORD: 4-byte address instruction support (0 = use mode switch)
     // ------------------------------------------------------------------
     put_dword(table, base + 60, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chip::{ChipDatabase, find_chip_by_name};
+
+    #[test]
+    fn sfdp_is_generated_unless_the_chip_predates_it() {
+        let db = ChipDatabase::new();
+        let signature =
+            |name| generate_sfdp(find_chip_by_name(&db, name).unwrap()).unwrap()[..4].to_vec();
+        assert_eq!(signature("W25Q64JV-.Q"), b"SFDP");
+        assert_eq!(signature("SST25VF080B"), [0xFF; 4]);
+    }
 }
