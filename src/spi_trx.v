@@ -200,18 +200,14 @@ module spi_trx(
     localparam
         STA_CMD             = 0,
         STA_READSTATUS      = 1,
-        STA_ADDR_READ       = 2,
+        STA_ADDR            = 2,   // Address phase, 1/2/4 lanes (addr_lanes)
         STA_READ            = 3,   // Data output phase, 1/2/4 lanes (read_byte_top)
         STA_READID          = 4,
-        STA_ADDR_WRITE      = 5,
         STA_WRITE           = 6,
-        STA_ADDR_ERASE      = 7,
         STA_ERASE           = 8,
         STA_LOG             = 9,
         STA_DUMMY           = 10,
-        STA_ADDR_READ_DUAL  = 11,  // Dual I/O address phase (1-2-2)
         STA_MODE_MULTI      = 13,  // Mode+dummy phase for 0xBB/0xEB
-        STA_ADDR_READ_QUAD  = 14,  // Quad I/O address phase (1-4-4)
         STA_WRITESTATUS     = 16,  // Receive status register write data
         STA_READSFDP        = 17,  // SFDP data output phase
         STA_AAI_DATA        = 18;  // AAI data reception (2 bytes)
@@ -233,8 +229,28 @@ module spi_trx(
     reg [1:0] aai_bytes_left;   // Ignore data beyond the two-byte AAI word
     
     reg [31:0] addr;
-    reg [4:0] addr_count;
+    reg [4:0] addr_count;       // Index of the next address MSB to arrive
     reg addr_4byte;
+
+    // STA_ADDR receives addr_lanes (1, 2 or 4) bits per clock, MSB first,
+    // then continues according to addr_kind.
+    localparam [1:0]
+        ADDR_KIND_READ  = 2'd0,
+        ADDR_KIND_WRITE = 2'd1,
+        ADDR_KIND_ERASE = 2'd2;
+    reg [2:0] addr_lanes = 1;
+    reg [1:0] addr_kind = ADDR_KIND_READ;
+    wire addr_quad = addr_lanes[2];
+    wire addr_dual = addr_lanes[1];
+    // Address including the bits arriving on this clock. Commands clear
+    // addr when entering STA_ADDR, so before the phase ends addr holds only
+    // the bits received so far, right-aligned.
+    wire [31:0] addr_next = addr_quad ? {addr[27:0], spi_io3_in, spi_io2_in, spi_io1_in, spi_io0_in} :
+                            addr_dual ? {addr[29:0], spi_io1_in, spi_io0_in} :
+                                        {addr[30:0], spi_io0_in};
+    // Most significant address bit arriving on this clock.
+    wire addr_lane_msb = addr_quad ? spi_io3_in : addr_dual ? spi_io1_in : spi_io0_in;
+    wire addr_last = addr_count == addr_lanes - 1'b1;
     
     reg fresh_read = 0;
     // One-burst lookahead state. The SDRAM controller ping-pongs fills
@@ -302,6 +318,8 @@ module spi_trx(
                 if (!aai_active)
                     addr <= 0;
                 addr_count <= 0;
+                addr_lanes <= 1;
+                addr_kind <= ADDR_KIND_READ;
                 dummy_count <= 0;
                 is_fast_read <= 0;
                 is_dual_read <= 0;
@@ -437,26 +455,30 @@ module spi_trx(
                     end
                         
                     CMD_READ: begin
-                        state <= STA_ADDR_READ;
+                        state <= STA_ADDR;
+                        addr <= 0;
                         addr_count <= addr_4byte ? 31 : 23;
                     end
                     
                     CMD_READ_4B: begin
                         if (cfg_4byte) begin
-                            state <= STA_ADDR_READ;
+                            state <= STA_ADDR;
+                            addr <= 0;
                             addr_count <= 31;
                         end
                     end
                     
                     CMD_FASTREAD: begin
-                        state <= STA_ADDR_READ;
+                        state <= STA_ADDR;
+                        addr <= 0;
                         addr_count <= addr_4byte ? 31 : 23;
                         is_fast_read <= 1;
                     end
                     
                     CMD_FASTREAD_4B: begin
                         if (cfg_4byte) begin
-                            state <= STA_ADDR_READ;
+                            state <= STA_ADDR;
+                            addr <= 0;
                             addr_count <= 31;
                             is_fast_read <= 1;
                         end
@@ -465,7 +487,8 @@ module spi_trx(
                     // Dual Output Read (1-1-2): cmd(1), addr(1), 8 dummy, data(2)
                     CMD_DUALREAD,
                     CMD_DUALREAD_4B: begin
-                        state <= STA_ADDR_READ;
+                        state <= STA_ADDR;
+                        addr <= 0;
                         addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_DUALREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                         is_fast_read <= 1;   // Uses same dummy phase
                         is_dual_read <= 1;
@@ -475,7 +498,9 @@ module spi_trx(
                     // Dual I/O Read (1-2-2): cmd(1), addr(2), mode+dummy(2), data(2)
                     CMD_DUALIOREAD,
                     CMD_DUALIOREAD_4B: begin
-                        state <= STA_ADDR_READ_DUAL;
+                        state <= STA_ADDR;
+                        addr <= 0;
+                        addr_lanes <= 2;
                         addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_DUALIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                         is_dual_read <= 1;
                         read_byte_top <= 3;
@@ -485,7 +510,8 @@ module spi_trx(
                     CMD_QUADREAD,
                     CMD_QUADREAD_4B: begin
                         if (status_reg2[1]) begin  // QE required
-                            state <= STA_ADDR_READ;
+                            state <= STA_ADDR;
+                            addr <= 0;
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                             is_fast_read <= 1;   // Uses same dummy phase
                             is_quad_read <= 1;
@@ -497,7 +523,9 @@ module spi_trx(
                     CMD_QUADIOREAD,
                     CMD_QUADIOREAD_4B: begin
                         if (status_reg2[1]) begin  // QE required
-                            state <= STA_ADDR_READ_QUAD;
+                            state <= STA_ADDR;
+                            addr <= 0;
+                            addr_lanes <= 4;
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                             is_quad_read <= 1;
                             read_byte_top <= 1;
@@ -507,7 +535,9 @@ module spi_trx(
                     CMD_SECTORERASE_4K,
                     CMD_SECTORERASE_4K_4B: begin
                         if (status_reg[1]) begin
-                            state <= STA_ADDR_ERASE;
+                            state <= STA_ADDR;
+                            addr <= 0;
+                            addr_kind <= ADDR_KIND_ERASE;
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_SECTORERASE_4K_4B) ? 31 : (addr_4byte ? 31 : 23);
                             write_len <= 23'h001FF; // 4KB = 512 × 8-byte bursts - 1
                         end
@@ -516,7 +546,9 @@ module spi_trx(
                     CMD_BLOCKERASE_32K,
                     CMD_BLOCKERASE_32K_4B: begin
                         if (status_reg[1]) begin
-                            state <= STA_ADDR_ERASE;
+                            state <= STA_ADDR;
+                            addr <= 0;
+                            addr_kind <= ADDR_KIND_ERASE;
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_BLOCKERASE_32K_4B) ? 31 : (addr_4byte ? 31 : 23);
                             write_len <= 23'h00FFF; // 32KB = 4096 × 8-byte bursts - 1
                         end
@@ -525,7 +557,9 @@ module spi_trx(
                     CMD_BLOCKERASE_64K,
                     CMD_BLOCKERASE_64K_4B: begin
                         if (status_reg[1]) begin
-                            state <= STA_ADDR_ERASE;
+                            state <= STA_ADDR;
+                            addr <= 0;
+                            addr_kind <= ADDR_KIND_ERASE;
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_BLOCKERASE_64K_4B) ? 31 : (addr_4byte ? 31 : 23);
                             write_len <= 23'h01FFF; // 64KB = 8192 × 8-byte bursts - 1
                         end
@@ -547,7 +581,9 @@ module spi_trx(
                     CMD_PAGEPROGRAM,
                     CMD_PAGEPROGRAM_4B: begin
                         if (status_reg[1]) begin
-                            state <= STA_ADDR_WRITE;
+                            state <= STA_ADDR;
+                            addr <= 0;
+                            addr_kind <= ADDR_KIND_WRITE;
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_PAGEPROGRAM_4B) ? 31 : (addr_4byte ? 31 : 23);
                             write_len <= 23'h0001F; // 256 byte page = 32 × 8-byte bursts - 1
                         end
@@ -571,7 +607,9 @@ module spi_trx(
                         if (status_reg[1] || aai_active) begin
                             if (!aai_active) begin
                                 // First AAI: need address phase
-                                state <= STA_ADDR_WRITE;
+                                state <= STA_ADDR;
+                                addr <= 0;
+                                addr_kind <= ADDR_KIND_WRITE;
                                 addr_count <= addr_4byte ? 31 : 23;
                                 is_aai <= 1;
                                 write_len <= 0;
@@ -591,7 +629,8 @@ module spi_trx(
                     end
                     
                     CMD_READSFDP: begin
-                        state <= STA_ADDR_READ;
+                        state <= STA_ADDR;
+                        addr <= 0;
                         addr_count <= 23;        // Always 3-byte address for SFDP
                         is_fast_read <= 1;       // 8 dummy clocks after address
                         is_sfdp_read <= 1;
@@ -620,68 +659,131 @@ module spi_trx(
                 else if ((state == STA_READSTATUS) && (bit_count_in == 0)) begin
                     miso_byte <= status_read_sel2 ? status_reg2 : status_reg;
                 end
-                else if (state == STA_ADDR_READ) begin
-                    // Receiving address bytes for read (single-bit, 1 bit/clock)
-                    // ram_addr is 23-bit burst address = byte_addr[25:3]
-                    // addr_count counts down from 23 (or 31 for 4-byte) to 0
-                    
-                    // SDRAM pipeline (skipped for SFDP reads which use internal table).
-                    // Row and bank are complete several clocks before the column;
-                    // issue ACTIVATE early, then post READ when address bit 3 arrives.
-                    if (!is_sfdp_read) begin
+                // ---------------------------------------------------------
+                // Address phase for reads, programs and erases. Receives
+                // addr_lanes bits per clock MSB first: IO0 for 1-x-x
+                // commands, IO1:IO0 for 1-2-2 and IO3:IO0 for 1-4-4.
+                // ---------------------------------------------------------
+                else if (state == STA_ADDR) begin
+                    // SDRAM pipeline for array reads (SFDP uses the internal
+                    // table). Row and bank are complete several clocks
+                    // before the column: issue ACTIVATE early, then post
+                    // READ when byte-address bit 3 arrives. ram_addr is the
+                    // 23-bit burst address = byte_addr[25:3].
+                    if (addr_kind == ADDR_KIND_READ && !is_sfdp_read) begin
                         if (addr_count == 15) begin
                             ram_inhibit_refresh <= 1;
                         end
-                        else if (addr_count == 9) begin
+                        else if (addr_count == (addr_quad ? 11 : 9)) begin
+                            // Quad: IO3/IO2 carry byte-address bits 11/10.
                             ram_activate <= 1;
-                            ram_addr[22:7] <= addr[25:10] & cfg_chip_erase_bursts[22:7];
+                            ram_addr[22:7] <= (addr_quad ? {addr[13:0], spi_io3_in, spi_io2_in}
+                                                         : addr[15:0]) &
+                                              cfg_chip_erase_bursts[22:7];
                         end
                         else if (addr_count == 3) begin
                             ram_read <= 1;
-                            ram_addr[6:0] <= {addr[9:4], spi_io0_in} &
+                            ram_addr[6:0] <= {addr[5:0], addr_lane_msb} &
                                              cfg_chip_erase_bursts[6:0];
                         end
                     end
-                    
-                    if (addr_count == 0) begin
-                        log_addr_valid <= 1;
-                        log_addr_toggle <= !log_addr_toggle;
-                        log_addr_out <= addr;
-                        log_addr_out[0] <= spi_io0_in;
-                        
-                        if (!is_sfdp_read) begin
-                            ram_activate <= 0;
-                            ram_read <= 0;
-                        end
-                        // Keep refresh inhibited across the dummy phase for
-                        // fast reads: the second burst posts mid-dummy and a
-                        // refresh starting in the gap would delay it past its
-                        // need. (Slow 0x03 drops here as before, preserving
-                        // the refresh-overlap window its first burst relies
-                        // on for trap timing coverage.) Inhibit is released
-                        // at the dummy end instead (see STA_DUMMY below).
-                        if (!is_sfdp_read && !is_fast_read) begin
-                            ram_inhibit_refresh <= 0;
-                        end
 
-                        if (is_fast_read) begin
-                            state <= STA_DUMMY;
-                            dummy_count <= 7;
-                        end
-                        else begin
-                            state <= STA_READ;
-                            spi_io1_oe_ff <= 1;
-                            fresh_read <= 1;
-                        end
-                    end
-                    
-                    if (bit_count_in == 0) begin
+                    // SST AAI ignores transmitted A0: the two bytes occupy
+                    // an aligned word within one SDRAM burst.
+                    addr <= (is_aai && addr_last) ? {addr_next[31:1], 1'b0} : addr_next;
+                    addr_count <= addr_count - addr_lanes;
+
+                    if (!addr_dual && !addr_quad && bit_count_in == 0) begin
                         log_strobe <= 1;
                         log_val <= {mosi_byte[7:1], spi_io0_in};
                     end
-                    
-                    addr[addr_count] <= spi_io0_in;
-                    addr_count <= addr_count - 1;
+
+                    if (addr_last) begin
+                        log_addr_valid <= 1;
+                        log_addr_toggle <= !log_addr_toggle;
+                        log_addr_out <= addr_next;
+
+                        case (addr_kind)
+                        ADDR_KIND_READ: begin
+                            if (addr_dual || addr_quad) begin
+                                // Mode+dummy phase: 4 clocks for 0xBB,
+                                // 6 (2 mode + 4 dummy) for 0xEB.
+                                state <= STA_MODE_MULTI;
+                                mode_count <= addr_quad ? 3'd5 : 3'd3;
+                            end
+                            else begin
+                                if (!is_sfdp_read) begin
+                                    ram_activate <= 0;
+                                    ram_read <= 0;
+                                end
+                                // Keep refresh inhibited across the dummy
+                                // phase for fast reads: the second burst
+                                // posts mid-dummy and a refresh starting in
+                                // the gap would delay it past its need.
+                                // (Slow 0x03 drops here as before,
+                                // preserving the refresh-overlap window its
+                                // first burst relies on for trap timing
+                                // coverage.) Inhibit is released at the
+                                // dummy end instead (see STA_DUMMY below).
+                                if (!is_sfdp_read && !is_fast_read) begin
+                                    ram_inhibit_refresh <= 0;
+                                end
+
+                                if (is_fast_read) begin
+                                    state <= STA_DUMMY;
+                                    dummy_count <= 7;
+                                end
+                                else begin
+                                    state <= STA_READ;
+                                    spi_io1_oe_ff <= 1;
+                                    fresh_read <= 1;
+                                end
+                            end
+                        end
+
+                        ADDR_KIND_ERASE: begin
+                            state <= STA_ERASE;
+                            write_cmd <= 1;
+                            write_type <= 2'd1;
+
+                            // Align address based on erase size
+                            // write_addr is 23-bit burst address = byte_addr[25:3]
+                            if (write_len == 20'h01FFF)
+                                write_addr <= wrap_burst_addr({addr_next[25:16], 13'b0});  // 64KB aligned
+                            else if (write_len == 20'h00FFF)
+                                write_addr <= wrap_burst_addr({addr_next[25:15], 12'b0});  // 32KB aligned
+                            else
+                                write_addr <= wrap_burst_addr({addr_next[25:12], 9'b0});   // 4KB aligned
+
+                            status_reg[1] <= 0;
+                            status_reg[0] <= 1;
+                        end
+
+                        default: begin // ADDR_KIND_WRITE
+                            if (is_aai) begin
+                                // Don't clear WEL between AAI words.
+                                state <= STA_AAI_DATA;
+                                aai_bytes_left <= 2;
+                                write_cmd <= 1;
+                                write_type <= 2'd2;
+                                write_addr <= wrap_burst_addr(addr_next[25:3]);
+                                write_len <= 0;
+                                status_reg[0] <= 1;
+                            end else begin
+                                state <= STA_WRITE;
+                                write_cmd <= 1;
+                                write_type <= 2'd0;
+
+                                // Page-aligned address in 8-byte burst units
+                                // byte_addr[25:3] -> burst address, page = 256 bytes = 32 bursts
+                                write_addr <= wrap_burst_addr({addr_next[25:8], 5'b0});
+
+                                status_reg[1] <= 0;
+                                status_reg[0] <= 1;
+                            end
+                        end
+                        endcase
+                    end
                 end
                 else if (state == STA_DUMMY) begin
                     if (dummy_count == 0) begin
@@ -817,81 +919,6 @@ module spi_trx(
                             miso_byte <= 0;
                     end
                 end
-                else if (state == STA_ADDR_ERASE) begin
-                    if (addr_count == 0) begin
-                        log_addr_valid <= 1;
-                        log_addr_toggle <= !log_addr_toggle;
-                        log_addr_out <= addr;
-                        log_addr_out[0] <= spi_io0_in;
-                        
-                        state <= STA_ERASE;
-                        write_cmd <= 1;
-                        write_type <= 2'd1;
-                        
-                        // Align address based on erase size
-                        // write_addr is 23-bit burst address = byte_addr[25:3]
-                        if (write_len == 20'h01FFF)
-                            write_addr <= wrap_burst_addr({addr[25:16], 13'b0});  // 64KB aligned
-                        else if (write_len == 20'h00FFF)
-                            write_addr <= wrap_burst_addr({addr[25:15], 12'b0});  // 32KB aligned
-                        else
-                            write_addr <= wrap_burst_addr({addr[25:12], 9'b0});   // 4KB aligned
-                            
-                        status_reg[1] <= 0;
-                        status_reg[0] <= 1;
-                    end
-                    
-                    addr[addr_count] <= spi_io0_in;
-                    addr_count <= addr_count - 1;
-                    
-                    if (bit_count_in == 0) begin
-                        log_strobe <= 1;
-                        log_val <= {mosi_byte[7:1], spi_io0_in};
-                    end
-                end
-                else if (state == STA_ADDR_WRITE) begin
-                    if (addr_count == 0) begin
-                        log_addr_valid <= 1;
-                        log_addr_toggle <= !log_addr_toggle;
-                        log_addr_out <= addr;
-                        log_addr_out[0] <= spi_io0_in;
-
-                        if (is_aai) begin
-                            // SST AAI ignores transmitted A0: the two bytes
-                            // occupy an aligned word within one SDRAM burst.
-                            // Don't clear WEL between AAI words.
-                            state <= STA_AAI_DATA;
-                            aai_bytes_left <= 2;
-                            write_cmd <= 1;
-                            write_type <= 2'd2;
-                            write_addr <= wrap_burst_addr(addr[25:3]);
-                            write_len <= 0;
-                            status_reg[0] <= 1;
-                        end else begin
-                            state <= STA_WRITE;
-                            write_cmd <= 1;
-                            write_type <= 2'd0;
-
-                            // Page-aligned address in 8-byte burst units
-                            // byte_addr[25:3] -> burst address, page = 256 bytes = 32 bursts
-                            write_addr <= wrap_burst_addr({addr[25:8], 5'b0});
-
-                            status_reg[1] <= 0;
-                            status_reg[0] <= 1;
-                        end
-                    end
-                    
-                    if (is_aai && addr_count == 0)
-                        addr[0] <= 0;
-                    else
-                        addr[addr_count] <= spi_io0_in;
-                    addr_count <= addr_count - 1;
-                    
-                    if (bit_count_in == 0) begin
-                        log_strobe <= 1;
-                        log_val <= {mosi_byte[7:1], spi_io0_in};
-                    end
-                end
                 else if ((state == STA_WRITE) && (bit_count_in == 0)) begin
                     write_buf_strobe <= 1;
                     write_buf_offset <= addr[7:0];
@@ -920,46 +947,6 @@ module spi_trx(
                     if (bit_count_in == 0) begin
                         log_strobe <= 1;
                         log_val <= {mosi_byte[7:1], spi_io0_in};
-                    end
-                end
-                // ---------------------------------------------------------
-                // Dual I/O address phase (1-2-2 mode, CMD 0xBB)
-                // 2 address bits per clock: IO1=high bit, IO0=low bit
-                // ---------------------------------------------------------
-                else if (state == STA_ADDR_READ_DUAL) begin
-                    
-                    // SDRAM pipeline during the address phase. Activate as
-                    // soon as row/bank are complete; the column is supplied
-                    // later when the READ request is posted.
-                    if (addr_count == 15) begin
-                        ram_inhibit_refresh <= 1;
-                    end
-                    else if (addr_count == 9) begin
-                        ram_activate <= 1;
-                        ram_addr[22:7] <= addr[25:10] & cfg_chip_erase_bursts[22:7];
-                    end
-                    else if (addr_count == 3) begin
-                        ram_read <= 1;
-                        ram_addr[6:0] <= {addr[9:4], spi_io1_in} &
-                                         cfg_chip_erase_bursts[6:0];
-                    end
-                    
-                    // Receive 2 address bits per clock
-                    addr[addr_count]     <= spi_io1_in;   // High bit
-                    addr[addr_count - 1] <= spi_io0_in;   // Low bit
-                    addr_count <= addr_count - 2;
-                    
-                    // Transition when last 2 bits received (addr_count was 1)
-                    if (addr_count == 1) begin
-                        log_addr_valid <= 1;
-                        log_addr_toggle <= !log_addr_toggle;
-                        log_addr_out <= addr;
-                        log_addr_out[1] <= spi_io1_in;
-                        log_addr_out[0] <= spi_io0_in;
-                        
-                        // Enter mode+dummy phase (4 dual clocks for 0xBB)
-                        state <= STA_MODE_MULTI;
-                        mode_count <= 3;
                     end
                 end
                 // ---------------------------------------------------------
@@ -1009,51 +996,6 @@ module spi_trx(
                     end
                     else begin
                         mode_count <= mode_count - 1;
-                    end
-                end
-                // ---------------------------------------------------------
-                // Quad I/O address phase (1-4-4 mode, CMD 0xEB)
-                // 4 address bits per clock: IO3=MSB, IO0=LSB
-                // ---------------------------------------------------------
-                else if (state == STA_ADDR_READ_QUAD) begin
-                    
-                    // SDRAM pipeline during the address phase. At count 11,
-                    // IO3/IO2 carry byte-address bits 11/10, completing the
-                    // row and bank. The final column bit arrives at count 3.
-                    if (addr_count == 15) begin
-                        ram_inhibit_refresh <= 1;
-                    end
-                    else if (addr_count == 11) begin
-                        ram_activate <= 1;
-                        ram_addr[22:7] <= {addr[25:12], spi_io3_in, spi_io2_in} &
-                                         cfg_chip_erase_bursts[22:7];
-                    end
-                    else if (addr_count == 3) begin
-                        ram_read <= 1;
-                        ram_addr[6:0] <= {addr[9:4], spi_io3_in} &
-                                        cfg_chip_erase_bursts[6:0];
-                    end
-                    
-                    // Receive 4 address bits per clock
-                    addr[addr_count]     <= spi_io3_in;   // MSB
-                    addr[addr_count - 1] <= spi_io2_in;
-                    addr[addr_count - 2] <= spi_io1_in;
-                    addr[addr_count - 3] <= spi_io0_in;   // LSB
-                    addr_count <= addr_count - 4;
-                    
-                    // Transition when last 4 bits received (addr_count was 3)
-                    if (addr_count == 3) begin
-                        log_addr_valid <= 1;
-                        log_addr_toggle <= !log_addr_toggle;
-                        log_addr_out <= addr;
-                        log_addr_out[3] <= spi_io3_in;
-                        log_addr_out[2] <= spi_io2_in;
-                        log_addr_out[1] <= spi_io1_in;
-                        log_addr_out[0] <= spi_io0_in;
-                        
-                        // Enter mode+dummy phase (6 quad clocks: 2 mode + 4 dummy)
-                        state <= STA_MODE_MULTI;
-                        mode_count <= 5;
                     end
                 end
                 // ---------------------------------------------------------
