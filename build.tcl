@@ -8,6 +8,7 @@ set_device -name GW5A-25B GW5A-LV25MG121NC1/I0
 # Add Verilog source files
 add_file src/top.v
 add_file src/spi_trx.v
+add_file src/spi_prefetch.v
 add_file src/sdram.v
 add_file src/glue.v
 add_file src/uart.v

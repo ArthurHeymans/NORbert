@@ -311,8 +311,8 @@ Note: H11 is a core board button pin, repurposed for FT245 (buttons are unused b
 
 ## SPI read performance
 
-Sustained SPI clock limits are set by the SDRAM prefetch pipeline (`spi_trx.v`
-and `sdram.v`). Each 8-byte SDRAM burst takes ~12 system clock cycles (120 MHz)
+Sustained SPI clock limits are set by the SDRAM prefetch pipeline
+(`spi_prefetch.v` and `sdram.v`). Each 8-byte SDRAM burst takes ~12 system clock cycles (120 MHz)
 from post to data valid. Instead of posting just-in-time, the SPI engine keeps
 one burst in flight at all times (one-burst lookahead with ping-pong buffers),
 so the limit is throughput (one burst per ~12 sysclks), not single-burst
@@ -354,6 +354,7 @@ for 0xEB/0xBB, not a faster SDRAM clock.
 src/
   top.v        Top-level module, clock/reset, bus wiring, TOCTOU address mux
   spi_trx.v    SPI flash transceiver (command decoder + data path)
+  spi_prefetch.v  SDRAM burst requests and ping-pong buffer selection for SPI reads
   sdram.v      Dual-chip SDRAM controller, byte-serial bursts, ping-pong prefetch
   glue.v       Protocol handler, UART/FT245 I/O, SPI write engine, TOCTOU trap engine, LOGPOLL state machine, LED control
   logger.v     SPI event capture into a 512-byte ring FIFO drained by CMD_LOGPOLL

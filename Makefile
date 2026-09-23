@@ -10,6 +10,7 @@ FAMILY = GW5A-25B
 VERILOG_FILES = \
 	src/top.v \
 	src/spi_trx.v \
+	src/spi_prefetch.v \
 	src/sdram.v \
 	src/glue.v \
 	src/uart.v \

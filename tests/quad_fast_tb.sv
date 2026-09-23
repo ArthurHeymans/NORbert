@@ -303,7 +303,7 @@ module quad_fast_tb;
                                  a, count, i, got, want);
                         $display("  liveA=%h liveB=%h cons=%b underrun=%b",
                                  spi.ram_read_buffer, spi.ram_read_buffer_b,
-                                 spi.consume_sel, underrun);
+                                 spi.prefetch.consume_sel, underrun);
                         for (integer j = 0; j < count; j++) begin
                             automatic logic [22:0] bb = (a+j) >> 3;
                             $display("  byte+%0d burst=%h idx=%0d want=%h",
