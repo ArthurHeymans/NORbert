@@ -3,6 +3,8 @@ mod cli;
 mod commands;
 mod device;
 mod protocol;
+#[cfg(test)]
+mod rtl_sync;
 mod sfdp;
 mod spi_log;
 mod transport;

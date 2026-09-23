@@ -250,7 +250,7 @@ TXN#   COMMAND            ADDRESS    INFO
        end: 4097 bytes from 0x001000
 ```
 
-The monitor also tracks double-reads of the same (opcode, address) pair and flags them as TOCTOU candidates. Press Ctrl+C to stop. The underlying protocol is a poll-based ring-buffer drain (`CMD_LOGPOLL` = 0x3A); packet types are `0xA1` (command), `0xA2` (address), `0xA3` (end + byte count) and `0xA4` (TOCTOU trap fired), with `0xA0` as the per-poll terminator.
+The monitor also tracks double-reads of the same (opcode, address) pair and flags them as TOCTOU candidates. Press Ctrl+C to stop. The underlying protocol is a poll-based ring-buffer drain (`CMD_LOGPOLL` = 0x3A); packet types are `0xA1` (command), `0xA2` (address), `0xA3` (end + byte count) and `0xA4` (TOCTOU trap fired), with `0xA0` as the per-poll terminator. Log bytes equal to `0xA0` or `0xA5` are sent as `0xA5 0x00` and `0xA5 0x05`.
 
 ### TOCTOU traps
 
@@ -311,8 +311,8 @@ Note: H11 is a core board button pin, repurposed for FT245 (buttons are unused b
 
 ## SPI read performance
 
-Sustained SPI clock limits are set by the SDRAM prefetch pipeline (`spi_trx.v`
-and `sdram.v`). Each 8-byte SDRAM burst takes ~12 system clock cycles (120 MHz)
+Sustained SPI clock limits are set by the SDRAM prefetch pipeline
+(`spi_prefetch.v` and `sdram.v`). Each 8-byte SDRAM burst takes ~12 system clock cycles (120 MHz)
 from post to data valid. Instead of posting just-in-time, the SPI engine keeps
 one burst in flight at all times (one-burst lookahead with ping-pong buffers),
 so the limit is throughput (one burst per ~12 sysclks), not single-burst
@@ -354,7 +354,10 @@ for 0xEB/0xBB, not a faster SDRAM clock.
 src/
   top.v        Top-level module, clock/reset, bus wiring, TOCTOU address mux
   spi_trx.v    SPI flash transceiver (command decoder + data path)
+  spi_prefetch.v  SDRAM burst requests and ping-pong buffer selection for SPI reads
   sdram.v      Dual-chip SDRAM controller, byte-serial bursts, ping-pong prefetch
+  spi_flash_cmds.vh  Emulated SPI flash opcodes and read wait states
+  host_protocol.vh   Host serial protocol opcodes and log packet types
   glue.v       Protocol handler, UART/FT245 I/O, SPI write engine, TOCTOU trap engine, LOGPOLL state machine, LED control
   logger.v     SPI event capture into a 512-byte ring FIFO drained by CMD_LOGPOLL
   uart.v       UART TX/RX (2 Mbaud)
@@ -369,6 +372,9 @@ tool/
 ```
 
 ## Serial protocol
+
+`src/host_protocol.vh` defines these values for the FPGA; `cargo test` checks
+that `tool/src/protocol.rs` matches it.
 
 All opcodes reply with a single `0x01` ACK unless otherwise noted. The FPGA
 accepts command bytes from whichever port (UART or FT245) first delivers one

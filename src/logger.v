@@ -44,6 +44,8 @@ module logger(
     input wire out_read_strobe
 );
 
+    `include "host_protocol.vh"
+
     // -----------------------------------------------------------------
     // Synchronize SPI-domain signals into system clock domain
     // -----------------------------------------------------------------
@@ -148,7 +150,7 @@ module logger(
                 if (evt_cmd_pending && fifo_space) begin
                     evt_cmd_pending   <= 0;
                     fifo_write_strobe <= 1;
-                    fifo_write_data   <= 8'hA1;
+                    fifo_write_data   <= LOG_PKT_CMD;
                     pkt_shift         <= {evt_cmd_opcode, 40'b0};
                     pkt_remain        <= 1;
                     pkt_state         <= PKT_EMIT;
@@ -156,7 +158,7 @@ module logger(
                 else if (evt_addr_pending && fifo_space) begin
                     evt_addr_pending  <= 0;
                     fifo_write_strobe <= 1;
-                    fifo_write_data   <= 8'hA2;
+                    fifo_write_data   <= LOG_PKT_ADDR;
                     pkt_shift         <= {evt_addr[31:0], 16'b0};
                     pkt_remain        <= 4;
                     pkt_state         <= PKT_EMIT;
@@ -164,7 +166,7 @@ module logger(
                 else if (evt_end_pending && fifo_space) begin
                     evt_end_pending   <= 0;
                     fifo_write_strobe <= 1;
-                    fifo_write_data   <= 8'hA3;
+                    fifo_write_data   <= LOG_PKT_END;
                     pkt_shift         <= {evt_byte_count, 24'b0};
                     pkt_remain        <= 3;
                     pkt_state         <= PKT_EMIT;
@@ -172,7 +174,7 @@ module logger(
                 else if (evt_trap_pending && fifo_space) begin
                     evt_trap_pending  <= 0;
                     fifo_write_strobe <= 1;
-                    fifo_write_data   <= 8'hA4;
+                    fifo_write_data   <= LOG_PKT_TRAP;
                     pkt_shift         <= {6'b0, evt_trap_index, evt_trap_addr, 16'b0};
                     pkt_remain        <= 5;
                     pkt_state         <= PKT_EMIT;
