@@ -201,7 +201,7 @@ module spi_trx(
         STA_CMD             = 0,
         STA_READSTATUS      = 1,
         STA_ADDR_READ       = 2,
-        STA_READ            = 3,
+        STA_READ            = 3,   // Data output phase, 1/2/4 lanes (read_byte_top)
         STA_READID          = 4,
         STA_ADDR_WRITE      = 5,
         STA_WRITE           = 6,
@@ -210,10 +210,8 @@ module spi_trx(
         STA_LOG             = 9,
         STA_DUMMY           = 10,
         STA_ADDR_READ_DUAL  = 11,  // Dual I/O address phase (1-2-2)
-        STA_READ_DUAL       = 12,  // Dual data output phase (1-1-2 & 1-2-2)
         STA_MODE_MULTI      = 13,  // Mode+dummy phase for 0xBB/0xEB
         STA_ADDR_READ_QUAD  = 14,  // Quad I/O address phase (1-4-4)
-        STA_READ_QUAD       = 15,  // Quad data output phase (1-1-4 & 1-4-4)
         STA_WRITESTATUS     = 16,  // Receive status register write data
         STA_READSFDP        = 17,  // SFDP data output phase
         STA_AAI_DATA        = 18;  // AAI data reception (2 bytes)
@@ -223,6 +221,9 @@ module spi_trx(
     reg is_fast_read = 0;
     reg is_dual_read = 0;       // Set for both 0x3B and 0xBB
     reg is_quad_read = 0;       // Set for both 0x6B and 0xEB
+    // Last bit_count_in value of a data byte in STA_READ: 7 for single,
+    // 3 for dual and 1 for quad output (SPI clocks per byte - 1).
+    reg [2:0] read_byte_top = 7;
     reg is_sfdp_read = 0;       // Set for CMD 0x5A (Read SFDP)
     reg [2:0] mode_count = 0;   // Mode+dummy counter (4 for dual, 6 for quad)
     
@@ -305,6 +306,7 @@ module spi_trx(
                 is_fast_read <= 0;
                 is_dual_read <= 0;
                 is_quad_read <= 0;
+                read_byte_top <= 7;
                 is_sfdp_read <= 0;
                 is_aai <= 0;
                 aai_bytes_left <= 0;
@@ -367,7 +369,7 @@ module spi_trx(
                 post_arm1 <= fresh_read;
                 post_arm2 <= post_arm1;
                 if (post_arm2 &&
-                    (state == STA_READ || state == STA_READ_DUAL || state == STA_READ_QUAD)) begin
+                    state == STA_READ) begin
                     // Dummy/mode-posted second burst: nothing to post, just
                     // clear the flag (the advance drop already re-armed).
                     if (prefetch_pending)
@@ -467,6 +469,7 @@ module spi_trx(
                         addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_DUALREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                         is_fast_read <= 1;   // Uses same dummy phase
                         is_dual_read <= 1;
+                        read_byte_top <= 3;
                     end
                     
                     // Dual I/O Read (1-2-2): cmd(1), addr(2), mode+dummy(2), data(2)
@@ -475,6 +478,7 @@ module spi_trx(
                         state <= STA_ADDR_READ_DUAL;
                         addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_DUALIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                         is_dual_read <= 1;
+                        read_byte_top <= 3;
                     end
                     
                     // Quad Output Read (1-1-4): cmd(1), addr(1), 8 dummy, data(4)
@@ -485,6 +489,7 @@ module spi_trx(
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                             is_fast_read <= 1;   // Uses same dummy phase
                             is_quad_read <= 1;
+                            read_byte_top <= 1;
                         end
                     end
                     
@@ -495,6 +500,7 @@ module spi_trx(
                             state <= STA_ADDR_READ_QUAD;
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
                             is_quad_read <= 1;
+                            read_byte_top <= 1;
                         end
                     end
 
@@ -692,23 +698,12 @@ module spi_trx(
                             spi_io1_oe_ff <= 1;
                             miso_byte <= sfdp_rdata;
                         end
-                        else if (is_quad_read) begin
-                            state <= STA_READ_QUAD;
-                            spi_io0_oe_ff <= 1;
-                            spi_io1_oe_ff <= 1;
-                            spi_io2_oe_ff <= 1;
-                            spi_io3_oe_ff <= 1;
-                            fresh_read <= 1;
-                        end
-                        else if (is_dual_read) begin
-                            state <= STA_READ_DUAL;
-                            spi_io0_oe_ff <= 1;
-                            spi_io1_oe_ff <= 1;
-                            fresh_read <= 1;
-                        end
                         else begin
                             state <= STA_READ;
+                            spi_io0_oe_ff <= is_dual_read || is_quad_read;
                             spi_io1_oe_ff <= 1;
+                            spi_io2_oe_ff <= is_quad_read;
+                            spi_io3_oe_ff <= is_quad_read;
                             fresh_read <= 1;
                         end
                     end
@@ -739,6 +734,12 @@ module spi_trx(
                             sfdp_raddr <= addr[6:0];
                     end
                 end
+                // ---------------------------------------------------------
+                // Data output phase for all read modes. read_byte_top sets
+                // the SPI clocks per byte: bit_count_in cycles 7..0 for
+                // single, 3..0 for dual (IO1:IO0) and 1..0 for quad
+                // (IO3:IO0) output.
+                // ---------------------------------------------------------
                 else if (state == STA_READ) begin
                     // One-burst lookahead: the next burst was posted on the
                     // first clock of this one (or during the dummy phase) and
@@ -754,7 +755,7 @@ module spi_trx(
                     end
 
                     if (addr[2:0] == 7) begin
-                        if (bit_count_in == 7 && !ram_activate && !posted_this_burst) begin
+                        if (bit_count_in == read_byte_top && !ram_activate && !posted_this_burst) begin
                             ram_continuation <= 1;
                             // Fallback when a read starts directly at byte 7.
                             ram_inhibit_refresh <= 1;
@@ -999,99 +1000,16 @@ module spi_trx(
                             ram_read <= 0;
                         end
                         
-                        if (is_quad_read) begin
-                            state <= STA_READ_QUAD;
-                            spi_io0_oe_ff <= 1;
-                            spi_io1_oe_ff <= 1;
-                            spi_io2_oe_ff <= 1;
-                            spi_io3_oe_ff <= 1;
-                        end
-                        else begin
-                            state <= STA_READ_DUAL;
-                            spi_io0_oe_ff <= 1;
-                            spi_io1_oe_ff <= 1;
-                        end
+                        state <= STA_READ;
+                        spi_io0_oe_ff <= 1;
+                        spi_io1_oe_ff <= 1;
+                        spi_io2_oe_ff <= is_quad_read;
+                        spi_io3_oe_ff <= is_quad_read;
                         fresh_read <= 1;
                     end
                     else begin
                         mode_count <= mode_count - 1;
                     end
-                end
-                // ---------------------------------------------------------
-                // Dual data output phase (1-1-2 and 1-2-2)
-                // 2 data bits per clock on IO0+IO1, 4 clocks per byte.
-                // bit_count_in cycles 3->2->1->0->3->... in this state.
-                //
-                // One-burst lookahead (see STA_READ): the next burst is
-                // posted on the first clock of this one, giving a full
-                // 32 SPI clocks of lead time instead of the old 8.
-                // ---------------------------------------------------------
-                else if (state == STA_READ_DUAL) begin
-                    
-                    // Drop the request levels on the last clock of byte 6
-                    // to re-arm the controller handshake for the next post.
-                    if (addr[2:0] == 6 && bit_count_in == 0) begin
-                        ram_inhibit_refresh <= 0;
-                        ram_activate <= 0;
-                        ram_read <= 0;
-                    end
-                    
-                    // Fallback for very short first bursts (addr starts at 7)
-                    // Only fires if the first-clock post didn't happen.
-                    if (addr[2:0] == 7) begin
-                        if (bit_count_in == 3 && !ram_activate && !posted_this_burst) begin
-                            ram_continuation <= 1;
-                            // Fallback for very short first bursts (addr starts at 7)
-                            // Only fires if the first-clock post didn't happen.
-                            ram_inhibit_refresh <= 1;
-                            ram_activate <= 1;
-                            ram_read <= 1;
-                            ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
-                            posted_this_burst <= 1;
-                        end
-                        else if (bit_count_in == 0) begin
-                            consume_sel <= ~consume_sel;
-                            // Both flags sample the system-clock valids
-                            // directly (async). Benign: these are sticky
-                            // diagnostics, never data-path. A transitioning
-                            // sample means its fill just completed (data is
-                            // fine either way); only a stable 0 flags.
-                            // Robust check (buffer just consumed = OLD
-                            // consume_sel: filled at least a full burst ago,
-                            // so a clear bit means the fill never happened).
-                            if (consume_sel ? !ram_read_valid_b
-                                            : !ram_read_valid_a)
-                                prefetch_underrun <= 1;
-                            // Margin check (upcoming buffer = ~OLD
-                            // consume_sel): a clear bit means its fill hasn't
-                            // completed yet. Data may still arrive in time
-                            // (beats land progressively), so this flags thin
-                            // margin, not corruption.
-                            if (consume_sel ? !ram_read_valid_a
-                                            : !ram_read_valid_b)
-                                prefetch_thin <= 1;
-                            // Burst-end drop: re-arms the controller handshake
-                            // for the delayed post two clocks later, and
-                            // restarts the posted flag for the next burst.
-                            // (Offset-7 first bursts have no byte 6; this is
-                            // their only drop.)
-                            ram_inhibit_refresh <= 0;
-                            ram_activate <= 0;
-                            ram_read <= 0;
-                            posted_this_burst <= 0;
-                            fresh_read <= 1;
-                        end
-                    end
-                    
-                    // Byte advance every 4 clocks
-                    if (bit_count_in == 0) begin
-                        miso_byte <= live_buffer[(addr[2:0]+1)*8 +: 8];
-                        addr <= addr + 1;
-                        log_byte_count <= log_byte_count + 1;
-                    end
-                    
-                    if (fresh_read)
-                        miso_byte <= live_buffer[addr[2:0]*8 +: 8];
                 end
                 // ---------------------------------------------------------
                 // Quad I/O address phase (1-4-4 mode, CMD 0xEB)
@@ -1139,82 +1057,6 @@ module spi_trx(
                     end
                 end
                 // ---------------------------------------------------------
-                // Quad data output phase (1-1-4 and 1-4-4)
-                // 4 data bits per clock on IO[3:0], 2 clocks per byte.
-                // bit_count_in cycles 1->0->1->0->... in this state.
-                //
-                // One-burst lookahead (see STA_READ): the next burst is
-                // posted on the first clock of this one, giving a full
-                // 16 SPI clocks of lead time instead of the old 3.5.
-                // ---------------------------------------------------------
-                else if (state == STA_READ_QUAD) begin
-                    
-                    // Drop the request levels on the last clock of byte 6
-                    // to re-arm the controller handshake for the next post.
-                    if (addr[2:0] == 6 && bit_count_in == 0) begin
-                        ram_inhibit_refresh <= 0;
-                        ram_activate <= 0;
-                        ram_read <= 0;
-                    end
-                    
-                    // Fallback for very short first bursts (addr starts at 7)
-                    // Only fires if the first-clock post didn't happen.
-                    if (addr[2:0] == 7) begin
-                        if (bit_count_in == 1 && !ram_activate && !posted_this_burst) begin
-                            ram_continuation <= 1;
-                            // Fallback for very short first bursts (addr starts at 7)
-                            // Only fires if the first-clock post didn't happen.
-                            ram_inhibit_refresh <= 1;
-                            ram_activate <= 1;
-                            ram_read <= 1;
-                            ram_addr <= wrap_burst_addr(ram_addr + 1'b1);
-                            posted_this_burst <= 1;
-                        end
-                        else if (bit_count_in == 0) begin
-                            consume_sel <= ~consume_sel;
-                            // Both flags sample the system-clock valids
-                            // directly (async). Benign: these are sticky
-                            // diagnostics, never data-path. A transitioning
-                            // sample means its fill just completed (data is
-                            // fine either way); only a stable 0 flags.
-                            // Robust check (buffer just consumed = OLD
-                            // consume_sel: filled at least a full burst ago,
-                            // so a clear bit means the fill never happened).
-                            if (consume_sel ? !ram_read_valid_b
-                                            : !ram_read_valid_a)
-                                prefetch_underrun <= 1;
-                            // Margin check (upcoming buffer = ~OLD
-                            // consume_sel): a clear bit means its fill hasn't
-                            // completed yet. Data may still arrive in time
-                            // (beats land progressively), so this flags thin
-                            // margin, not corruption.
-                            if (consume_sel ? !ram_read_valid_a
-                                            : !ram_read_valid_b)
-                                prefetch_thin <= 1;
-                            // Burst-end drop: re-arms the controller handshake
-                            // for the delayed post two clocks later, and
-                            // restarts the posted flag for the next burst.
-                            // (Offset-7 first bursts have no byte 6; this is
-                            // their only drop.)
-                            ram_inhibit_refresh <= 0;
-                            ram_activate <= 0;
-                            ram_read <= 0;
-                            posted_this_burst <= 0;
-                            fresh_read <= 1;
-                        end
-                    end
-                    
-                    // Byte advance every 2 clocks
-                    if (bit_count_in == 0) begin
-                        miso_byte <= live_buffer[(addr[2:0]+1)*8 +: 8];
-                        addr <= addr + 1;
-                        log_byte_count <= log_byte_count + 1;
-                    end
-                    
-                    if (fresh_read)
-                        miso_byte <= live_buffer[addr[2:0]*8 +: 8];
-                end
-                // ---------------------------------------------------------
                 // Write Status Register data reception (CMD 0x01)
                 // Receives 1 byte (SR1) or 2 bytes (SR1 + SR2).
                 // ---------------------------------------------------------
@@ -1254,30 +1096,28 @@ module spi_trx(
                 
                 // ---------------------------------------------------------
                 // bit_count_in management
-                // Single mode: cycles 7->0 (8 clocks/byte), wraps naturally
-                // Dual read:   cycles 3->0 (4 clocks/byte), override wrap
+                // Counts down to 0 once per byte; outside STA_READ it wraps
+                // naturally (8 clocks/byte). STA_READ, and the dummy/mode
+                // phases entering it, reload read_byte_top instead.
                 // ---------------------------------------------------------
-                if (state == STA_READ_QUAD && bit_count_in == 0)
-                    bit_count_in <= 1;
-                else if (state == STA_READ_DUAL && bit_count_in == 0)
-                    bit_count_in <= 3;
-                else if (state == STA_DUMMY && dummy_count == 0 && is_quad_read)
-                    bit_count_in <= 1;   // Entry into STA_READ_QUAD
-                else if (state == STA_DUMMY && dummy_count == 0 && is_dual_read)
-                    bit_count_in <= 3;   // Entry into STA_READ_DUAL
-                else if (state == STA_MODE_MULTI && mode_count == 0 && is_quad_read)
-                    bit_count_in <= 1;   // Entry into STA_READ_QUAD
-                else if (state == STA_MODE_MULTI && mode_count == 0)
-                    bit_count_in <= 3;   // Entry into STA_READ_DUAL
+                if ((state == STA_READ && bit_count_in == 0) ||
+                    (state == STA_DUMMY && dummy_count == 0) ||
+                    (state == STA_MODE_MULTI && mode_count == 0))
+                    bit_count_in <= read_byte_top;
                 else
                     bit_count_in <= bit_count_in - 1;
             end
         end
     end
     
-    // Data output on falling edge of SPI clock
+    // Data output on falling edge of SPI clock.
+    //
+    // IO0 and IO2 are only enabled on entry to STA_READ (IO0 for dual and
+    // quad, IO2 for quad) and cleared at every CS drop, so their enable
+    // flops double as registered lane selects. Decoding state here instead
+    // would lengthen the half-cycle posedge-to-negedge output path.
     always @(negedge spi_clk) begin
-        if (state == STA_READ_QUAD) begin
+        if (spi_io2_oe_ff) begin
             // Quad output: 4 bits per clock (2 clocks per byte)
             // IO3 = MSB of nibble, IO0 = LSB of nibble
             // bit_count_in=1: high nibble [7:4], bit_count_in=0: low nibble [3:0]
@@ -1294,7 +1134,7 @@ module spi_trx(
                 spi_io0_out <= miso_byte[{bit_count_in[0], 2'b00}];
             end
         end
-        else if (state == STA_READ_DUAL) begin
+        else if (spi_io0_oe_ff) begin
             // Dual output: 2 bits per clock
             // IO1 = high bit of pair, IO0 = low bit of pair
             if (fresh_read) begin
