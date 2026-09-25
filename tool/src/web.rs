@@ -1,7 +1,7 @@
 use crate::device::{
     ConnectionKind, FT2232H_PID, FTDI_VID, FlashDevice, Transport, UART_BAUD_RATE,
 };
-use crate::protocol::{CMD_VERSION, is_supported_protocol_version};
+use crate::protocol::{CMD_VERSION, PrefetchFaults, is_supported_protocol_version};
 use anyhow::{Result, anyhow, bail};
 use ftdi_nusb::{FtdiDevice, Interface};
 use futures_util::{future::Either, pin_mut};
@@ -527,6 +527,14 @@ impl WebFlashDevice {
             .map_err(js_error)
     }
 
+    pub async fn supports_prefetch_diagnostics(&mut self) -> Result<bool, JsValue> {
+        self.inner
+            .capabilities()
+            .await
+            .map(|capabilities| capabilities.prefetch_diagnostics)
+            .map_err(js_error)
+    }
+
     pub async fn start(&mut self) -> Result<(), JsValue> {
         self.inner.start_emulation().await.map_err(js_error)
     }
@@ -747,5 +755,14 @@ impl WebFlashDevice {
 
     pub async fn toctou_reset_all(&mut self) -> Result<(), JsValue> {
         self.inner.toctou_reset_all().await.map_err(js_error)
+    }
+}
+
+// Rust-only methods for the egui front end: their types are not exported
+// to JavaScript, so they stay out of the #[wasm_bindgen] block.
+impl WebFlashDevice {
+    /// Read and clear the sticky SDRAM prefetch fault flags.
+    pub async fn prefetch_faults(&mut self) -> Result<PrefetchFaults, JsValue> {
+        self.inner.prefetch_faults().await.map_err(js_error)
     }
 }

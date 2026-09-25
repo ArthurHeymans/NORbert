@@ -10,6 +10,10 @@ module spi_flash_tb;
     wire running, miso, miso_oe, tx_strobe;
     wire [7:0] tx_data;
     reg check_early_start = 0, early_start_ack = 0;
+    // Drive glue's prefetch fault inputs directly: the real flags come from
+    // spi_prefetch inside spi_trx, and a genuine underrun needs a timing
+    // corner the functional testbench does not reach.
+    reg prefetch_underrun = 0, prefetch_thin = 0;
     wire spi_reset = reset || !running;
     wire write_cmd, write_done, write_strobe;
     wire [1:0] write_type;
@@ -28,6 +32,17 @@ module spi_flash_tb;
     // 10-bit model index: (row 0, bank, burst-in-row).
     wire [9:0] mem_index = {access_addr[11], access_addr[10:9], access_addr[8:2]};
 
+    // FT245 receive FIFO as glue sees it: first-word-fallthrough data and a
+    // pop strobe.
+    reg [7:0] ft_queue [0:15];
+    integer ft_head = 0, ft_tail = 0;
+    wire ft_rx_available = ft_head != ft_tail;
+    wire [7:0] ft_rx_byte = ft_queue[ft_head % 16];
+    wire ft_rx_pop, ft_tx_strobe;
+    wire [7:0] ft_tx_data;
+    integer ft_replies = 0;
+    reg [7:0] ft_reply [0:3];
+
     spi_trx spi (
         .clk(clk), .spi_clk(sck), .spi_reset(spi_reset), .spi_csel(cs),
         .spi_io0_in(mosi), .spi_io1_in(1'b0), .spi_io2_in(1'b1), .spi_io3_in(1'b1),
@@ -42,7 +57,9 @@ module spi_flash_tb;
     glue dut (
         .clk(clk), .reset(reset), .rxd_strobe(rx_strobe), .rxd_data(rx_data),
         .txd_ready(1'b1), .txd_strobe(tx_strobe), .txd_data(tx_data),
-        .ft_rx_data_available(1'b0), .ft_rx_data(8'b0), .ft_txd_ready(1'b1),
+        .ft_rx_data_available(ft_rx_available), .ft_rx_data(ft_rx_byte),
+        .ft_rx_pop(ft_rx_pop), .ft_txd_ready(1'b1),
+        .ft_txd_strobe(ft_tx_strobe), .ft_txd_data(ft_tx_data),
         .sdram_access_cmd(access), .sdram_access_addr(access_addr), .sdram_cmd_busy(busy),
         .sdram_read_busy(1'b0), .sdram_read_buffer(read_buffer), .sdram_write_buffer(write_buffer),
         .spi_reset(spi_reset), .spi_csel(cs), .spi_cmd_write(write_cmd),
@@ -52,7 +69,8 @@ module spi_flash_tb;
         .spi_clk(sck),
         .sfdp_raddr(sfdp_addr), .sfdp_rdata(sfdp_data), .spi_running(running),
         .log_fifo_data_available(1'b0), .log_fifo_read_data(8'b0),
-        .log_addr_valid_sync(1'b0), .log_addr_sync(24'b0), .spi_active_sync(1'b0)
+        .log_addr_valid_sync(1'b0), .log_addr_sync(24'b0), .spi_active_sync(1'b0),
+        .prefetch_underrun(prefetch_underrun), .prefetch_thin(prefetch_thin)
     );
 
     always @(posedge clk) begin
@@ -88,6 +106,127 @@ module spi_flash_tb;
         @(negedge clk); rx_data = b; rx_strobe = 1;
         @(negedge clk); rx_strobe = 0;
         repeat (10) @(negedge clk); // One byte per 12 system clocks
+    endtask
+
+    // FT245 receive FIFO model (declared above): pop advances the head,
+    // and FT245-side replies are recorded apart from UART ones.
+    always @(posedge clk) begin
+        if (ft_rx_pop) ft_head <= ft_head + 1;
+        if (ft_tx_strobe) begin
+            if (ft_replies < 4) ft_reply[ft_replies] <= ft_tx_data;
+            ft_replies <= ft_replies + 1;
+        end
+    end
+
+    task ft_push(input [7:0] b);
+        @(negedge clk);
+        ft_queue[ft_tail % 16] = b;
+        ft_tail = ft_tail + 1;
+    endtask
+
+    // Record every host reply so a query task can inspect the byte that
+    // came back, and fail if the command produced none.
+    reg last_reply = 0;
+    reg [7:0] last_reply_byte = 8'hxx;
+    always @(posedge clk) begin
+        if (tx_strobe) begin
+            last_reply <= 1;
+            last_reply_byte <= tx_data;
+        end
+    end
+
+    // Send an argument-free host command and return its reply byte. Fails
+    // if nothing comes back, so a missing handler cannot pass silently.
+    task automatic host_query(input [7:0] opcode, output [7:0] reply);
+        last_reply = 0;
+        host_byte(opcode);
+        if (!last_reply) $fatal(1, "command %h produced no reply", opcode);
+        reply = last_reply_byte;
+    endtask
+
+    // A fault must be visible to the host after the transaction that raised
+    // it ended, and one read must both report and clear it.
+    task automatic check_prefetch_faults;
+        reg [7:0] reply;
+        prefetch_underrun = 0; prefetch_thin = 0;
+        repeat (4) @(negedge clk);
+        host_query(8'h3b, reply);
+        if (reply !== 8'h80) $fatal(1, "clean prefetch reported %h", reply);
+
+        // Underrun only: bit 0.
+        prefetch_underrun = 1;
+        repeat (4) @(negedge clk);
+        host_query(8'h3b, reply);
+        if (reply !== 8'h81) $fatal(1, "underrun reported %h, expected 81", reply);
+        // The SPI flag stays high through the CS gap. A second host read
+        // must not mistake that same level for a new fault.
+        host_query(8'h3b, reply);
+        if (reply !== 8'h80) $fatal(1, "underrun reported twice: %h", reply);
+        prefetch_underrun = 0;
+        repeat (4) @(negedge clk);
+        prefetch_underrun = 1;
+        repeat (4) @(negedge clk);
+        host_query(8'h3b, reply);
+        if (reply !== 8'h81) $fatal(1, "new underrun not reported: %h", reply);
+        prefetch_underrun = 0;
+        host_query(8'h3b, reply);
+        if (reply !== 8'h80) $fatal(1, "new underrun not cleared: %h", reply);
+
+        // Both flags at once: bits 0 and 1.
+        prefetch_underrun = 1; prefetch_thin = 1;
+        repeat (4) @(negedge clk);
+        prefetch_underrun = 0; prefetch_thin = 0;
+        host_query(8'h3b, reply);
+        if (reply !== 8'h83) $fatal(1, "both faults reported %h, expected 83", reply);
+
+        // Thin alone: bit 1.
+        prefetch_thin = 1;
+        repeat (4) @(negedge clk);
+        prefetch_thin = 0;
+        host_query(8'h3b, reply);
+        if (reply !== 8'h82) $fatal(1, "thin reported %h, expected 82", reply);
+
+        // Reset must drop a latched fault, and the SPI flag still being
+        // high from before the reset is not a new fault.
+        prefetch_underrun = 1;
+        repeat (8) @(negedge clk);
+        reset = 1;
+        repeat (4) @(negedge clk);
+        reset = 0;
+        repeat (8) @(negedge clk);
+        host_query(8'h3b, reply);
+        if (reply !== 8'h80) $fatal(1, "reset left fault latched: %h", reply);
+        // A fault after the reset is still reported.
+        prefetch_underrun = 0;
+        repeat (4) @(negedge clk);
+        prefetch_underrun = 1;
+        repeat (4) @(negedge clk);
+        prefetch_underrun = 0;
+        host_query(8'h3b, reply);
+        if (reply !== 8'h81) $fatal(1, "fault after reset reported %h, expected 81", reply);
+    endtask
+
+    // PREFETCH is argument-free and must be answered over FT245 while the
+    // target holds CS low, without leaving anything in the RX FIFO that
+    // would block the next always-safe command.
+    task automatic check_prefetch_ft245_while_selected;
+        integer waited;
+        ft_replies = 0;
+        select_spi;
+        repeat (4) @(negedge clk);
+        ft_push(8'h3b);
+        ft_push(8'h36);
+        waited = 0;
+        while (ft_replies < 2 && waited < 200) begin
+            @(negedge clk);
+            waited++;
+        end
+        if (ft_replies != 2)
+            $fatal(1, "FT245 PREFETCH+STATUS with CS low got %0d replies", ft_replies);
+        if (ft_reply[0] !== 8'h80) $fatal(1, "FT245 PREFETCH reported %h", ft_reply[0]);
+        if (ft_reply[1] !== 8'h01) $fatal(1, "FT245 STATUS reported %h", ft_reply[1]);
+        if (ft_head != ft_tail) $fatal(1, "FT245 RX FIFO not drained with CS low");
+        deselect_spi;
     endtask
 
     task configure_sfdp(input integer length, input [7:0] seed,
@@ -197,6 +336,10 @@ module spi_flash_tb;
         for (integer i = 0; i < 8192; i++) expected[i] = '1;
         repeat (4) @(negedge clk); reset = 0;
 
+        // Prefetch diagnostics first: the reply must be correct before any
+        // SPI traffic can raise a real flag.
+        check_prefetch_faults;
+
         // Deliberately configure before a 128-cycle RAM scrub could finish.
         configure_sfdp(1, 8'ha5);
         check_early_start = 1;
@@ -204,6 +347,7 @@ module spi_flash_tb;
         if (running) $fatal(1, "Early START enabled SPI before page-buffer initialization");
         wait (early_start_ack); check_early_start = 0;
         read_sfdp(0, 260, 1, 8'ha5);
+        check_prefetch_ft245_while_selected;
 
         host_byte(8'h35); configure_sfdp(128, 8'ha5); host_byte(8'h34);
         for (integer start = 0; start < 128; start++) read_sfdp(start, 260, 128, 8'ha5);
@@ -241,7 +385,7 @@ module spi_flash_tb;
         repeat (4) @(negedge clk); reset = 0;
         host_byte(8'h34); wait (running);
         read_sfdp(0, 130, 0, 0);
-        $display("PASS SPI: SFDP/startup/reconfigure/reset, PP/wrap/AND, AAI/alignment/bounds/cleanup");
+        $display("PASS SPI: prefetch fault latch incl. FT245 with CS low, SFDP/startup/reconfigure/reset, PP/wrap/AND, AAI/alignment/bounds/cleanup");
         $finish;
     end
 

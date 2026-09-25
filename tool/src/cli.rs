@@ -136,6 +136,14 @@ pub(crate) enum Commands {
 
     /// Query whether SPI emulation is currently running
     Status,
+
+    /// Report and clear the SDRAM prefetch fault flags
+    ///
+    /// The FPGA latches the fast read path's underrun and thin-margin
+    /// conditions and keeps them until read. Run this after a target read
+    /// to confirm the data it received was not served from a burst that
+    /// had not landed in time.
+    Prefetch,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

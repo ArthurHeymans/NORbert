@@ -45,6 +45,7 @@ pub(crate) struct ProtocolCapabilities {
     pub(crate) hold_control: bool,
     pub(crate) activity_log: bool,
     pub(crate) toctou: bool,
+    pub(crate) prefetch_diagnostics: bool,
 }
 
 impl ProtocolCapabilities {
@@ -60,6 +61,7 @@ impl ProtocolCapabilities {
             hold_control: supports_hold_control(version),
             activity_log: supports_activity_log(version),
             toctou: supports_toctou(version),
+            prefetch_diagnostics: supports_prefetch_diagnostics(version),
         })
     }
 }
@@ -495,6 +497,26 @@ impl FlashDevice {
         self.expect_ack("hold control").await
     }
 
+    /// Read and clear the sticky SDRAM prefetch fault flags.
+    ///
+    /// A non-empty result means the SPI fast path did not keep up at least
+    /// once since the previous read: `underrun` is data shifted out before
+    /// the SDRAM burst filled it, `thin` is a burst that had not landed yet
+    /// when its first byte was needed.
+    pub(crate) async fn prefetch_faults(&mut self) -> Result<PrefetchFaults> {
+        self.require_capability("prefetch diagnostics", |c| c.prefetch_diagnostics)
+            .await?;
+        // A single opcode byte, like STATUS: glue takes no argument for it,
+        // and a trailing byte would sit at the head of the FT245 FIFO while
+        // the target holds CS low, blocking every command behind it.
+        self.transport.write_all(&[CMD_PREFETCH]).await?;
+        let reply = self.read_ack("prefetch diagnostics").await?;
+        if reply & !(PREFETCH_UNDERRUN | PREFETCH_THIN) != PREFETCH_VALID {
+            bail!("prefetch diagnostics: unexpected response 0x{reply:02x}");
+        }
+        Ok(PrefetchFaults::from_reply(reply))
+    }
+
     pub(crate) async fn log_start(&mut self) -> Result<()> {
         self.require_capability("activity logging", |c| c.activity_log)
             .await?;
@@ -786,6 +808,40 @@ mod tests {
         let error = device.read_ack("test").unwrap_err().to_string();
 
         assert!(error.contains("made no read progress"));
+    }
+
+    #[test]
+    fn prefetch_reply_distinguishes_clean_status_from_transport_noise() {
+        let (transport, writes) =
+            MockTransport::new([0x00, PREFETCH_VALID, PREFETCH_VALID | PREFETCH_THIN]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+
+        assert_eq!(device.prefetch_faults().unwrap(), PrefetchFaults::default());
+        assert_eq!(
+            device.prefetch_faults().unwrap(),
+            PrefetchFaults {
+                underrun: false,
+                thin: true
+            }
+        );
+        assert_eq!(&*writes.borrow(), &[vec![CMD_PREFETCH], vec![CMD_PREFETCH]]);
+    }
+
+    #[test]
+    fn prefetch_reply_requires_only_the_marker_and_fault_bits() {
+        for reply in [0x01, PREFETCH_VALID | 0x04] {
+            let (transport, _) = MockTransport::new([reply]);
+            let mut device =
+                FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+            assert!(
+                device
+                    .prefetch_faults()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unexpected response")
+            );
+        }
     }
 
     #[test]

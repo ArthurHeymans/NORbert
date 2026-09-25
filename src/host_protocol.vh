@@ -5,7 +5,7 @@
 // tool/src/rtl_sync.rs parses this file and checks tool/src/protocol.rs
 // against it, so `cargo test` fails if the two drift apart.
 
-localparam VERSION = 8'h05;  // Version 5: HOLDCTL + logging + TOCTOU
+localparam VERSION = 8'h06;  // Version 6: CMD_PREFETCH diagnostics
 
 localparam
     CMD_NOP          = 8'h00,
@@ -19,7 +19,16 @@ localparam
     CMD_HOLDCTL      = 8'h37,  // Assert/release target flash #HOLD
     CMD_LOGCTL       = 8'h38,  // Enable/disable SPI bus logging capture
     CMD_TOCTOU       = 8'h39,  // TOCTOU trap management
-    CMD_LOGPOLL      = 8'h3A;  // Drain logger ring FIFO
+    CMD_LOGPOLL      = 8'h3A,  // Drain logger ring FIFO
+    CMD_PREFETCH     = 8'h3B;  // Read and clear the SDRAM prefetch fault flags
+
+// CMD_PREFETCH reply byte. The FPGA keeps both flags set until a host read
+// reports and clears them, so a fault hit during a long read is still
+// visible once the transaction has ended.
+localparam
+    PREFETCH_UNDERRUN = 8'h01,  // A consumed burst was never filled: stale bytes
+    PREFETCH_THIN     = 8'h02,  // The next burst had not landed when needed
+    PREFETCH_VALID    = 8'h80;  // Always set: a clean reply must not be 0x00 noise
 
 // CMD_TOCTOU sub-commands
 localparam

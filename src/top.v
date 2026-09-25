@@ -213,6 +213,10 @@ module top(
     // -----------------------------------------------------------
     
     wire spi_active;
+    // Sticky-until-read by glue, so the fast read path's health is
+    // observable from the host instead of only inside simulation.
+    wire prefetch_underrun;
+    wire prefetch_thin;
     wire spi_ram_inhibit_refresh;
     wire spi_ram_activate;
     wire spi_ram_read;
@@ -281,8 +285,8 @@ module top(
         .ram_read_valid_a(sdram_read_valid_a),
         .ram_read_valid_b(sdram_read_valid_b),
         .ram_read_busy(sdram_read_busy),
-        .prefetch_underrun(),
-        .prefetch_thin(),
+        .prefetch_underrun(prefetch_underrun),
+        .prefetch_thin(prefetch_thin),
         
         .write_cmd(spi_write_cmd),
         .write_type(spi_write_type),
@@ -608,6 +612,9 @@ module top(
         .log_addr_valid_sync(log_addr_valid_pulse_sys),
         .log_addr_sync(log_addr_out[23:0]),
         .spi_active_sync(spi_active_sys[1]),
+
+        .prefetch_underrun(prefetch_underrun),
+        .prefetch_thin(prefetch_thin),
 
         .redirect_active(redirect_active),
         .redirect_mask(redirect_mask),
