@@ -77,7 +77,7 @@ module sdram(
 );
 
     parameter CLK_FREQ_MHZ = 132;
-    parameter BURST_LEN = 4;
+    parameter [4:0] BURST_LEN = 5'd4;
 
     // Internal DQ bus handling - tristate managed in this module
     // (Gowin requires inout and tristate to be in the same module for proper IOBUF inference)
@@ -90,28 +90,34 @@ module sdram(
     // Timing parameters (in clock cycles)
     // Based on W9825G6KH-6 datasheet (166MHz grade, tCK_min=6ns for CL=3)
     // At 120MHz: tCK = 8.33ns
+    //
+    // The values consumed by cmdtarget are sized to it (5 bits), so a
+    // timing constant that stops fitting is an elaboration error rather
+    // than a silent truncation. tINIT and tREFRESH stay plain integers:
+    // they size the init/refresh counters through $clog2 and are only
+    // compared against them.
     localparam integer tINIT        = 100 * CLK_FREQ_MHZ;   // 100us init
     localparam integer tREFRESH     = (CLK_FREQ_MHZ * 32000) / 8192;  // ~468 cycles
-    localparam integer tRP          = 2;   // 16.7ns precharge (min 15ns for -6)
-    localparam integer tRC          = 8;   // 66.7ns row cycle (min 60ns for -6)
-    localparam integer tMRD         = 2;   // 2 cycles mode register set
-    localparam integer tRCD         = 2;   // 16.7ns RAS to CAS delay (min 15ns for -6)
-    localparam integer tDPL         = 2;   // Write recovery (min 2 tCK)
-    localparam integer tRAS         = 6;   // 50ns row active time (min 42ns for -6)
+    localparam [4:0] tRP            = 5'd2;   // 16.7ns precharge (min 15ns for -6)
+    localparam [4:0] tRC            = 5'd8;   // 66.7ns row cycle (min 60ns for -6)
+    localparam [4:0] tMRD           = 5'd2;   // 2 cycles mode register set
+    localparam [4:0] tRCD           = 5'd2;   // 16.7ns RAS to CAS delay (min 15ns for -6)
+    localparam [4:0] tDPL           = 5'd2;   // Write recovery (min 2 tCK)
+    localparam [4:0] tRAS           = 5'd6;   // 50ns row active time (min 42ns for -6)
     // CAS latency 2: the W9825G6KH-6 is rated CL2 to 133MHz, so CL2 at
     // 120MHz is in spec and saves a full cycle of first-byte latency
     // versus CL3. This is load-bearing for dummy-less reads (0x03)
     // and tiny first bursts at fast SCLK. The MRS below programs the
     // same value into both chips, and tREAD/capture track it.
-    localparam integer tCAS         = 2;   // CAS latency = 2 for W9825G6KH
+    localparam [4:0] tCAS           = 5'd2;   // CAS latency = 2 for W9825G6KH
 
     // Read pipeline delay: compensates for SDRAM clock phase shift and capture pipeline.
     // With PE_COARSE=9 on SDRAM clock and aux_clk capture, RD_PIPELINE_DELAY=0 is correct.
-    localparam integer RD_PIPELINE_DELAY = 0;
+    localparam [4:0] RD_PIPELINE_DELAY = 5'd0;
 
     // Derived timing
-    localparam integer tREAD  = tCAS + RD_PIPELINE_DELAY + BURST_LEN + 1;
-    localparam integer tWRITE = BURST_LEN + tDPL + tRP;
+    localparam [4:0] tREAD  = tCAS + RD_PIPELINE_DELAY + BURST_LEN + 1;
+    localparam [4:0] tWRITE = BURST_LEN + tDPL + tRP;
 
     // State machine states
     localparam
@@ -351,13 +357,21 @@ module sdram(
             // Busy when: any command is in progress (state != IDLE),
             // a new command has been posted (access_cmd != 0), or a
             // refresh is imminent and not inhibited.
+            //
+            // tREFRESH and tINIT are plain integers because they size the
+            // counters holding them; Verilog-2001 has no cast to narrow a
+            // parameter expression for these comparisons.
+            /* verilator lint_off WIDTHEXPAND */
             cmd_busy <= (state != STA_IDLE) ||
                         (access_cmd != 2'b00) ||
                         ((refreshcount >= tREFRESH-1) && !do_inhibit_refresh);
+            /* verilator lint_on WIDTHEXPAND */
 
             if (state == STA_INIT) begin
                 // Wait for SDRAM power-up (100us) - chip 0 selected (CS LOW)
+                /* verilator lint_off WIDTHEXPAND */
                 if (initcount >= tINIT) begin
+                /* verilator lint_on WIDTHEXPAND */
                     state <= STA_INIT_PRECHARGE;
                     cmdcount <= 1;
                     cmdtarget <= tRP;
@@ -393,9 +407,9 @@ module sdram(
                         // wrbuf_read_ptr counts 1..3 here (word 0 went out
                         // at dispatch above). Explicit lanes, see read path.
                         case (wrbuf_read_ptr)
-                            2'd1: dq_o <= write_buffer[31:16];
-                            2'd2: dq_o <= write_buffer[47:32];
-                            2'd3: dq_o <= write_buffer[63:48];
+                            3'd1: dq_o <= write_buffer[31:16];
+                            3'd2: dq_o <= write_buffer[47:32];
+                            3'd3: dq_o <= write_buffer[63:48];
                             default: dq_o <= write_buffer[15:0];
                         endcase
                         dqm_o <= 2'b00;
@@ -441,7 +455,7 @@ module sdram(
                         a_o <= 0;
                         a_o[9] <= 1'b0;         // Write burst: programmed length
                         a_o[8:7] <= 2'b00;      // Standard operation
-                        a_o[6:4] <= tCAS;       // CAS latency = 2 (tCAS)
+                        a_o[6:4] <= tCAS[2:0];  // CAS latency = 2 (tCAS)
                         a_o[3] <= 1'b0;         // Burst type: sequential
                         a_o[2:0] <= BURST_MODE; // Burst length = 4
                     end
@@ -498,7 +512,7 @@ module sdram(
                         a_o <= 0;
                         a_o[9] <= 1'b0;
                         a_o[8:7] <= 2'b00;
-                        a_o[6:4] <= tCAS;
+                        a_o[6:4] <= tCAS[2:0];
                         a_o[3] <= 1'b0;
                         a_o[2:0] <= BURST_MODE;
                     end
@@ -695,7 +709,11 @@ module sdram(
                     dq_o <= write_buffer[15:0];
                     dqm_o <= 2'b00;
                 end
+                // Counter-threshold comparison; see the WIDTHEXPAND waiver
+                // on cmd_busy above for why this cannot be sized.
+                /* verilator lint_off WIDTHEXPAND */
                 else if ((refreshcount >= tREFRESH) && !do_inhibit_refresh) begin
+                /* verilator lint_on WIDTHEXPAND */
                     // Auto refresh - alternate between chips
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;

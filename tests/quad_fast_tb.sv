@@ -81,6 +81,18 @@ module quad_fast_tb;
                  + burst[22:16] * 8'd3 + 8'h51;
     endfunction
 
+    // Expected byte i of a read from byte address a. The DUT addresses
+    // SDRAM in 8-byte bursts, so a byte is located by its 23-bit burst
+    // address and its 3-bit offset inside it. Doing the arithmetic in an
+    // integer and slicing at the end keeps every operand's width exact.
+    function automatic [7:0] expected_byte(input [23:0] a, input integer i);
+        // 26 bits so the 23-bit burst address is byteaddr[25:3], with both
+        // addends widened explicitly rather than by truncation.
+        logic [25:0] byteaddr;
+        byteaddr = {2'b00, a} + 26'(i);
+        expected_byte = exp_byte(byteaddr[25:3], byteaddr[2:0]);
+    endfunction
+
     // Byte-serial layout must match sdram.v: beat w carries bytes
     // 2w (dq[7:0]) and 2w+1 (dq[15:8]) whole.
     function [15:0] enc_word(input [22:0] burst, input [1:0] w);
@@ -246,7 +258,6 @@ module quad_fast_tb;
         // explore_mode aborts the read at the first mismatch (failed_cell)
         // so one bad cell cannot cascade into the next
         reg [7:0] got, want;
-        reg [22:0] burst;
         select_spi;
         send_byte(opcode);
         begin : read_check_body
@@ -255,8 +266,7 @@ module quad_fast_tb;
                 send_byte(a[23:16]); send_byte(a[15:8]); send_byte(a[7:0]);
                 for (integer i = 0; i < count; i++) begin
                     recv_single(got);
-                    burst = (a+i) >> 3;
-                    want = exp_byte(burst, (a+i) & 3'b111);
+                    want = expected_byte(a, i);
                     if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
                 end
             end
@@ -265,8 +275,7 @@ module quad_fast_tb;
                 send_byte(0);
                 for (integer i = 0; i < count; i++) begin
                     recv_single(got);
-                    burst = (a+i) >> 3;
-                    want = exp_byte(burst, (a+i) & 3'b111);
+                    want = expected_byte(a, i);
                     if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
                 end
             end
@@ -275,8 +284,7 @@ module quad_fast_tb;
                 send_byte(0);
                 for (integer i = 0; i < count; i++) begin
                     recv_dual(got);
-                    burst = (a+i) >> 3;
-                    want = exp_byte(burst, (a+i) & 3'b111);
+                    want = expected_byte(a, i);
                     if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
                 end
             end
@@ -286,8 +294,7 @@ module quad_fast_tb;
                 repeat (4) send_dual_bits(2'b11);
                 for (integer i = 0; i < count; i++) begin
                     recv_dual(got);
-                    burst = (a+i) >> 3;
-                    want = exp_byte(burst, (a+i) & 3'b111);
+                    want = expected_byte(a, i);
                     if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
                 end
             end
@@ -296,8 +303,7 @@ module quad_fast_tb;
                 send_byte(0);
                 for (integer i = 0; i < count; i++) begin
                     recv_quad(got);
-                    burst = (a+i) >> 3;
-                    want = exp_byte(burst, (a+i) & 3'b111);
+                    want = expected_byte(a, i);
                     if (got !== want) begin
                         $display("0x6B addr %h len %0d fail at+%0d: got %h want %h",
                                  a, count, i, got, want);
@@ -305,9 +311,10 @@ module quad_fast_tb;
                                  spi.ram_read_buffer, spi.ram_read_buffer_b,
                                  spi.prefetch.consume_sel, underrun);
                         for (integer j = 0; j < count; j++) begin
-                            automatic logic [22:0] bb = (a+j) >> 3;
+                            automatic logic [25:0] bj = {2'b00, a} + 26'(j);
                             $display("  byte+%0d burst=%h idx=%0d want=%h",
-                                     j, bb, (a+j) & 3'b111, exp_byte(bb, (a+j) & 3'b111));
+                                     j, bj[25:3], bj[2:0],
+                                     exp_byte(bj[25:3], bj[2:0]));
                         end
                         cell_mismatch(opcode, a, i, got, want);
                         disable read_check_body;
@@ -320,8 +327,7 @@ module quad_fast_tb;
                 repeat (6) send_quad_nibble(4'hf);
                 for (integer i = 0; i < count; i++) begin
                     recv_quad(got);
-                    burst = (a+i) >> 3;
-                    want = exp_byte(burst, (a+i) & 3'b111);
+                    want = expected_byte(a, i);
                     if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
                 end
             end

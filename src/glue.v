@@ -176,7 +176,8 @@ module glue(
     reg active_port;
 
     wire cmd_idle = (cmd == CMD_NOP) && (in_count == 0) &&
-                    !read_state && !write_state && (log_poll_state == 0);
+                    (read_state == 3'd0) && (write_state == 3'd0) &&
+                    (log_poll_state == 0);
     wire mux_txd_ready = active_port ? ft_txd_ready : txd_ready;
 
     // Serial handler gate: only consume FIFO bytes when SPI is inactive.
@@ -522,7 +523,7 @@ module glue(
             // get continuous mirroring as before.
             write_strobe_r <= write_strobe;
             if ((write_strobe && !write_strobe_r) ||
-                (!write_strobe && !write_state))
+                (!write_strobe && (write_state == 3'd0)))
                 sdram_write_buffer <= write_buffer;
             
             // Inhibit SDRAM refresh while a serial-path operation is active.
@@ -538,7 +539,7 @@ module glue(
                                                      i_spi_write_state == 4'd6 || i_spi_write_state == 4'd7 ||
                                                      i_spi_write_state == 4'd8));
     
-            if (sdram_access_cmd)
+            if (sdram_access_cmd != 2'b00)
                 sdram_access_cmd <= 0;
                 
             spi_csel_buf <= {spi_csel_buf[0], spi_csel};
@@ -588,10 +589,16 @@ module glue(
                         else begin
                             // Second+ access: activate redirect
                             redirect_active <= 1;
-                            redirect_mask <= trap_mask[i][23:3];
+                            // The redirect is applied to the 23-bit burst
+                            // address, so the byte-granular mask and
+                            // replacement base enter it >>3. The low three
+                            // byte bits are not expressible: an SDRAM burst
+                            // is 8 bytes, so a match finer than that cannot
+                            // be redirected to a different offset.
+                            redirect_mask <= {2'b00, trap_mask[i][23:3]};
                             // Compute replacement burst addr via bitwise mux:
                             // new_burst = (replace & mask) | (original & ~mask)
-                            redirect_base <= trap_replace[i][23:3];
+                            redirect_base <= {2'b00, trap_replace[i][23:3]};
                             
                             trap_notify_strobe <= 1;
                             trap_notify_index  <= i[1:0];
@@ -762,7 +769,8 @@ module glue(
             // Exclude active read/write operations: during reads the
             // host sends nothing (waiting for response data), so the
             // idle counter would fire and kill the transfer.
-            if (in_count != 0 && !rxd_strobe_buf && !read_state && !write_state) begin
+            if (in_count != 0 && !rxd_strobe_buf &&
+                (read_state == 3'd0) && (write_state == 3'd0)) begin
                 serial_idle_count <= serial_idle_count + 1;
                 if (serial_idle_count[16]) begin
                     in_count <= 0;
@@ -1139,7 +1147,7 @@ module glue(
                     if (write_strobe && !sdram_busy)
                         write_state <= 1;
 
-                    if (read_state) begin
+                    if (read_state != 3'd0) begin
                         if ((read_state == 1) && !sdram_busy) begin
                             // Activate
                             sdram_access_cmd <= 2'b11;
@@ -1171,7 +1179,7 @@ module glue(
                                 read_pos <= read_pos + 1;
                         end
                     end
-                    else if (write_state) begin
+                    else if (write_state != 3'd0) begin
                         if ((write_state == 1) && !sdram_busy) begin
                             // Activate
                             sdram_access_cmd <= 2'b11;

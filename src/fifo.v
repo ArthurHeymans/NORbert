@@ -46,7 +46,10 @@ module fifo(
     reg [WIDTH-1:0] read_data_fwft;
     reg [WIDTH-1:0] ram [0:NUM-1];
 
-    wire [BITS:0] next_count = count + write_strobe - read_strobe;
+    // Single-bit strobes are zero-extended explicitly: Verilog-2001 has
+    // no cast to size a 1-bit signal for N-bit arithmetic, and implicit
+    // extension is exactly the WIDTHEXPAND warning this design keeps on.
+    wire [BITS:0] next_count = count + {{BITS{1'b0}}, write_strobe} - {{BITS{1'b0}}, read_strobe};
     assign more_available = (count > 1);
     assign data_available = (count != 0);
 
@@ -63,7 +66,7 @@ module fifo(
             if (write_strobe)
                 ram[wr_ptr] <= write_data;
 
-            read_data_ram <= ram[rd_ptr + read_strobe];
+            read_data_ram <= ram[rd_ptr + {{(BITS-1){1'b0}}, read_strobe}];
             fwft <= 0;
 
             // First word fall through
@@ -74,8 +77,8 @@ module fifo(
                 fwft <= 1;
             end
 
-            rd_ptr <= rd_ptr + read_strobe;
-            wr_ptr <= wr_ptr + write_strobe;
+            rd_ptr <= rd_ptr + {{(BITS-1){1'b0}}, read_strobe};
+            wr_ptr <= wr_ptr + {{(BITS-1){1'b0}}, write_strobe};
             count <= next_count;
 
             space_available <= (NUM - 1'b1 - next_count > FREESPACE);

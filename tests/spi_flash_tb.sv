@@ -25,6 +25,8 @@ module spi_flash_tb;
     integer busy_cycles = 0;
     reg [63:0] memory [0:1023];
     reg [7:0] expected [0:8191];
+    // 10-bit model index: (row 0, bank, burst-in-row).
+    wire [9:0] mem_index = {access_addr[11], access_addr[10:9], access_addr[8:2]};
 
     spi_trx spi (
         .clk(clk), .spi_clk(sck), .spi_reset(spi_reset), .spi_csel(cs),
@@ -69,10 +71,16 @@ module spi_flash_tb;
         end
         if (access != 0) begin
             if (busy) $fatal(1, "SDRAM request while busy");
+            // The model flattens (row 0, bank, column) into 8 KiB, so a
+            // second row would alias onto the first. The guard keeps tests
+            // in row 0 rather than letting a truncated index make two
+            // addresses share a byte.
+            if (access_addr[24:12] != 0)
+                $fatal(1, "SDRAM access 0x%0h is outside the test model", access_addr);
             busy <= 1;
             busy_cycles <= access == 3 ? 3 : 10;
-            if (access == 1) read_buffer <= memory[access_addr[24:2]];
-            if (access == 2) memory[access_addr[24:2]] <= write_buffer;
+            if (access == 1) read_buffer <= memory[mem_index];
+            if (access == 2) memory[mem_index] <= write_buffer;
         end
     end
 

@@ -42,7 +42,12 @@ module divide_by_n(
             counter <= 0;
         else if (counter == 0) begin
             out <= 1;
+            // N-1 always fits in CLOG2(N) bits. Verilog-2001 has no cast
+            // to narrow a parameter expression, so the 32-bit subtraction
+            // is assigned to the sized counter deliberately.
+            /* verilator lint_off WIDTHTRUNC */
             counter <= N - 1;
+            /* verilator lint_on WIDTHTRUNC */
         end else
             counter <= counter - 1;
     end

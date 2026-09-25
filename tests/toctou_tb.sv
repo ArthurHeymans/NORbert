@@ -173,7 +173,8 @@ module toctou_tb;
         read_flash(24'h001238, 4'b0001, 0, 0, 0, 0, 8'heb);
         delayed_initial_reads = 0;
         for (integer phase = 0; phase < 40; phase++) begin
-            while (dut.sdram_i.refreshcount != 392+phase) @(negedge clk);
+            // refreshcount is 10 bits wide; size the target to match.
+            while (dut.sdram_i.refreshcount != 10'(392+phase)) @(negedge clk);
             read_flash(24'h001238, 4'b0001, 1, 0, 24'hfffff8, 24'h007458, 8'heb);
         end
         if (delayed_initial_reads == 0) $fatal(1, "Missing initial-READ/redirect overlap coverage");

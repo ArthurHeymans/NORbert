@@ -158,6 +158,20 @@ module spi_trx(
     
     reg [4:0] state;
     reg [2:0] dummy_count = 0;
+    // dummy_count is loaded with the last dummy clock and counts down to 0,
+    // so fast reads support 1..8 wait clocks. Verilog-2001 has no cast to
+    // narrow the parameter expression, so the truncation is waived here and
+    // the range is enforced by the generate guard below instead.
+    /* verilator lint_off WIDTHTRUNC */
+    localparam [2:0] FAST_READ_DUMMY_LAST = FAST_READ_DUMMY_CLKS - 1;
+    /* verilator lint_on WIDTHTRUNC */
+    generate
+        if (FAST_READ_DUMMY_CLKS < 1 || FAST_READ_DUMMY_CLKS > 8) begin : g_dummy_range
+            // Deliberately undefined: elaboration fails if dummy_count
+            // cannot hold the configured fast-read wait.
+            FAST_READ_DUMMY_CLKS_must_be_1_to_8 unsupported_dummy_clks();
+        end
+    endgenerate
     reg is_fast_read = 0;
     reg is_dual_read = 0;       // Set for both 0x3B and 0xBB
     reg is_quad_read = 0;       // Set for both 0x6B and 0xEB
@@ -194,7 +208,9 @@ module spi_trx(
                                         {addr[30:0], spi_io0_in};
     // Most significant address bit arriving on this clock.
     wire addr_lane_msb = addr_quad ? spi_io3_in : addr_dual ? spi_io1_in : spi_io0_in;
-    wire addr_last = addr_count == addr_lanes - 1'b1;
+    // addr_count is 5 bits and counts down by addr_lanes (1, 2 or 4) per
+    // address clock; the subtraction is done at addr_count's width.
+    wire addr_last = addr_count == ({2'b00, addr_lanes} - 5'd1);
     
     // Set on the clock that starts a new burst in STA_READ; the first byte
     // of the burst comes straight from live_buffer.
@@ -592,7 +608,7 @@ module spi_trx(
                     // SST AAI ignores transmitted A0: the two bytes occupy
                     // an aligned word within one SDRAM burst.
                     addr <= (is_aai && addr_last) ? {addr_next[31:1], 1'b0} : addr_next;
-                    addr_count <= addr_count - addr_lanes;
+                    addr_count <= addr_count - {2'b00, addr_lanes};
 
                     if (!addr_dual && !addr_quad && bit_count_in == 0) begin
                         log_strobe <= 1;
@@ -616,7 +632,7 @@ module spi_trx(
                             else begin
                                 if (is_fast_read) begin
                                     state <= STA_DUMMY;
-                                    dummy_count <= FAST_READ_DUMMY_CLKS - 1;
+                                    dummy_count <= FAST_READ_DUMMY_LAST;
                                 end
                                 else begin
                                     state <= STA_READ;
@@ -633,9 +649,9 @@ module spi_trx(
 
                             // Align address based on erase size
                             // write_addr is 23-bit burst address = byte_addr[25:3]
-                            if (write_len == 20'h01FFF)
+                            if (write_len == 23'h01FFF)
                                 write_addr <= wrap_burst_addr({addr_next[25:16], 13'b0});  // 64KB aligned
-                            else if (write_len == 20'h00FFF)
+                            else if (write_len == 23'h00FFF)
                                 write_addr <= wrap_burst_addr({addr_next[25:15], 12'b0});  // 32KB aligned
                             else
                                 write_addr <= wrap_burst_addr({addr_next[25:12], 9'b0});   // 4KB aligned
