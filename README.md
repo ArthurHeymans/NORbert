@@ -56,6 +56,14 @@ openFPGALoader -b tangprimer25k spi_flash.fs
 openFPGALoader -b tangprimer25k -f spi_flash.fs
 ```
 
+Each release carries one bitstream, named `spi_flash.fs` so that the
+`releases/latest/download/...` link in the web UI keeps working across
+releases, plus a `SHA256SUMS` file to check it against:
+
+```sh
+sha256sum --check SHA256SUMS
+```
+
 Release tags exactly match the Rust package version (for example, tag `0.1.0`
 uses `version = "0.1.0"` in `tool/Cargo.toml`). The release workflow rejects a
 mismatch.
