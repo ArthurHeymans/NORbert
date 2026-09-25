@@ -65,8 +65,6 @@ module glue(
     input wire [7:0] spi_write_buf_offset,
     input wire [7:0] spi_write_buf_val,
     
-    input wire log_strobe,
-    input wire [7:0] log_val,
     
     // Chip configuration outputs (from CHIPCONFIG command)
     output reg [23:0] cfg_jedec_id,
@@ -165,9 +163,6 @@ module glue(
     reg write_strobe;
     reg write_strobe_r;  // delayed copy for rising-edge detection
     
-    reg [1:0] log_strobe_buf;
-    always @(posedge clk) log_strobe_buf <= {log_strobe_buf[0], log_strobe};
-    reg log_ack;
     
     reg [1:0] spi_csel_buf;
     
@@ -358,7 +353,6 @@ module glue(
             ft_txd_data <= 0;
             
             led <= 0;
-            log_ack <= 0;
             
             spi_writing <= 0;
             spi_write_ack <= 0;
@@ -552,12 +546,6 @@ module glue(
             led[3] <= !spi_csel_buf[1];
             led[2] <= hold_out;                         // Target flash held
             led[0] <= heartbeat[25];                    // Heartbeat ~2Hz at 132MHz
-            
-            // Legacy single-byte log_strobe/log_val path is superseded
-            // by the structured logger + CMD_LOGPOLL flow.  The acknowledge
-            // register is still shadowed so the input does not synthesize
-            // into a dangling always-block, but no bytes are forwarded.
-            if (!log_strobe_buf[1]) log_ack <= 0;
             
             // -------------------------------------------------------
             // TOCTOU trap check: on address phase completion, compare

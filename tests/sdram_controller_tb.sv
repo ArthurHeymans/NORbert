@@ -29,7 +29,7 @@ module sdram_controller_tb;
         .spi_reset(1'b0), .spi_csel(cs), .spi_cmd_write(command), .spi_write_type(kind),
         .spi_write_addr(address), .spi_write_len(length), .spi_write_done(done),
         .spi_write_buf_strobe(strobe), .spi_write_buf_offset(offset), .spi_write_buf_val(value),
-        .log_strobe(1'b0), .log_val(8'b0), .spi_clk(clk), .sfdp_raddr(7'b0),
+        .spi_clk(clk), .sfdp_raddr(7'b0),
         .log_fifo_data_available(1'b0), .log_fifo_read_data(8'b0),
         .log_addr_valid_sync(1'b0), .log_addr_sync(24'b0), .spi_active_sync(1'b0)
     );

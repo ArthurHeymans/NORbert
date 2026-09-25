@@ -230,9 +230,6 @@ module top(
     wire [7:0] spi_write_buf_offset;
     wire [7:0] spi_write_buf_val;
     
-    wire log_strobe;
-    wire [7:0] log_val;
-    
     // Structured logging signals (SPI clock domain)
     wire log_cmd_valid;
     wire [7:0] log_cmd_opcode;
@@ -303,9 +300,6 @@ module top(
         
         .sfdp_raddr(sfdp_raddr),
         .sfdp_rdata(sfdp_rdata),
-        
-        .log_strobe(log_strobe),
-        .log_val(log_val),
         
         .log_cmd_valid(log_cmd_valid),
         .log_cmd_opcode(log_cmd_opcode),
@@ -592,9 +586,6 @@ module top(
         .spi_write_buf_strobe(spi_write_buf_strobe),
         .spi_write_buf_offset(spi_write_buf_offset),
         .spi_write_buf_val(spi_write_buf_val),
-        
-        .log_strobe(log_strobe),
-        .log_val(log_val),
         
         .cfg_jedec_id(cfg_jedec_id),
         .cfg_4byte(cfg_4byte),

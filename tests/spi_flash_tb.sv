@@ -49,7 +49,7 @@ module spi_flash_tb;
         .spi_write_type(write_type), .spi_write_addr(write_addr), .spi_write_len(write_len),
         .spi_write_done(write_done), .spi_write_buf_strobe(write_strobe),
         .spi_write_buf_offset(write_offset), .spi_write_buf_val(write_value),
-        .log_strobe(1'b0), .log_val(8'b0), .spi_clk(sck),
+        .spi_clk(sck),
         .sfdp_raddr(sfdp_addr), .sfdp_rdata(sfdp_data), .spi_running(running),
         .log_fifo_data_available(1'b0), .log_fifo_read_data(8'b0),
         .log_addr_valid_sync(1'b0), .log_addr_sync(24'b0), .spi_active_sync(1'b0)

@@ -68,8 +68,6 @@ module spi_trx(
     output reg [6:0] sfdp_raddr,
     input wire [7:0] sfdp_rdata,
     
-    output reg log_strobe = 0,
-    output reg [7:0] log_val = 0,
     
     // Structured logging outputs (directly driven from SPI state machine).
     // All signals are in the SPI clock domain; the logger module synchronizes.
@@ -149,7 +147,8 @@ module spi_trx(
         STA_READID          = 4,
         STA_WRITE           = 6,
         STA_ERASE           = 8,
-        STA_LOG             = 9,
+        // 9 (STA_LOG) retired with the 0xF2 logging hook: unlisted opcodes
+        // are ignored by the decoder, so 9 stays unused rather than reused.
         STA_DUMMY           = 10,
         STA_MODE_MULTI      = 13,  // Mode+dummy phase for 0xBB/0xEB
         STA_WRITESTATUS     = 16,  // Receive status register write data
@@ -312,8 +311,6 @@ module spi_trx(
                 status_read_sel2 <= 0;
                 mode_count <= 0;
                 
-                log_strobe <= 0;
-                log_val <= 0;
                 log_cmd_valid <= 0;
                 log_addr_valid <= 0;
                 log_byte_count <= 0;
@@ -328,13 +325,9 @@ module spi_trx(
                     addr_4byte <= 0;
                     aai_active <= 0;
                     addr <= 0;
-                    
-                    log_strobe <= 1;
-                    log_val <= 8'hE2;
                 end
             end
             else begin
-                log_strobe <= 0;
                 log_cmd_valid <= 0;
                 log_addr_valid <= 0;
                     
@@ -584,14 +577,8 @@ module spi_trx(
                         addr_count <= 1;
                     end
                     
-                    CMD_LOG: begin
-                        state <= STA_LOG;
-                    end
-                        
                     endcase
                     
-                    log_strobe <= 1;
-                    log_val <= {mosi_byte[7:1], spi_io0_in};
                     log_cmd_valid <= 1;
                     log_cmd_opcode <= {mosi_byte[7:1], spi_io0_in};
                     log_byte_count <= 0;
@@ -609,11 +596,6 @@ module spi_trx(
                     // an aligned word within one SDRAM burst.
                     addr <= (is_aai && addr_last) ? {addr_next[31:1], 1'b0} : addr_next;
                     addr_count <= addr_count - {2'b00, addr_lanes};
-
-                    if (!addr_dual && !addr_quad && bit_count_in == 0) begin
-                        log_strobe <= 1;
-                        log_val <= {mosi_byte[7:1], spi_io0_in};
-                    end
 
                     if (addr_last) begin
                         log_addr_valid <= 1;
@@ -770,12 +752,6 @@ module spi_trx(
                     write_buf_val <= {mosi_byte[7:1], spi_io0_in};
                     if (aai_bytes_left == 1)
                         addr <= addr + 2;
-                end
-                else if (state == STA_LOG) begin
-                    if (bit_count_in == 0) begin
-                        log_strobe <= 1;
-                        log_val <= {mosi_byte[7:1], spi_io0_in};
-                    end
                 end
                 // ---------------------------------------------------------
                 // Mode+dummy phase for multi-IO reads (0xBB and 0xEB)
