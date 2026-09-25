@@ -158,8 +158,10 @@
             gwSh
             gowinEda
 
-            # Open-source synthesis (linting only for GW5A)
+            # Open-source synthesis, place and route and bitstream packing
             yosys
+            nextpnr
+            python3Packages.apycula
 
             # Programming tool
             openfpgaloader
@@ -188,7 +190,8 @@
             echo "Available tools:"
             echo "  gw_sh            - Gowin CLI synthesis (Education Edition)"
             echo "  gw_ide           - Gowin IDE GUI"
-            echo "  yosys            - Verilog linting"
+            echo "  yosys            - Verilog linting and open-source synthesis"
+            echo "  nextpnr-himbaechel, gowin_pack - Open-source place and route"
             echo "  openFPGALoader   - FPGA programming"
             echo "  verilator        - Verilog simulation"
             echo "  gtkwave          - Waveform viewer"
@@ -199,6 +202,7 @@
             echo ""
             echo "Build commands:"
             echo "  make build       - Synthesize with gw_sh (CLI)"
+            echo "  make build-oss   - Experimental open-source build"
             echo "  make prog        - Program FPGA (volatile)"
             echo "  make flash       - Program to flash (persistent)"
             echo "  make lint        - Lint with yosys"

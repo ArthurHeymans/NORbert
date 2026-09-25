@@ -1,6 +1,7 @@
 # Makefile for Tang Primer 25K SPI Flash Emulator
 # Uses Gowin IDE (Education Edition) via gw_sh for CLI synthesis.
-# GW5A is NOT supported by open-source tools (apicula/nextpnr-gowin).
+# build-oss is an experimental open-source flow (Yosys, nextpnr-himbaechel,
+# Apicula). It builds, but its GW5A timing model is not trusted yet.
 
 # GW5A-LV25MG121NC1/I0 - Tang Primer 25K FPGA (MBGA121N package)
 DEVICE = GW5A-LV25MG121NC1/I0
@@ -31,11 +32,17 @@ CST_FILE = tangprimer25k.cst
 # Gowin IDE output
 BITSTREAM = impl/pnr/spi_flash.fs
 
+# Open-source flow output. Apicula's GW5A-25A database covers the Tang
+# Primer 25K part.
+OSS_DIR = impl/oss
+OSS_BITSTREAM = $(OSS_DIR)/spi_flash.fs
+OSS_SDC = tangprimer25k.oss.sdc
+
 # Open-source lint tools use Yosys' GW5A primitive declarations so the
 # generated PLL wrapper can be elaborated without the proprietary simulator.
 GOWIN_CELLS = $(shell yosys-config --datdir)/gowin/cells_xtra_gw5a.v
 
-.PHONY: all build lint lint-yosys lint-verilator test prog flash clean tool webui webui-serve ftdi-setup help
+.PHONY: all build build-oss lint lint-yosys lint-verilator test test-gate prog prog-oss flash clean tool webui webui-serve ftdi-setup help
 
 all: build
 
@@ -44,6 +51,25 @@ build: $(BITSTREAM)
 
 $(BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) tangprimer25k.sdc build.tcl
 	gw_sh build.tcl
+
+# Open-source build. -nolutram because Apicula does not support GW5A-25A
+# shadow SRAM (RAM16SDP4) yet; small memories go to BSRAM or flip-flops.
+# The dual-purpose pins are released as GPIO like in build.tcl: without
+# i2c_as_gpio, IO_sdram_dq[12] on the I2C SDA pin always reads 1.
+# Timing failures are reported but not fatal: the GW5A delays are largely
+# borrowed from GW2A, so the Gowin build stays the reference.
+build-oss: $(OSS_BITSTREAM)
+
+$(OSS_BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) $(OSS_SDC)
+	mkdir -p $(OSS_DIR)
+	yosys -q -l $(OSS_DIR)/yosys.log \
+		-p "read_verilog -Isrc $(VERILOG_FILES); synth_gowin -family gw5a -nolutram -top top -json $(OSS_DIR)/top.json"
+	nextpnr-himbaechel --json $(OSS_DIR)/top.json --write $(OSS_DIR)/pnr.json \
+		--device $(DEVICE) --vopt family=GW5A-25A --vopt cst=$(CST_FILE) \
+		--vopt i2c_as_gpio --vopt sspi_as_gpio \
+		--sdc $(OSS_SDC) --timing-allow-fail -l $(OSS_DIR)/nextpnr.log
+	gowin_pack -d GW5A-25A --i2c_as_gpio --sspi_as_gpio --mspi_as_gpio \
+		--ready_as_gpio --done_as_gpio --cpu_as_gpio -o $@ $(OSS_DIR)/pnr.json
 
 # Open-source syntax, elaboration, and synthesis checks.
 lint: lint-yosys lint-verilator
@@ -82,8 +108,15 @@ test:
 		"$$build/$$test/V$${test}_tb"; \
 	done
 
+# The same testbenches against the Yosys GW5A netlist.
+test-gate:
+	tests/gate.sh
+
 # Program the device (volatile - lost on power cycle)
 prog: $(BITSTREAM)
+	openFPGALoader -b tangprimer25k $<
+
+prog-oss: $(OSS_BITSTREAM)
 	openFPGALoader -b tangprimer25k $<
 
 # Program to flash (persistent)
@@ -115,10 +148,13 @@ help:
 	@echo "Tang Primer 25K SPI Flash Emulator"
 	@echo ""
 	@echo "  make build   - Synthesize + PnR (default, requires gw_sh)"
+	@echo "  make build-oss - Experimental open-source build (yosys/nextpnr/apicula)"
+	@echo "  make prog-oss  - Program the open-source bitstream (volatile)"
 	@echo "  make prog    - Program FPGA (volatile)"
 	@echo "  make flash   - Program to flash (persistent)"
 	@echo "  make lint    - Check Verilog with Yosys and Verilator"
 	@echo "  make test    - Simulate SPI, SDRAM, TOCTOU, FIFO, logger, UART and FT245"
+	@echo "  make test-gate - Run the testbenches on the Yosys GW5A netlist"
 	@echo "  make tool    - Build spi-flash-tool (ftdi-nusb backend, default)"
 	@echo "  make webui  - Build the WebUSB/Web Serial browser UI"
 	@echo "  make webui-serve - Build and serve the UI at http://localhost:8081"

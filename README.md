@@ -78,13 +78,14 @@ If you have [Nix](https://nixos.org/) with flakes enabled, just enter the dev sh
 nix develop    # or let direnv handle it
 ```
 
-This provides the Gowin IDE (Education Edition), yosys, openFPGALoader, verilator, the Rust toolchain with the WebAssembly target, `wasm-bindgen-cli`, and Trunk for building and serving the Web UI.
+This provides the Gowin IDE (Education Edition), yosys, nextpnr, Apicula, openFPGALoader, verilator, the Rust toolchain with the WebAssembly target, `wasm-bindgen-cli`, and Trunk for building and serving the Web UI.
 
 Without Nix, you'll need:
 
 - [Gowin IDE Education Edition](https://www.gowinsemi.com/en/support/home/) v1.9.11.03 (`gw_sh` on PATH)
 - [openFPGALoader](https://github.com/trabucayre/openFPGALoader)
 - [yosys](https://github.com/YosysHQ/yosys) (optional, for linting)
+- [nextpnr](https://github.com/YosysHQ/nextpnr) with the Gowin himbaechel target and [Apicula](https://github.com/YosysHQ/apicula) (optional, for the open-source build)
 - [Verilator](https://verilator.org/) and a C++ toolchain (for linting/simulation)
 - Rust toolchain (for the host tool)
 
@@ -96,12 +97,32 @@ make prog                   # program FPGA (volatile, lost on power cycle)
 make flash                  # program to flash (persistent)
 ```
 
+An experimental open-source flow builds the same RTL with Yosys,
+nextpnr-himbaechel and Apicula, without the Gowin IDE:
+
+```sh
+make build-oss              # impl/oss/spi_flash.fs
+make prog-oss               # program FPGA (volatile)
+```
+
+Its PLL fuses match the Gowin build, and on a Tang Primer 25K the bitstream
+loads and verifies 8 MiB images over UART, across several nextpnr seeds.
+The SPI target interface is untested on hardware, and timing is not
+signed off: nextpnr's GW5A delays are largely borrowed from GW2A, and it
+does not analyse the PLL phase offsets, the SDRAM pin timing or the SPI
+pin timing that the design relies on. Releases stay on the Gowin flow.
+
 ### RTL checks
 
 ```sh
 make lint                   # Yosys synthesis checks and Verilator lint
 make test                   # SPI, SDRAM, TOCTOU, FIFO, logger, UART, FT245
+make test-gate              # the same benches on the Yosys GW5A netlist
 ```
+
+`test-gate` catches RTL that Yosys maps differently from Gowin synthesis,
+such as a tristate it does not recognise. It runs every bench except the
+UART and FT245 ones, which peek at state that synthesis renames.
 
 The tests cover SFDP startup/reconfiguration, page-program and AAI semantics,
 program latency/refresh, accepted SDRAM addresses during redirected reads, and

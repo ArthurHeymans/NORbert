@@ -71,3 +71,9 @@ jobs:
 
       - name: Simulate SPI, SDRAM and TOCTOU
         run: make test
+
+      - name: Simulate the Yosys GW5A netlist
+        run: make test-gate
+
+      - name: Open-source place, route and pack
+        run: make build-oss
