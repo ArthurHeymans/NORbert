@@ -15,6 +15,8 @@ module quad_fast_tb;
     always #4.167 clk = ~clk; // 120 MHz system clock
     reg reset = 1;
     reg sck = 0, cs = 1;
+    // Whether the emulated chip supports 4-byte addressing at all.
+    reg cfg_4byte = 1'b0;
     reg io0_in = 1, io1_in = 1, io2_in = 1, io3_in = 1;
 
     wire io0_out, io1_out, io2_out, io3_out;
@@ -41,7 +43,7 @@ module quad_fast_tb;
         .ram_read_buffer(read_buffer_a), .ram_read_buffer_b(read_buffer_b),
         .ram_read_valid_a(read_valid_a), .ram_read_valid_b(read_valid_b),
         .ram_read_busy(read_busy), .ram_post_toggle(post_toggle), .prefetch_thin(thin),
-        .write_done(1'b0), .cfg_jedec_id(24'h4125bf), .cfg_4byte(1'b0),
+        .write_done(1'b0), .cfg_jedec_id(24'h4125bf), .cfg_4byte(cfg_4byte),
         .cfg_chip_erase_bursts(23'h7fffff),
         .sfdp_rdata(8'h0), .prefetch_underrun(underrun)
     );
@@ -85,11 +87,11 @@ module quad_fast_tb;
     // SDRAM in 8-byte bursts, so a byte is located by its 23-bit burst
     // address and its 3-bit offset inside it. Doing the arithmetic in an
     // integer and slicing at the end keeps every operand's width exact.
-    function automatic [7:0] expected_byte(input [23:0] a, input integer i);
+    function automatic [7:0] expected_byte(input [31:0] a, input integer i);
         // 26 bits so the 23-bit burst address is byteaddr[25:3], with both
         // addends widened explicitly rather than by truncation.
         logic [25:0] byteaddr;
-        byteaddr = {2'b00, a} + 26'(i);
+        byteaddr = 26'(a[25:0]) + 26'(i);
         expected_byte = exp_byte(byteaddr[25:3], byteaddr[2:0]);
     endfunction
 
@@ -145,6 +147,33 @@ module quad_fast_tb;
 
 
 
+
+    // Read with a plain three-byte-read opcode whose address phase is four
+    // bytes wide because 0xB7 put the engine in four-byte mode. This is
+    // the mode-dependent half of four-byte addressing: the opcode is the
+    // same one the 3-byte bench uses, only the phase length changes. A
+    // three-byte phase here would latch a different address *and* take the
+    // fourth byte as the first data clock, so the pattern function would
+    // not match.
+    task read_after_mode(input [7:0] mode_cmd, input bit four_byte, input [31:0] a);
+        reg [7:0] got, want;
+        select_spi;
+        send_byte(mode_cmd);
+        deselect_spi;
+        select_spi;
+        send_byte(8'h03);
+        if (four_byte) address4(a); else begin
+            send_byte(a[23:16]); send_byte(a[15:8]); send_byte(a[7:0]);
+        end
+        recv_single(got);
+        deselect_spi;
+        // With a three-byte phase those three bytes address a[23:0]: the
+        // fourth byte of the same stream is not part of the address at all.
+        want = expected_byte(four_byte ? a : {8'h00, a[23:0]}, 0);
+        if (got !== want)
+            $fatal(1, "0x03 in %0d-byte mode sent %h read %h, expected %h",
+                   four_byte ? 4 : 3, a, got, want);
+    endtask
 
     // ---------------------------------------------------------------
     // SPI master tasks (mode 0). Data changes on negedge (FPGA side),
@@ -202,6 +231,11 @@ module quad_fast_tb;
         #(sclk_half); sck = 0;
     endtask
 
+    task address4(input [31:0] a);
+        send_byte(a[31:24]); send_byte(a[23:16]);
+        send_byte(a[15:8]); send_byte(a[7:0]);
+    endtask
+
     task send_quad_nibble(input [3:0] n);
         io3_in = n[3]; io2_in = n[2]; io1_in = n[1]; io0_in = n[0];
         #(sclk_half); sck = 1;
@@ -233,7 +267,7 @@ module quad_fast_tb;
         else $fatal(1, "quad_fast FAIL: %s", what);
     endtask
 
-    task check_underrun(input [23:0] a, input [7:0] opcode);
+    task check_underrun(input [31:0] a, input [8:0] opcode);
         if (underrun)
             cell_fail($sformatf("prefetch underrun: opcode %h addr %h @ %0.1fMHz",
                                 opcode, a, 1000.0/(2*sclk_half)));
@@ -248,20 +282,22 @@ module quad_fast_tb;
 
     // Read `count` bytes with the given opcode from flash address `a`,
     // checking every byte against the pattern function.
-    task cell_mismatch(input [7:0] opcode, input [23:0] a, input integer i,
+    task cell_mismatch(input [8:0] opcode, input [31:0] a, input integer i,
                         input [7:0] got, input [7:0] want);
         cell_fail($sformatf("opcode %h addr %h+%0d: got %h want %h @ %0.1fMHz",
                             opcode, a, i, got, want, 1000.0/(2*sclk_half)));
     endtask
 
-    task read_check(input [7:0] opcode, input [23:0] a, input integer count);
+    // opcode is 9 bits so the sweep can pass a four-byte form marker
+    // without widening; only the low byte reaches the decoder.
+    task read_check(input [8:0] opcode, input [31:0] a, input integer count);
         // explore_mode aborts the read at the first mismatch (failed_cell)
         // so one bad cell cannot cascade into the next
         reg [7:0] got, want;
         select_spi;
-        send_byte(opcode);
+        send_byte(opcode[7:0]);
         begin : read_check_body
-        case (opcode)
+        case (opcode[7:0])
             8'h03: begin // slow read: single addr, no dummy
                 send_byte(a[23:16]); send_byte(a[15:8]); send_byte(a[7:0]);
                 for (integer i = 0; i < count; i++) begin
@@ -311,7 +347,7 @@ module quad_fast_tb;
                                  spi.ram_read_buffer, spi.ram_read_buffer_b,
                                  spi.prefetch.consume_sel, underrun);
                         for (integer j = 0; j < count; j++) begin
-                            automatic logic [25:0] bj = {2'b00, a} + 26'(j);
+                            automatic logic [25:0] bj = 26'(a[25:0]) + 26'(j);
                             $display("  byte+%0d burst=%h idx=%0d want=%h",
                                      j, bj[25:3], bj[2:0],
                                      exp_byte(bj[25:3], bj[2:0]));
@@ -331,7 +367,72 @@ module quad_fast_tb;
                     if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
                 end
             end
-            default: $fatal(1, "bad opcode %h", opcode);
+            // ---- four-byte-address forms ---------------------------------
+            // The address is sent as four bytes. If the engine consumed
+            // only three, the low three would be taken as the address and
+            // the fourth as a dummy clock, landing in a different burst --
+            // which the pattern function catches, because the pattern is a
+            // function of the burst address.
+            8'h13: begin // read 4B: single addr, no dummy
+                send_byte(a[31:24]); send_byte(a[23:16]);
+                send_byte(a[15:8]); send_byte(a[7:0]);
+                for (integer i = 0; i < count; i++) begin
+                    recv_single(got);
+                    want = expected_byte(a, i);
+                    if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
+                end
+            end
+            8'h0c: begin // fast read 4B: single addr + 8 dummy
+                send_byte(a[31:24]); send_byte(a[23:16]);
+                send_byte(a[15:8]); send_byte(a[7:0]);
+                send_byte(0);
+                for (integer i = 0; i < count; i++) begin
+                    recv_single(got);
+                    want = expected_byte(a, i);
+                    if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
+                end
+            end
+            8'h3c: begin // dual-out 4B: single addr + 8 dummy, dual data
+                send_byte(a[31:24]); send_byte(a[23:16]);
+                send_byte(a[15:8]); send_byte(a[7:0]);
+                send_byte(0);
+                for (integer i = 0; i < count; i++) begin
+                    recv_dual(got);
+                    want = expected_byte(a, i);
+                    if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
+                end
+            end
+            8'h6c: begin // quad-out 4B: single addr + 8 dummy, quad data
+                send_byte(a[31:24]); send_byte(a[23:16]);
+                send_byte(a[15:8]); send_byte(a[7:0]);
+                send_byte(0);
+                for (integer i = 0; i < count; i++) begin
+                    recv_quad(got);
+                    want = expected_byte(a, i);
+                    if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
+                end
+            end
+            8'hbc: begin // dual-io 4B: 16 dual addr bits, 4 mode clocks
+                for (integer i = 30; i >= 0; i -= 2)
+                    send_dual_bits(a[i+1 -: 2]);
+                repeat (4) send_dual_bits(2'b11);
+                for (integer i = 0; i < count; i++) begin
+                    recv_dual(got);
+                    want = expected_byte(a, i);
+                    if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
+                end
+            end
+            8'hec: begin // quad-io 4B: 8 quad addr nibbles, 6 mode clocks
+                for (integer i = 28; i >= 0; i -= 4)
+                    send_quad_nibble(a[i+3 -: 4]);
+                repeat (6) send_quad_nibble(4'hf);
+                for (integer i = 0; i < count; i++) begin
+                    recv_quad(got);
+                    want = expected_byte(a, i);
+                    if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
+                end
+            end
+            default: $fatal(1, "bad opcode %h", opcode[7:0]);
         endcase
         end : read_check_body
         deselect_spi;
@@ -342,11 +443,11 @@ module quad_fast_tb;
     // must_pass=1 (default): any failure is fatal. must_pass=0 explores:
     // failures are logged with EXPLORE-FAIL and the sweep continues, so
     // one thin corner cannot hide the rest of the matrix.
-    task sweep_offsets(input [7:0] opcode, input integer count, input [23:0] base,
+    task sweep_offsets(input [8:0] opcode, input integer count, input [31:0] base,
                          input bit must_pass = 1);
         explore_mode = !must_pass;
         for (integer off = 0; off < 8; off++)
-            read_check(opcode, base + 24'(off), count);
+            read_check(opcode, base + 32'(off), count);
         explore_mode = 0;
     endtask
 
@@ -357,64 +458,88 @@ module quad_fast_tb;
 
         // Sanity: slow read at 30MHz, aligned.
         sclk_half = 16.667;
-        read_check(8'h03, 24'h001000, 16);
+        read_check(9'h03, 32'h001000, 16);
 
         // Calibration gate: quad-out at 30MHz, all offsets. This passed on
         // the old pipeline too; failure here means the DQ model timing is
         // off, not the RTL.
-        sweep_offsets(8'h6b, 32, 24'h002000);
+        sweep_offsets(9'h6b, 32, 32'h002000);
         $display("quad_fast: 30MHz calibration OK");
 
         // Slow read at 50MHz, all offsets (no dummy: hardest first burst).
         sclk_half = 10.0;
-        sweep_offsets(8'h03, 32, 24'h003000);
+        sweep_offsets(9'h03, 32, 32'h003000);
         $display("quad_fast: 0x03 @50MHz OK");
 
         // Fast single at 70MHz.
         sclk_half = 7.143;
-        sweep_offsets(8'h0b, 32, 24'h004000);
+        sweep_offsets(9'h0b, 32, 32'h004000);
         $display("quad_fast: 0x0B @70MHz OK");
 
         // Dual-out at 50MHz, spot offsets.
         sclk_half = 10.0;
-        read_check(8'h3b, 24'h005000, 32);
-        read_check(8'h3b, 24'h005007, 32);
+        read_check(9'h3b, 32'h005000, 32);
+        read_check(9'h3b, 32'h005007, 32);
         $display("quad_fast: 0x3B @50MHz OK");
 
         // Dual-IO at 50 and 60MHz, all offsets.
-        sweep_offsets(8'hbb, 32, 24'h006000);
+        sweep_offsets(9'hbb, 32, 32'h006000);
         $display("quad_fast: 0xBB @50MHz OK");
         sclk_half = 8.333;
-        sweep_offsets(8'hbb, 32, 24'h007000);
+        sweep_offsets(9'hbb, 32, 32'h007000);
         $display("quad_fast: 0xBB @60MHz OK");
 
         // Quad-out at 50/60/70MHz, all offsets.
         sclk_half = 10.0;
-        sweep_offsets(8'h6b, 32, 24'h008000);
+        sweep_offsets(9'h6b, 32, 32'h008000);
         $display("quad_fast: 0x6B @50MHz OK");
         sclk_half = 8.333;
-        sweep_offsets(8'h6b, 32, 24'h009000);
+        sweep_offsets(9'h6b, 32, 32'h009000);
         $display("quad_fast: 0x6B @60MHz OK");
         sclk_half = 7.143;
-        sweep_offsets(8'h6b, 32, 24'h00a000);
+        sweep_offsets(9'h6b, 32, 32'h00a000);
         $display("quad_fast: 0x6B @70MHz OK");
 
         // Quad-IO at 50MHz (supported), 60/70MHz (explore: offset 7 is
         // physics-limited -- second burst needed ~30ns before the single
         // controller can produce it -- expect EXPLORE-FAIL there).
         sclk_half = 10.0;
-        sweep_offsets(8'heb, 32, 24'h00b000);
+        sweep_offsets(9'heb, 32, 32'h00b000);
         $display("quad_fast: 0xEB @50MHz OK");
         sclk_half = 8.333;
-        sweep_offsets(8'heb, 32, 24'h00c000, 0);
+        sweep_offsets(9'heb, 32, 32'h00c000, 0);
         sclk_half = 7.143;
-        sweep_offsets(8'heb, 32, 24'h00d000, 0);
+        sweep_offsets(9'heb, 32, 32'h00d000, 0);
         // Dual-IO at 70MHz (explore: short mode phase + tiny first bursts).
-        sweep_offsets(8'hbb, 32, 24'h00e000, 0);
+        sweep_offsets(9'hbb, 32, 32'h00e000, 0);
         // Slow read at 60MHz (explore: 3.5-clock first-burst window).
         sclk_half = 8.333;
-        sweep_offsets(8'h03, 32, 24'h00f000, 0);
+        sweep_offsets(9'h03, 32, 32'h00f000, 0);
 
+        // ---- four-byte addressing, every read command -----------------
+        // Addresses with a non-zero third and fourth byte, so a three-byte
+        // address phase would land in a different burst. All eight start
+        // offsets each, at the frequency each command is documented for.
+        // cfg_4byte is set so the engine accepts the mode commands too.
+        cfg_4byte = 1'b1;
+        sclk_half = 10.0;   // 50 MHz: no-dummy read, same limit as 0x03
+        sweep_offsets(9'h13, 32, 32'h0023_4500);
+        $display("quad_fast: 0x13 4-byte read @50MHz OK");
+        sclk_half = 7.143;  // 70 MHz: 8 dummy clocks, same as 0x0B
+        sweep_offsets(9'h0c, 32, 32'h0123_4500);
+        $display("quad_fast: 0x0C 4-byte fast read @70MHz OK");
+        sclk_half = 10.0;   // 50 MHz, same as 0x3B
+        sweep_offsets(9'h3c, 32, 32'h0123_4500);
+        $display("quad_fast: 0x3C 4-byte dual-out @50MHz OK");
+        sclk_half = 7.143;  // 70 MHz, same as 0x6B
+        sweep_offsets(9'h6c, 32, 32'h0123_4500);
+        $display("quad_fast: 0x6C 4-byte quad-out @70MHz OK");
+        sclk_half = 8.333;  // 60 MHz, same as 0xBB
+        sweep_offsets(9'hbc, 32, 32'h0123_4500);
+        $display("quad_fast: 0xBC 4-byte dual-io @60MHz OK");
+        sclk_half = 10.0;   // 50 MHz, same as 0xEB
+        sweep_offsets(9'hec, 32, 32'h0023_4500);
+        $display("quad_fast: 0xEC 4-byte quad-io @50MHz OK");
         // Long sequential runs across row/bank boundaries with refresh
         // coexistence: 2KB from 0x3FF800 crosses the 4KB row at 0x400000
         // plus bank boundaries on the way. (Chip select is byte 25,
@@ -422,19 +547,35 @@ module quad_fast_tb;
         // as the row bits.)
         sclk_half = 8.333;
         ref_before = refreshes;
-        read_check(8'h6b, 24'h3ff800, 2048);
+        read_check(9'h6b, 32'h3ff800, 2048);
         if (refreshes == ref_before)
             $fatal(1, "no SDRAM refresh during 2KB streaming read");
         $display("quad_fast: 2KB 0x6B @60MHz row/bank crossing OK (%0d refreshes)",
                  refreshes - ref_before);
         ref_before = refreshes;
-        read_check(8'heb, 24'h3ff000, 2048);
+        read_check(9'heb, 32'h3ff000, 2048);
         if (refreshes == ref_before)
             $fatal(1, "no SDRAM refresh during 2KB streaming read");
         $display("quad_fast: 2KB 0xEB @60MHz row/bank crossing OK (%0d refreshes)",
                  refreshes - ref_before);
 
-        $display("PASS QUAD_FAST: single/dual/quad 30-70MHz, offsets 0-7, crossings, refresh (thin flags: %0d, explore fails: %0d, explore thin: %0d)", thin_hits, explore_fails, explore_thin);
+        // The mode pair: 0xB7 widens the address phase of the plain 0x03
+        // and 0xE9 narrows it again. Placed after the streaming runs
+        // because it changes pipeline state that the 60 MHz corners above
+        // depend on; it is a decode check, so the frequency is irrelevant.
+        sclk_half = 10.0;
+        read_after_mode(8'hb7, 1'b1, 32'h0123_4500);
+        $display("quad_fast: 0xB7 widens the 0x03 address phase to four bytes OK");
+        read_after_mode(8'he9, 1'b0, 32'h0123_4500);
+        $display("quad_fast: 0xE9 narrows it back to three bytes OK");
+        // A chip that does not advertise four-byte addressing ignores 0xB7
+        // outright, so 0x03 stays three bytes.
+        cfg_4byte = 1'b0;
+        read_after_mode(8'hb7, 1'b0, 32'h0123_4500);
+        $display("quad_fast: 0xB7 ignored when the chip has no 4-byte support OK");
+        cfg_4byte = 1'b0;
+
+        $display("PASS QUAD_FAST: single/dual/quad 30-70MHz, 3- and 4-byte addressing incl. the 0xB7/0xE9 mode pair, offsets 0-7, crossings, refresh (thin flags: %0d, explore fails: %0d, explore thin: %0d)", thin_hits, explore_fails, explore_thin);
         $finish;
     end
 

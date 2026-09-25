@@ -104,7 +104,10 @@ make test                   # SPI, SDRAM, TOCTOU, FIFO, logger, UART, FT245
 ```
 
 The tests cover SFDP startup/reconfiguration, page-program and AAI semantics,
-program latency/refresh, and accepted SDRAM addresses during redirected reads.
+program latency/refresh, accepted SDRAM addresses during redirected reads, and
+three- versus four-byte addressing: every four-byte read command at all start
+offsets, the 0xB7/0xE9 address-mode pair, the four-byte program and erase
+forms, and a chip that ignores the mode commands entirely.
 The transport and buffer blocks are covered by their own benches: the FIFO
 against a queue model (`tests/fifo_tb.sv`), the logger's byte stream against
 the format the host decoder expects (`tests/logger_tb.sv`), the UART over all
