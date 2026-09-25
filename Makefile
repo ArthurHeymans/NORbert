@@ -72,7 +72,7 @@ lint-verilator:
 # width bug in the RTL it is exercising.
 test:
 	@set -eu; build=$$(mktemp -d); trap 'rm -rf "$$build"' EXIT; \
-	for test in spi_flash sdram_controller toctou quad_fast; do \
+	for test in spi_flash sdram_controller toctou quad_fast fifo logger uart ft245; do \
 		echo "Testing $$test"; \
 		verilator --binary --timing -j 2 --top-module $${test}_tb -Isrc \
 			-Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD \
@@ -118,7 +118,7 @@ help:
 	@echo "  make prog    - Program FPGA (volatile)"
 	@echo "  make flash   - Program to flash (persistent)"
 	@echo "  make lint    - Check Verilog with Yosys and Verilator"
-	@echo "  make test    - Simulate SPI, SDRAM coordination, and TOCTOU"
+	@echo "  make test    - Simulate SPI, SDRAM, TOCTOU, FIFO, logger, UART and FT245"
 	@echo "  make tool    - Build spi-flash-tool (ftdi-nusb backend, default)"
 	@echo "  make webui  - Build the WebUSB/Web Serial browser UI"
 	@echo "  make webui-serve - Build and serve the UI at http://localhost:8081"

@@ -1,6 +1,16 @@
 // FIFO Module
 // Same clock domain FIFO with first-word-fallthrough
-// Holds up to NUM entries (should be a power of two)
+// Backing RAM has NUM entries (NUM must be a power of two); the usable
+// depth is smaller because space_available reserves headroom.
+//
+// Contract, pinned down by tests/fifo_tb.sv:
+//   - Write only while space_available is high. It is a *registered*
+//     signal and reserves FREESPACE slots on top, so the usable depth is
+//     NUM - 1 - FREESPACE (14 of 16 at NUM=16, FREESPACE=1), not NUM.
+//   - Read only while data_available is high. A read on an empty FIFO is
+//     not benign: next_count is computed as count + write - read, so it
+//     wraps and the FIFO then claims data it does not have. Both
+//     consumers in this design gate on data_available.
 
 `default_nettype none
 

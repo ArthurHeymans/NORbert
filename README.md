@@ -100,11 +100,16 @@ make flash                  # program to flash (persistent)
 
 ```sh
 make lint                   # Yosys synthesis checks and Verilator lint
-make test                   # SPI, SDRAM coordination and TOCTOU simulations
+make test                   # SPI, SDRAM, TOCTOU, FIFO, logger, UART, FT245
 ```
 
 The tests cover SFDP startup/reconfiguration, page-program and AAI semantics,
 program latency/refresh, and accepted SDRAM addresses during redirected reads.
+The transport and buffer blocks are covered by their own benches: the FIFO
+against a queue model (`tests/fifo_tb.sv`), the logger's byte stream against
+the format the host decoder expects (`tests/logger_tb.sv`), the UART over all
+256 byte values in both transmitter configurations (`tests/uart_tb.sv`), and
+the FT245 handshake against a time-accurate FT2232H model (`tests/ft245_tb.sv`).
 They use a burst-level memory model or a clock-only PLL stub; they do not replace
 Gowin timing analysis or hardware validation of SDRAM pin timing.
 
@@ -262,6 +267,14 @@ TXN#   COMMAND            ADDRESS    INFO
 ```
 
 The monitor also tracks double-reads of the same (opcode, address) pair and flags them as TOCTOU candidates. Press Ctrl+C to stop. The underlying protocol is a poll-based ring-buffer drain (`CMD_LOGPOLL` = 0x3A); packet types are `0xA1` (command), `0xA2` (address), `0xA3` (end + byte count) and `0xA4` (TOCTOU trap fired), with `0xA0` as the per-poll terminator. Log bytes equal to `0xA0` or `0xA5` are sent as `0xA5 0x00` and `0xA5 0x05`.
+
+The ring holds 503 bytes (512 entries less FIFO headroom), with one event
+pending per packet type behind it. A host that polls slower than the target
+reads will therefore see gaps: the FPGA drops the events it has no pending
+slot for rather than overwriting the ring, so a transaction can lose some of
+its packets (its address, say) and keep others. Packets that do arrive are
+always whole and in order, never torn, corrupted or reordered.
+`tests/logger_tb.sv` checks both the loss and the integrity.
 
 ### TOCTOU traps
 
