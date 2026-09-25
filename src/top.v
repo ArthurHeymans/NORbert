@@ -167,9 +167,12 @@ module top(
     // IO3 (/HOLD pin): input normally, output during quad read data phase.
     // When hold_out is asserted, IO3 is driven LOW continuously to keep
     // the target flash in hold state (mutually exclusive with quad I/O).
+    //
+    // Keep the 1'bz in the outermost mux: Yosys only infers a tristate
+    // buffer there, and otherwise turns the pin into a plain output.
     wire hold_out;
-    assign spi_io3_pin = hold_out ? 1'b0 :
-                         (spi_io3_oe && spi_active_out) ? spi_io3_out : 1'bz;
+    wire spi_io3_drive = hold_out || (spi_io3_oe && spi_active_out);
+    assign spi_io3_pin = spi_io3_drive ? (spi_io3_out && !hold_out) : 1'bz;
     wire spi_io3_in = spi_io3_pin;
     
     assign spi_debug_pin = spi_debug_out;
