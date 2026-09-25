@@ -213,6 +213,10 @@ module top(
     // -----------------------------------------------------------
     
     wire spi_active;
+    // Sticky-until-read by glue, so the fast read path's health is
+    // observable from the host instead of only inside simulation.
+    wire prefetch_underrun;
+    wire prefetch_thin;
     wire spi_ram_inhibit_refresh;
     wire spi_ram_activate;
     wire spi_ram_read;
@@ -229,9 +233,6 @@ module top(
     wire spi_write_buf_strobe;
     wire [7:0] spi_write_buf_offset;
     wire [7:0] spi_write_buf_val;
-    
-    wire log_strobe;
-    wire [7:0] log_val;
     
     // Structured logging signals (SPI clock domain)
     wire log_cmd_valid;
@@ -284,8 +285,8 @@ module top(
         .ram_read_valid_a(sdram_read_valid_a),
         .ram_read_valid_b(sdram_read_valid_b),
         .ram_read_busy(sdram_read_busy),
-        .prefetch_underrun(),
-        .prefetch_thin(),
+        .prefetch_underrun(prefetch_underrun),
+        .prefetch_thin(prefetch_thin),
         
         .write_cmd(spi_write_cmd),
         .write_type(spi_write_type),
@@ -303,9 +304,6 @@ module top(
         
         .sfdp_raddr(sfdp_raddr),
         .sfdp_rdata(sfdp_rdata),
-        
-        .log_strobe(log_strobe),
-        .log_val(log_val),
         
         .log_cmd_valid(log_cmd_valid),
         .log_cmd_opcode(log_cmd_opcode),
@@ -593,9 +591,6 @@ module top(
         .spi_write_buf_offset(spi_write_buf_offset),
         .spi_write_buf_val(spi_write_buf_val),
         
-        .log_strobe(log_strobe),
-        .log_val(log_val),
-        
         .cfg_jedec_id(cfg_jedec_id),
         .cfg_4byte(cfg_4byte),
         .cfg_chip_erase_bursts(cfg_chip_erase_bursts),
@@ -617,6 +612,9 @@ module top(
         .log_addr_valid_sync(log_addr_valid_pulse_sys),
         .log_addr_sync(log_addr_out[23:0]),
         .spi_active_sync(spi_active_sys[1]),
+
+        .prefetch_underrun(prefetch_underrun),
+        .prefetch_thin(prefetch_thin),
 
         .redirect_active(redirect_active),
         .redirect_mask(redirect_mask),

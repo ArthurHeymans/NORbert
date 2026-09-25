@@ -9,7 +9,7 @@
 
 use zerocopy::{Immutable, IntoBytes};
 
-pub const PROTOCOL_VERSION: u8 = 5;
+pub const PROTOCOL_VERSION: u8 = 6;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 3;
 
 pub const fn is_supported_protocol_version(version: u8) -> bool {
@@ -30,6 +30,11 @@ pub const fn supports_activity_log(version: u8) -> bool {
 
 pub const fn supports_toctou(version: u8) -> bool {
     version >= 5
+}
+
+/// Version 6 added the SDRAM prefetch fault flags.
+pub const fn supports_prefetch_diagnostics(version: u8) -> bool {
+    version >= 6
 }
 
 /// Convert a flash capacity to the FPGA's combined erase-count/address-mask
@@ -59,6 +64,11 @@ pub const CMD_HOLDCTL: u8 = 0x37;
 pub const CMD_LOGCTL: u8 = 0x38;
 pub const CMD_TOCTOU: u8 = 0x39;
 pub const CMD_LOGPOLL: u8 = 0x3A;
+pub const CMD_PREFETCH: u8 = 0x3B;
+
+pub const PREFETCH_UNDERRUN: u8 = 0x01;
+pub const PREFETCH_THIN: u8 = 0x02;
+pub const PREFETCH_VALID: u8 = 0x80;
 
 pub const LOG_POLL_TERMINATOR: u8 = 0xA0;
 pub const LOG_POLL_ESCAPE: u8 = 0xA5;
@@ -174,6 +184,33 @@ impl ControlRequest {
             command: CMD_TOCTOU,
             value: TOCTOU_RESET_ALL,
         }
+    }
+}
+
+/// Outcome of a `CMD_PREFETCH` read. The FPGA clears both flags when it
+/// answers, so a fault is reported to exactly one reader.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PrefetchFaults {
+    /// A burst the SPI side shifted out was never filled in time: the data
+    /// it returned was stale or invalid.
+    pub underrun: bool,
+    /// The next burst had not landed when the first byte was needed. Not
+    /// necessarily corruption, but the margin was gone.
+    pub thin: bool,
+}
+
+impl PrefetchFaults {
+    /// Decode the fault bits after the device has validated the reply marker.
+    pub fn from_reply(reply: u8) -> Self {
+        Self {
+            underrun: reply & PREFETCH_UNDERRUN != 0,
+            thin: reply & PREFETCH_THIN != 0,
+        }
+    }
+
+    /// Whether either flag was set.
+    pub const fn any(&self) -> bool {
+        self.underrun || self.thin
     }
 }
 
@@ -296,6 +333,23 @@ mod tests {
         assert!(supports_activity_log(5));
         assert!(!supports_toctou(4));
         assert!(supports_toctou(5));
+        assert!(!supports_prefetch_diagnostics(5));
+        assert!(supports_prefetch_diagnostics(6));
+    }
+
+    #[test]
+    fn prefetch_replies_decode_to_the_documented_bits() {
+        assert_eq!(
+            PrefetchFaults::from_reply(PREFETCH_VALID),
+            PrefetchFaults::default()
+        );
+        assert!(!PrefetchFaults::from_reply(PREFETCH_VALID).any());
+        assert!(PrefetchFaults::from_reply(PREFETCH_VALID | PREFETCH_UNDERRUN).underrun);
+        assert!(!PrefetchFaults::from_reply(PREFETCH_VALID | PREFETCH_UNDERRUN).thin);
+        assert!(!PrefetchFaults::from_reply(PREFETCH_VALID | PREFETCH_THIN).underrun);
+        assert!(PrefetchFaults::from_reply(PREFETCH_VALID | PREFETCH_THIN).thin);
+        let both = PrefetchFaults::from_reply(PREFETCH_VALID | PREFETCH_UNDERRUN | PREFETCH_THIN);
+        assert!(both.underrun && both.thin && both.any());
     }
 
     #[test]

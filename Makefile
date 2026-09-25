@@ -55,21 +55,27 @@ lint-yosys:
 		-e ".*" \
 		-p "read_verilog -lib $(GOWIN_CELLS); read_verilog -Isrc $(VERILOG_FILES); synth_gowin -family gw5a -top top -noflatten; check"
 
+# Width warnings are on deliberately: the address arithmetic here is 23-bit
+# burst addresses wrapped by a mask, so a silent truncation is the most
+# likely class of bug. Where Verilog-2001 has no cast to size a parameter
+# expression, the site carries a lint_off with the reason inline.
 lint-verilator:
 	verilator --lint-only --top-module top -Isrc \
 		-Wno-CASEINCOMPLETE -Wno-DEFPARAM -Wno-PINMISSING \
-		-Wno-WIDTHTRUNC -Wno-WIDTHEXPAND \
 		$(GOWIN_CELLS) $(VERILOG_FILES)
 
 # Behavioral tests use a clock-only PLL stub, not proprietary primitives.
 # Keep generated C++ and binaries outside the working tree.
+#
+# Width warnings are not suppressed here either: the testbenches must see
+# the same width discipline as the lint build, so a testbench cannot hide a
+# width bug in the RTL it is exercising.
 test:
 	@set -eu; build=$$(mktemp -d); trap 'rm -rf "$$build"' EXIT; \
-	for test in spi_flash sdram_controller toctou quad_fast; do \
+	for test in spi_flash sdram_controller toctou quad_fast fifo logger uart ft245; do \
 		echo "Testing $$test"; \
 		verilator --binary --timing -j 2 --top-module $${test}_tb -Isrc \
 			-Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD \
-			-Wno-WIDTHTRUNC -Wno-WIDTHEXPAND \
 			--Mdir "$$build/$$test" tests/$${test}_tb.sv tests/pll_stub.v \
 			$(filter-out src/pll.v,$(VERILOG_FILES)) >"$$build/$$test.log" 2>&1 \
 			|| { cat "$$build/$$test.log"; exit 1; }; \
@@ -112,7 +118,7 @@ help:
 	@echo "  make prog    - Program FPGA (volatile)"
 	@echo "  make flash   - Program to flash (persistent)"
 	@echo "  make lint    - Check Verilog with Yosys and Verilator"
-	@echo "  make test    - Simulate SPI, SDRAM coordination, and TOCTOU"
+	@echo "  make test    - Simulate SPI, SDRAM, TOCTOU, FIFO, logger, UART and FT245"
 	@echo "  make tool    - Build spi-flash-tool (ftdi-nusb backend, default)"
 	@echo "  make webui  - Build the WebUSB/Web Serial browser UI"
 	@echo "  make webui-serve - Build and serve the UI at http://localhost:8081"

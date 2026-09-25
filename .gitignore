@@ -1,3 +1,17 @@
+# Build outputs
 impl/
-tool/target/
 dist/
+tool/target/
+
+# Tool caches
+.direnv/
+
+# Scratch space for local notes and one-off scripts
+.local/
+
+# Editor/agent tooling
+.pi-lens/
+.pi-subagents/
+
+# KiCad autosave copies (the design itself lives in the NORbert-pcb repo)
+pcb/.history/

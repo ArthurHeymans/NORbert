@@ -56,6 +56,14 @@ openFPGALoader -b tangprimer25k spi_flash.fs
 openFPGALoader -b tangprimer25k -f spi_flash.fs
 ```
 
+Each release carries one bitstream, named `spi_flash.fs` so that the
+`releases/latest/download/...` link in the web UI keeps working across
+releases, plus a `SHA256SUMS` file to check it against:
+
+```sh
+sha256sum --check SHA256SUMS
+```
+
 Release tags exactly match the Rust package version (for example, tag `0.1.0`
 uses `version = "0.1.0"` in `tool/Cargo.toml`). The release workflow rejects a
 mismatch.
@@ -92,11 +100,19 @@ make flash                  # program to flash (persistent)
 
 ```sh
 make lint                   # Yosys synthesis checks and Verilator lint
-make test                   # SPI, SDRAM coordination and TOCTOU simulations
+make test                   # SPI, SDRAM, TOCTOU, FIFO, logger, UART, FT245
 ```
 
 The tests cover SFDP startup/reconfiguration, page-program and AAI semantics,
-program latency/refresh, and accepted SDRAM addresses during redirected reads.
+program latency/refresh, accepted SDRAM addresses during redirected reads, and
+three- versus four-byte addressing: every four-byte read command at all start
+offsets, the 0xB7/0xE9 address-mode pair, the four-byte program and erase
+forms, and a chip that ignores the mode commands entirely.
+The transport and buffer blocks are covered by their own benches: the FIFO
+against a queue model (`tests/fifo_tb.sv`), the logger's byte stream against
+the format the host decoder expects (`tests/logger_tb.sv`), the UART over all
+256 byte values in both transmitter configurations (`tests/uart_tb.sv`), and
+the FT245 handshake against a time-accurate FT2232H model (`tests/ft245_tb.sv`).
 They use a burst-level memory model or a clock-only PLL stub; they do not replace
 Gowin timing analysis or hardware validation of SDRAM pin timing.
 
@@ -201,6 +217,9 @@ Load a firmware image into NORbert's SDRAM, then let your target SPI master read
 spi-flash-tool version
 spi-flash-tool status       # running | stopped
 
+# Check whether the SPI fast read path ever fell behind (clears the flags)
+spi-flash-tool prefetch
+
 # Load a firmware image (auto stops + starts emulation around the load)
 spi-flash-tool load firmware.bin
 
@@ -251,6 +270,14 @@ TXN#   COMMAND            ADDRESS    INFO
 ```
 
 The monitor also tracks double-reads of the same (opcode, address) pair and flags them as TOCTOU candidates. Press Ctrl+C to stop. The underlying protocol is a poll-based ring-buffer drain (`CMD_LOGPOLL` = 0x3A); packet types are `0xA1` (command), `0xA2` (address), `0xA3` (end + byte count) and `0xA4` (TOCTOU trap fired), with `0xA0` as the per-poll terminator. Log bytes equal to `0xA0` or `0xA5` are sent as `0xA5 0x00` and `0xA5 0x05`.
+
+The ring holds 503 bytes (512 entries less FIFO headroom), with one event
+pending per packet type behind it. A host that polls slower than the target
+reads will therefore see gaps: the FPGA drops the events it has no pending
+slot for rather than overwriting the ring, so a transaction can lose some of
+its packets (its address, say) and keep others. Packets that do arrive are
+always whole and in order, never torn, corrupted or reordered.
+`tests/logger_tb.sv` checks both the loss and the integrity.
 
 ### TOCTOU traps
 
@@ -334,8 +361,8 @@ not replace that.
 | 0x6B Quad Output | 1-1-4 | 70 MHz | 8 dummy clocks |
 | 0xEB Quad I/O | 1-4-4 | 50 MHz | 6 mode clocks; offset 7 flags thin |
 
-Known corners (all loudly flagged by `prefetch_underrun` / `prefetch_thin`,
-never silent):
+Known corners (all flagged by the FPGA's prefetch fault flags -- see
+`spi-flash-tool prefetch` below, never silent):
 
 - **Quad-I/O reads starting at offset 7 above 50 MHz** need the second burst
   ~30 ns before a single SDRAM controller can physically produce it. Use
@@ -348,17 +375,42 @@ If you need more: the levers are open-row (skip re-ACTIVATE on same-row
 bursts, saves ~2 sysclks per burst) and master-configured extra dummy clocks
 for 0xEB/0xBB, not a faster SDRAM clock.
 
+### Checking the prefetch path
+
+The corners above are detected in the FPGA, not just in simulation. Run a
+target read, then ask the FPGA what happened:
+
+```sh
+spi-flash-tool prefetch
+```
+
+The flags are latched in the FPGA and cleared by the read that reports them,
+so the check covers everything since the previous one:
+
+- **underrun** (`0x01`) -- a burst was shifted out of the SPI data path
+  before the SDRAM controller filled it. The target read stale bytes. This
+  is a correctness failure, not a margin warning.
+- **thin margin** (`0x02`) -- the next burst had not landed when its first
+  byte was needed. Not necessarily corruption, but the margin is gone and a
+  slightly longer SDRAM access would turn it into an underrun.
+
+The command is safe to run while the target is reading, and the web UI has
+the same check as **Check prefetch** on the Device panel. An underrun means
+the frequency, start offset or SDRAM latency of that read is outside the
+supported envelope in the table above -- the data the target received cannot
+be trusted.
+
 ## Project structure
 
 ```text
 src/
   top.v        Top-level module, clock/reset, bus wiring, TOCTOU address mux
   spi_trx.v    SPI flash transceiver (command decoder + data path)
-  spi_prefetch.v  SDRAM burst requests and ping-pong buffer selection for SPI reads
+  spi_prefetch.v  SDRAM burst requests, ping-pong buffer selection and the prefetch fault flags
   sdram.v      Dual-chip SDRAM controller, byte-serial bursts, ping-pong prefetch
   spi_flash_cmds.vh  Emulated SPI flash opcodes and read wait states
   host_protocol.vh   Host serial protocol opcodes and log packet types
-  glue.v       Protocol handler, UART/FT245 I/O, SPI write engine, TOCTOU trap engine, LOGPOLL state machine, LED control
+  glue.v       Protocol handler, UART/FT245 I/O, SPI write engine, TOCTOU trap engine, LOGPOLL state machine, prefetch fault latch, LED control
   logger.v     SPI event capture into a 512-byte ring FIFO drained by CMD_LOGPOLL
   uart.v       UART TX/RX (2 Mbaud)
   ft245.v      FT2232H async 245 FIFO interface
@@ -380,9 +432,14 @@ All opcodes reply with a single `0x01` ACK unless otherwise noted. The FPGA
 accepts command bytes from whichever port (UART or FT245) first delivers one
 while the parser is idle, and routes the response back to the same port.
 
+`VERSION` reports the protocol version, currently 6. The host tool talks to
+any version from 3 up to its own and enables commands by version, but it
+refuses a newer bitstream rather than guess at its protocol: a version 6
+bitstream needs a tool from the same release or later.
+
 | Opcode | Name       | Args                                                | Reply                            |
 |--------|------------|-----------------------------------------------------|----------------------------------|
-| `0x30` | VERSION    | none                                                | 1 byte (current: `0x05`)         |
+| `0x30` | VERSION    | none                                                | 1 byte (current: `0x06`)         |
 | `0x31` | RAMREAD    | 3-byte burst addr + 2-byte burst count              | `count*8` data bytes             |
 | `0x32` | RAMWRITE   | 3-byte burst addr + 2-byte burst count + data       | `0x01`                           |
 | `0x33` | CHIPCONFIG | JEDEC(3) + flags + erase_bursts(3) + sfdp_len + sfdp| `0x01`                           |
@@ -393,6 +450,15 @@ while the parser is idle, and routes the response back to the same port.
 | `0x38` | LOGCTL     | 1 byte: `0x01` start capture, `0x00` stop capture   | `0x01`                           |
 | `0x39` | TOCTOU     | sub-command + args (see below)                      | `0x01`                           |
 | `0x3A` | LOGPOLL    | none                                                | log bytes terminated by `0xA0`   |
+| `0x3B` | PREFETCH   | none                                                | 1 byte: `0x80` valid + `0x01` underrun + `0x02` thin |
+
+A clean PREFETCH reply is `0x80` (not `0x00`, which the host discards as
+transport noise); `0x81`, `0x82` and `0x83` report faults. PREFETCH is a
+single byte with no argument, like STATUS: over FT245 the FPGA only takes
+the always-safe opcodes while the target holds CS low, so a stray argument
+byte would block every command queued behind it. It is safe to issue in any
+emulation state, and reading it clears the flags it reports, so a fault is
+reported to exactly one reader.
 
 TOCTOU sub-commands (all prefixed with opcode `0x39`):
 

@@ -45,13 +45,19 @@ jobs:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          # One bitstream per release. The name has to stay spi_flash.fs:
+          # the web UI links to releases/latest/download/spi_flash.fs, and
+          # releases/latest only resolves a literal asset name, not a
+          # versioned one. The release title carries the version.
           cp impl/pnr/spi_flash.fs spi_flash.fs
-          cp impl/pnr/spi_flash.fs "norbert-${TAG_NAME}-tangprimer25k.fs"
-          sha256sum spi_flash.fs "norbert-${TAG_NAME}-tangprimer25k.fs" > SHA256SUMS
+          sha256sum spi_flash.fs > SHA256SUMS
+          web_url=https://arthurheymans.github.io/NORbert/
+          wiring_url=https://github.com/ArthurHeymans/NORbert#browser-jtag-wiring
           cat > release-notes.md <<EOF
           ## Programming the Tang Primer 25K
 
-          Download \`spi_flash.fs\` (or the versioned copy) and program it with [openFPGALoader](https://github.com/trabucayre/openFPGALoader):
+          Download \`spi_flash.fs\` and program it with
+          [openFPGALoader](https://github.com/trabucayre/openFPGALoader):
 
           \`\`\`sh
           # Volatile: runs immediately, lost on power-off
@@ -61,7 +67,15 @@ jobs:
           openFPGALoader -b tangprimer25k -f spi_flash.fs
           \`\`\`
 
-          You can also open the [NORbert Web UI](https://arthurheymans.github.io/NORbert/), choose **Bitstream**, select the downloaded \`.fs\` file, and program SRAM or flash through WebUSB. This path requires an external FT2232H connected to the Dock's external-JTAG header; see the [browser JTAG wiring guide](https://github.com/ArthurHeymans/NORbert#browser-jtag-wiring). Chromium and an HTTPS/localhost page are required.
+          Check the download against the attached \`SHA256SUMS\`:
+          \`sha256sum --check SHA256SUMS\`.
+
+          You can also open the [NORbert Web UI](${web_url}), choose
+          **Bitstream**, select the downloaded \`.fs\` file, and program SRAM
+          or flash through WebUSB. This path requires an external FT2232H
+          connected to the Dock's external-JTAG header; see the
+          [browser JTAG wiring guide](${wiring_url}). Chromium and an
+          HTTPS/localhost page are required.
 
           The release tag and Rust package version are both \`${TAG_NAME}\`.
           EOF
@@ -75,5 +89,4 @@ jobs:
             --title "NORbert $TAG_NAME" \
             --notes-file release-notes.md \
             spi_flash.fs \
-            "norbert-${TAG_NAME}-tangprimer25k.fs" \
             SHA256SUMS

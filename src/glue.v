@@ -65,8 +65,6 @@ module glue(
     input wire [7:0] spi_write_buf_offset,
     input wire [7:0] spi_write_buf_val,
     
-    input wire log_strobe,
-    input wire [7:0] log_val,
     
     // Chip configuration outputs (from CHIPCONFIG command)
     output reg [23:0] cfg_jedec_id,
@@ -104,6 +102,12 @@ module glue(
     input wire log_addr_valid_sync, // Pulse: address phase complete (system clock)
     input wire [23:0] log_addr_sync,// Flash byte address (latched when valid)
     input wire spi_active_sync,     // SPI CS active (synchronized)
+
+    // SDRAM prefetch diagnostics (spi_prefetch, SPI clock domain). These
+    // are per-transaction flags, cleared at the next transaction's first
+    // clock; glue latches them so a host read still sees them afterwards.
+    input wire prefetch_underrun,
+    input wire prefetch_thin,
 
     // TOCTOU redirect outputs (directly to address mux in top.v)
     output reg redirect_active,
@@ -165,18 +169,43 @@ module glue(
     reg write_strobe;
     reg write_strobe_r;  // delayed copy for rising-edge detection
     
-    reg [1:0] log_strobe_buf;
-    always @(posedge clk) log_strobe_buf <= {log_strobe_buf[0], log_strobe};
-    reg log_ack;
     
     reg [1:0] spi_csel_buf;
+
+    // -----------------------------------------------------------
+    // SDRAM prefetch fault latch
+    //
+    // spi_prefetch's flags live in the SPI clock domain and stay high until
+    // the next transaction. Synchronize them, then latch each rising edge:
+    // latching levels would re-report the same fault after a host read while
+    // the SPI transaction (or the gap before the next one) is still active.
+    // An address phase leaves plenty of clocks with the flags low before a
+    // subsequent transaction can raise them again.
+    //
+    // The synchronizer and edge history keep tracking through reset: a flag
+    // still high from before a reset is then an old level, not a new edge,
+    // so reset clears a latched fault without it coming straight back.
+    // -----------------------------------------------------------
+    reg [1:0] prefetch_faults;
+    reg [1:0] prefetch_faults_sync1 = 2'b00;
+    reg [1:0] prefetch_faults_sync2 = 2'b00;
+    reg [1:0] prefetch_faults_prev = 2'b00;
+    wire [1:0] prefetch_faults_event = prefetch_faults_sync2 & ~prefetch_faults_prev;
+    wire [1:0] prefetch_faults_now = prefetch_faults | prefetch_faults_event;
+
+    always @(posedge clk) begin
+        prefetch_faults_sync1 <= {prefetch_thin, prefetch_underrun};
+        prefetch_faults_sync2 <= prefetch_faults_sync1;
+        prefetch_faults_prev <= prefetch_faults_sync2;
+    end
     
     // Active port selection: 0 = UART, 1 = FT245
     // Latched when a command byte arrives while idle.
     reg active_port;
 
     wire cmd_idle = (cmd == CMD_NOP) && (in_count == 0) &&
-                    !read_state && !write_state && (log_poll_state == 0);
+                    (read_state == 3'd0) && (write_state == 3'd0) &&
+                    (log_poll_state == 0);
     wire mux_txd_ready = active_port ? ft_txd_ready : txd_ready;
 
     // Serial handler gate: only consume FIFO bytes when SPI is inactive.
@@ -188,9 +217,11 @@ module glue(
     wire serial_gate = (spi_reset || spi_csel_buf[1]) && !spi_writing;
 
     // Always-safe command bypass: when the parser is idle and the next
-    // byte waiting in the FT245 RX FIFO is a VERSION/START/STOP/STATUS
-    // opcode, pop it even if serial_gate is closed (SPI master mid-
-    // transaction).  These commands do not touch SDRAM or spi_trx state
+    // byte waiting in the FT245 RX FIFO is an argument-free
+    // VERSION/START/STOP/STATUS/PREFETCH/LOGPOLL opcode, pop it even if
+    // serial_gate is closed (SPI master mid-transaction).  Any argument
+    // byte would stay stuck here until CS rises, so only argument-free
+    // commands qualify.  These commands do not touch SDRAM or spi_trx state
     // and are handled in a separate dispatcher below, so letting them
     // through while SPI is live is safe and guarantees the host can
     // always reach the FPGA.
@@ -199,6 +230,7 @@ module glue(
                                 (ft_rx_data == CMD_START)   ||
                                 (ft_rx_data == CMD_STOP)    ||
                                 (ft_rx_data == CMD_STATUS)  ||
+                                (ft_rx_data == CMD_PREFETCH) ||
                                 (ft_rx_data == CMD_LOGPOLL));
 
     // Hold flag: prevent double-consume from FIFO.  Set for 1 cycle
@@ -357,7 +389,7 @@ module glue(
             ft_txd_data <= 0;
             
             led <= 0;
-            log_ack <= 0;
+            prefetch_faults <= 2'b00;
             
             spi_writing <= 0;
             spi_write_ack <= 0;
@@ -456,7 +488,7 @@ module glue(
             // Normally we only pop when the serial handler gate is open,
             // preventing byte loss during SPI CS noise or spi_writing.
             // However, if the byte at the head of the FIFO is an always-
-            // safe command (VERSION/START/STOP/STATUS) AND the parser is
+            // safe command (see peek_is_always_safe) AND the parser is
             // idle, pop it anyway -- the always-safe dispatcher below can
             // handle it without touching SDRAM or spi_trx state.  This is
             // what lets the host issue STOP while SPI is actively being
@@ -522,7 +554,7 @@ module glue(
             // get continuous mirroring as before.
             write_strobe_r <= write_strobe;
             if ((write_strobe && !write_strobe_r) ||
-                (!write_strobe && !write_state))
+                (!write_strobe && (write_state == 3'd0)))
                 sdram_write_buffer <= write_buffer;
             
             // Inhibit SDRAM refresh while a serial-path operation is active.
@@ -538,7 +570,7 @@ module glue(
                                                      i_spi_write_state == 4'd6 || i_spi_write_state == 4'd7 ||
                                                      i_spi_write_state == 4'd8));
     
-            if (sdram_access_cmd)
+            if (sdram_access_cmd != 2'b00)
                 sdram_access_cmd <= 0;
                 
             spi_csel_buf <= {spi_csel_buf[0], spi_csel};
@@ -552,12 +584,10 @@ module glue(
             led[2] <= hold_out;                         // Target flash held
             led[0] <= heartbeat[25];                    // Heartbeat ~2Hz at 132MHz
             
-            // Legacy single-byte log_strobe/log_val path is superseded
-            // by the structured logger + CMD_LOGPOLL flow.  The acknowledge
-            // register is still shadowed so the input does not synthesize
-            // into a dangling always-block, but no bytes are forwarded.
-            if (!log_strobe_buf[1]) log_ack <= 0;
-            
+            // Sticky before the dispatcher below, so that CMD_PREFETCH's
+            // clear is the last assignment and wins for that cycle.
+            prefetch_faults <= prefetch_faults_now;
+
             // -------------------------------------------------------
             // TOCTOU trap check: on address phase completion, compare
             // against all 4 trap entries. All matches trigger; the highest
@@ -588,10 +618,16 @@ module glue(
                         else begin
                             // Second+ access: activate redirect
                             redirect_active <= 1;
-                            redirect_mask <= trap_mask[i][23:3];
+                            // The redirect is applied to the 23-bit burst
+                            // address, so the byte-granular mask and
+                            // replacement base enter it >>3. The low three
+                            // byte bits are not expressible: an SDRAM burst
+                            // is 8 bytes, so a match finer than that cannot
+                            // be redirected to a different offset.
+                            redirect_mask <= {2'b00, trap_mask[i][23:3]};
                             // Compute replacement burst addr via bitwise mux:
                             // new_burst = (replace & mask) | (original & ~mask)
-                            redirect_base <= trap_replace[i][23:3];
+                            redirect_base <= {2'b00, trap_replace[i][23:3]};
                             
                             trap_notify_strobe <= 1;
                             trap_notify_index  <= i[1:0];
@@ -762,7 +798,8 @@ module glue(
             // Exclude active read/write operations: during reads the
             // host sends nothing (waiting for response data), so the
             // idle counter would fire and kill the transfer.
-            if (in_count != 0 && !rxd_strobe_buf && !read_state && !write_state) begin
+            if (in_count != 0 && !rxd_strobe_buf &&
+                (read_state == 3'd0) && (write_state == 3'd0)) begin
                 serial_idle_count <= serial_idle_count + 1;
                 if (serial_idle_count[16]) begin
                     in_count <= 0;
@@ -776,7 +813,8 @@ module glue(
             // -----------------------------------------------------------
             // Always-safe command dispatcher.
             //
-            // Handles VERSION/START/STOP/STATUS regardless of SPI state.
+            // Handles VERSION/START/STOP/STATUS/PREFETCH and starts
+            // LOGPOLL regardless of SPI state.
             // None of these touch SDRAM, chip configuration, or spi_trx
             // state, so processing them while SPI emulation is live is
             // safe -- and is exactly what lets the host recover control
@@ -812,6 +850,17 @@ module glue(
                     // tool's transparent 0x00 skipping still work around
                     // the FT2232H's occasional leaked modem-status bytes.
                     txd_data_buf <= spi_running ? 8'h01 : 8'h02;
+                end
+                CMD_PREFETCH: begin
+                    // Reports and clears the latched flags, so a host can
+                    // tell whether the fast read path ever came up short
+                    // while the target was reading. Safe to issue at any
+                    // time: it touches neither SDRAM nor spi_trx.
+                    txd_strobe_buf <= 1;
+                    // read_ack skips 0x00 and 0xFF as transport noise;
+                    // include a marker even when neither fault is set.
+                    txd_data_buf <= PREFETCH_VALID | {6'd0, prefetch_faults_now};
+                    prefetch_faults <= 2'b00;
                 end
                 CMD_LOGPOLL: begin
                     // LOGPOLL: no argument bytes.  Enter drain state
@@ -894,7 +943,7 @@ module glue(
                     serial_idle_count <= 0;
 
                     if (in_count == 0) begin
-                        // VERSION/START/STOP/STATUS are handled above.
+                        // The always-safe opcodes are handled above.
                         // HOLDCTL/LOGCTL/TOCTOU only flip flags/GPIO and
                         // do not touch SDRAM or spi_trx state, so they
                         // are safe to accept in either spi_running state.
@@ -1139,7 +1188,7 @@ module glue(
                     if (write_strobe && !sdram_busy)
                         write_state <= 1;
 
-                    if (read_state) begin
+                    if (read_state != 3'd0) begin
                         if ((read_state == 1) && !sdram_busy) begin
                             // Activate
                             sdram_access_cmd <= 2'b11;
@@ -1171,7 +1220,7 @@ module glue(
                                 read_pos <= read_pos + 1;
                         end
                     end
-                    else if (write_state) begin
+                    else if (write_state != 3'd0) begin
                         if ((write_state == 1) && !sdram_busy) begin
                             // Activate
                             sdram_access_cmd <= 2'b11;

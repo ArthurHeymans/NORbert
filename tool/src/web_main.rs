@@ -3,11 +3,11 @@
 use egui::Color32;
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Function, Uint8Array};
-use spi_flash_tool::WebFlashDevice;
 use spi_flash_tool::chip::{FlashChip, FlashChipExt};
 use spi_flash_tool::gowin::{self, FlashOptions, ProgramProgress};
 use spi_flash_tool::sfdp::generate_sfdp;
 use spi_flash_tool::spi_log::{ActivityLog, HEADER};
+use spi_flash_tool::{PrefetchFaults, WebFlashDevice};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -44,7 +44,9 @@ struct SharedState {
     running: Option<bool>,
     emulation_control: bool,
     activity_log: bool,
+    prefetch_diagnostics: bool,
     hold_enabled: Option<bool>,
+    prefetch_faults: Option<PrefetchFaults>,
     status: String,
     status_error: bool,
     pending_file: Option<(String, File)>,
@@ -66,7 +68,9 @@ impl Default for SharedState {
             running: None,
             emulation_control: false,
             activity_log: false,
+            prefetch_diagnostics: false,
             hold_enabled: None,
+            prefetch_faults: None,
             status: "Choose a transport to connect to NORbert".to_owned(),
             status_error: false,
             pending_file: None,
@@ -179,6 +183,7 @@ impl NorbertWebApp {
                         let version = device.get_version().await?;
                         let emulation_control = device.supports_emulation_control().await?;
                         let activity_log = device.supports_activity_log().await?;
+                        let prefetch_diagnostics = device.supports_prefetch_diagnostics().await?;
                         let running = if emulation_control {
                             Some(device.status().await?)
                         } else {
@@ -188,20 +193,29 @@ impl NorbertWebApp {
                             version,
                             emulation_control,
                             activity_log,
+                            prefetch_diagnostics,
                             running,
                         ))
                     }
                     .await;
 
                     match details {
-                        Ok((version, emulation_control, activity_log, running)) => {
+                        Ok((
+                            version,
+                            emulation_control,
+                            activity_log,
+                            prefetch_diagnostics,
+                            running,
+                        )) => {
                             let mut shared = state.borrow_mut();
                             shared.device = Some(device);
                             shared.connection = ConnectionState::Connected;
                             shared.version = Some(version);
                             shared.emulation_control = emulation_control;
                             shared.activity_log = activity_log;
+                            shared.prefetch_diagnostics = prefetch_diagnostics;
                             shared.running = running;
+                            shared.prefetch_faults = None;
                             shared.status = "Connected successfully".to_owned();
                             shared.status_error = false;
                         }
@@ -251,7 +265,9 @@ impl NorbertWebApp {
             shared.running = None;
             shared.emulation_control = false;
             shared.activity_log = false;
+            shared.prefetch_diagnostics = false;
             shared.hold_enabled = None;
+            shared.prefetch_faults = None;
             shared.configured_chip = None;
             shared.connection = ConnectionState::Disconnected;
             match result {
@@ -678,6 +694,51 @@ impl NorbertWebApp {
         });
     }
 
+    /// Read and clear the sticky SDRAM prefetch fault flags, so the panel
+    /// can say whether the fast read path kept up during the last run.
+    fn check_prefetch(&self, ctx: &egui::Context) {
+        let state = self.state.clone();
+        let repaint = ctx.clone();
+        {
+            let mut shared = state.borrow_mut();
+            shared.busy = true;
+            shared.prefetch_faults = None;
+            shared.status = "Checking SDRAM prefetch...".to_owned();
+            shared.status_error = false;
+        }
+        spawn_local(async move {
+            let mut device = state.borrow_mut().device.take();
+            let result = match device.as_mut() {
+                Some(device) => device.prefetch_faults().await,
+                None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
+            };
+            let mut shared = state.borrow_mut();
+            shared.device = device;
+            shared.busy = false;
+            match result {
+                Ok(faults) => {
+                    shared.status = if faults.underrun && faults.thin {
+                        "SDRAM prefetch: UNDERRUN and thin margin - the target read stale data"
+                    } else if faults.underrun {
+                        "SDRAM prefetch: UNDERRUN - a burst was shifted out before it filled, so the target read stale data"
+                    } else if faults.thin {
+                        "SDRAM prefetch: thin margin - a burst had not landed when its first byte was needed"
+                    } else {
+                        "SDRAM prefetch: no faults"
+                    }
+                    .to_owned();
+                    shared.status_error = faults.underrun;
+                    shared.prefetch_faults = Some(faults);
+                }
+                Err(error) => set_error(
+                    &mut shared,
+                    format!("Prefetch check failed: {}", js_error(error)),
+                ),
+            }
+            repaint.request_repaint();
+        });
+    }
+
     fn start_monitor(&self, ctx: &egui::Context) {
         let state = self.state.clone();
         let repaint = ctx.clone();
@@ -886,6 +947,8 @@ impl NorbertWebApp {
         let version = state.version;
         let running = state.running;
         let emulation_control = state.emulation_control;
+        let prefetch_diagnostics = state.prefetch_diagnostics;
+        let prefetch_faults = state.prefetch_faults;
         let configured_chip = state.configured_chip.clone();
         drop(state);
 
@@ -958,7 +1021,43 @@ impl NorbertWebApp {
                         |chip| format!("{} {}", chip.vendor, chip.name),
                     ));
                     ui.end_row();
+                    ui.label("SDRAM prefetch:");
+                    match prefetch_faults {
+                        _ if !prefetch_diagnostics => {
+                            ui.label("Unavailable (requires protocol 6)");
+                        }
+                        None => {
+                            ui.label("Not checked");
+                        }
+                        Some(faults) if faults.underrun => {
+                            let message = if faults.thin {
+                                "UNDERRUN + thin margin: stale data served"
+                            } else {
+                                "UNDERRUN: stale data served"
+                            };
+                            ui.label(egui::RichText::new(message).color(Color32::RED));
+                        }
+                        Some(faults) if faults.thin => {
+                            ui.label(egui::RichText::new("Thin margin").color(Color32::YELLOW));
+                        }
+                        Some(_) => {
+                            ui.label(egui::RichText::new("No faults").color(Color32::GREEN));
+                        }
+                    }
+                    ui.end_row();
                 });
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!busy && prefetch_diagnostics, egui::Button::new("Check prefetch"))
+                    .clicked()
+                {
+                    self.check_prefetch(ctx);
+                }
+                ui.label(
+                    "Reports and clears the FPGA's SDRAM prefetch fault flags. Run it after a target read to confirm the data it received was not served from a burst that had not landed in time.",
+                );
+            });
 
             ui.add_space(16.0);
             ui.separator();

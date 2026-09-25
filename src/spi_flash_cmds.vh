@@ -38,8 +38,10 @@ localparam
     CMD_AAI_WORD        = 8'hAD,  // AAI Word Program (SST)
     CMD_4BYTEDISABLE    = 8'hE9,
     CMD_QUADIOREAD      = 8'hEB,  // Quad I/O Read (1-4-4)
-    CMD_QUADIOREAD_4B   = 8'hEC,  // Quad I/O Read with 4-byte address
-    CMD_LOG             = 8'hF2;
+    CMD_QUADIOREAD_4B   = 8'hEC;  // Quad I/O Read with 4-byte address
+
+// 0xF2 is not a NOR flash command. It used to be an internal logging hook
+// with no consumer left; unlisted opcodes are ignored by the decoder.
 
 // Wait states between the address and the first data clock of fast reads,
 // in SPI clocks. spi_prefetch's lookahead post points (dummy_count 5, mode

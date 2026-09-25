@@ -45,7 +45,6 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         0xE9 => "4BYTE_DISABLE",
         0xEB => "QUAD_IO_READ",
         0xEC => "QUAD_IO_READ_4B",
-        0xF2 => "LOG",
         _ => "UNKNOWN",
     }
 }
