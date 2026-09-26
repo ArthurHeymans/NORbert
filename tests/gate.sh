@@ -30,7 +30,7 @@ synth() {
     # Yosys treats newlines in -p as command separators.
     yosys -q -l "$build/$tb.$mod.log" -p "read_verilog -Isrc $RTL $extra; \
         $chparam hierarchy -top $mod; $keep \
-        synth_gowin -family gw5a -nolutram -noflatten $pads -top $mod; \
+        synth_gowin -family gw5a -nolutram -nowidelut -noflatten $pads -top $mod; \
         write_verilog -noattr $build/$tb.$mod.v" >/dev/null
 }
 

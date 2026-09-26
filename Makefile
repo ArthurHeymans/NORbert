@@ -54,6 +54,8 @@ $(BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) tangprimer25k.sdc 
 
 # Open-source build. -nolutram because Apicula does not support GW5A-25A
 # shadow SRAM (RAM16SDP4) yet; small memories go to BSRAM or flip-flops.
+# -nowidelut because synth_gowin counts a LUT5-LUT8 as one LUT4, while
+# it takes 2-16 of them: plain LUT4s save 13% of the LUTs and are faster.
 # The dual-purpose pins are released as GPIO like in build.tcl: without
 # i2c_as_gpio, IO_sdram_dq[12] on the I2C SDA pin always reads 1.
 # Timing failures are reported but not fatal: the GW5A delays are largely
@@ -63,7 +65,7 @@ build-oss: $(OSS_BITSTREAM)
 $(OSS_BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) $(OSS_SDC)
 	mkdir -p $(OSS_DIR)
 	yosys -q -l $(OSS_DIR)/yosys.log \
-		-p "read_verilog -Isrc $(VERILOG_FILES); synth_gowin -family gw5a -nolutram -top top -json $(OSS_DIR)/top.json"
+		-p "read_verilog -Isrc $(VERILOG_FILES); synth_gowin -family gw5a -nolutram -nowidelut -top top -json $(OSS_DIR)/top.json"
 	nextpnr-himbaechel --json $(OSS_DIR)/top.json --write $(OSS_DIR)/pnr.json \
 		--device $(DEVICE) --vopt family=GW5A-25A --vopt cst=$(CST_FILE) \
 		--vopt i2c_as_gpio --vopt sspi_as_gpio \
