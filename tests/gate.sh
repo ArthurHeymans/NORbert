@@ -64,5 +64,5 @@ synth quad_fast spi_trx
 sim quad_fast "$build/quad_fast.sdram.v" "$build/quad_fast.spi_trx.v"
 
 synth toctou top "spi_addr_latched refreshcount spi_cmd_read_ack trap_triggered
-                  log_addr_sync log_addr_valid_sync"
+                  log_addr_sync log_addr_valid_sync reset spi_reset_effective"
 sim toctou "$build/toctou.top.v"
