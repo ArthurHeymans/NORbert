@@ -76,23 +76,23 @@
           targetPkgs =
             pkgs: with pkgs; [
               stdenv.cc.cc.lib
-              xorg.libX11
-              xorg.libXext
-              xorg.libXrender
-              xorg.libXtst
-              xorg.libXi
-              xorg.libXrandr
-              xorg.libXcomposite
-              xorg.libXcursor
-              xorg.libXdamage
-              xorg.libXfixes
-              xorg.libXScrnSaver
-              xorg.libxcb
-              xorg.xcbutil
-              xorg.xcbutilimage
-              xorg.xcbutilkeysyms
-              xorg.xcbutilrenderutil
-              xorg.xcbutilwm
+              libx11
+              libxext
+              libxrender
+              libxtst
+              libxi
+              libxrandr
+              libxcomposite
+              libxcursor
+              libxdamage
+              libxfixes
+              libxscrnsaver
+              libxcb
+              libxcb-util
+              libxcb-image
+              libxcb-keysyms
+              libxcb-render-util
+              libxcb-wm
               libGL
               libGLU
               libdrm
