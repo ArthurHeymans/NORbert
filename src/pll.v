@@ -24,16 +24,20 @@
 //   MDIV = 24 -> VCO = 50 * 24 / 1 = 1200MHz (valid: 700-1400MHz)
 //   ODIV0 = 10 -> CLKOUT0 = 1200 / 10 = 120MHz (main clock, PE_COARSE=0)
 //   ODIV1 = 10 -> CLKOUT1 = 1200 / 10 = 120MHz (SDRAM clock, PE_COARSE=0)
-//   ODIV2 = 10 -> CLKOUT2 = 1200 / 10 = 120MHz (aux clock, PE_COARSE=6)
+//   ODIV2 = 10 -> CLKOUT2 = 1200 / 10 = 120MHz (aux clock, PE_COARSE=5)
 //   UART: 120MHz / 60 = 2.0 Mbaud
 //   CRITICAL: DIVISOR must be divisible by 4 (uart_rx uses DIVISOR/4)
 //
 // SDRAM read capture timing:
 //   PE_COARSE step = T_VCO/2 = 0.833ns/2 = 0.417ns (for VCO=1200MHz)
-//   PE_COARSE=6 -> 6 * 0.417ns = 2.5ns phase shift (108 degrees)
-//   This centers the DQ sampling point within the SDRAM data valid window,
-//   accounting for IODELAY (~0.8ns), round-trip PCB routing on the 40-pin
-//   connector (~3ns), and W9825G6KH tAC (max 5.4ns) / tOH (min 2.5ns).
+//   PE_COARSE=5 -> 5 * 0.417ns = 2.08ns phase shift (90 degrees)
+//   This centers the DQ sampling point within the SDRAM data valid window.
+//   Measured on hardware with the Gowin IDE build: reads are clean from
+//   PE_COARSE=3 to 7 plus 4 PE_FINE steps and fail at 2 plus 4 PE_FINE
+//   steps and at 8, leaving about 1ns of margin on each side at 5. The
+//   window includes the routing delay from the DQ pins to the dq_captured
+//   registers, so it moves when the placer moves those registers; measure
+//   again after changes that affect their placement.
 //
 // Uses defparam style matching Gowin IDE-generated code (gowin_pll_27.v).
 // Includes ICP_SEL, LPF_RES, LPF_CAP loop filter parameters that the
@@ -132,7 +136,7 @@ module pll(
     defparam pll_inst.CLKOUT0_PE_FINE = 0;
     defparam pll_inst.CLKOUT1_PE_COARSE = 9;     // SDRAM clock: ~3.75ns delay (max for ODIV=10)
     defparam pll_inst.CLKOUT1_PE_FINE = 0;
-    defparam pll_inst.CLKOUT2_PE_COARSE = 6;     // Aux clock: ~2.5ns phase shift for DQ read capture
+    defparam pll_inst.CLKOUT2_PE_COARSE = 5;     // Aux clock: ~2.08ns phase shift for DQ read capture
     defparam pll_inst.CLKOUT2_PE_FINE = 0;
     defparam pll_inst.CLKOUT3_PE_COARSE = 0;
     defparam pll_inst.CLKOUT3_PE_FINE = 0;
