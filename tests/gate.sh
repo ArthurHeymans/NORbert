@@ -21,9 +21,14 @@ sed 's/^  assign I = IO;/  assign O = IO;/' \
 
 # synth <tb> <module> [keep wires] [chparam args]
 # Wires the testbench peeks at are kept so dead-register removal cannot
-# hide them.
+# hide them. Parameters fixed with chparam are declared again in the
+# netlist, so testbenches can pass the same values as to the RTL (older
+# Verilator fails with an internal error on unknown parameters).
 synth() {
     local tb=$1 mod=$2 keep=${3:-} chparam=${4:-} pads=-noiopads extra=""
+    local params=""
+    set -- $chparam
+    while [ $# -ge 3 ]; do params="$params  parameter $2 = $3;\n"; shift 3; done
     if [ "$mod" = top ]; then pads=""; extra="src/top.v tests/pll_stub.v"; fi
     [ -z "$chparam" ] || chparam="chparam $chparam $mod;"
     [ -z "$keep" ] || keep="setattr -set keep 1 $(printf 'w:%s ' $keep);"
@@ -32,6 +37,13 @@ synth() {
         $chparam hierarchy -top $mod; $keep \
         synth_gowin -family gw5a -nolutram -nowidelut -noflatten $pads -top $mod; \
         write_verilog -noattr $build/$tb.$mod.v" >/dev/null
+    if [ -n "$params" ]; then
+        # After the port list, which ends the first line ending in ");".
+        awk -v m="module $mod(" -v p="$params" \
+            'index($0, m) == 1 { h = 1 } { print } h && /\);$/ { printf "%s", p; h = 0 }' \
+            "$build/$tb.$mod.v" >"$build/$tb.$mod.v.tmp"
+        mv "$build/$tb.$mod.v.tmp" "$build/$tb.$mod.v"
+    fi
 }
 
 sim() {
