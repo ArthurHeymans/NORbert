@@ -163,7 +163,11 @@ impl FlashDevice {
     }
 
     async fn read_exact(&mut self, buffer: &mut [u8]) -> Result<()> {
-        const MAX_EMPTY_READS: usize = 64;
+        // The deadline bounds the wait. Empty reads take about 1ms on the
+        // FT245 (latency timer) and 5ms on the UART (port timeout), so the
+        // count only stops a transport that returns nothing without waiting
+        // from spinning until the deadline.
+        const MAX_EMPTY_READS: usize = 100_000;
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut offset = 0;
         let mut empty_reads = 0;
