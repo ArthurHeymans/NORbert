@@ -48,7 +48,11 @@ module ft245(
     // -----------------------------------------------------------------
     localparam [3:0]
         DELAY_RD_DATA  = 4'd7,  // RD# active to data valid (~58ns, min 50ns)
-        DELAY_RD_RECOV = 4'd10, // RD# recovery + sync pipeline (~83ns, extra margin)
+        // RD# recovery + sync pipeline (~117ns). The FT2232H keeps RXF#
+        // high for at least 49ns after RD# rises; 10 cycles was too short
+        // on hardware: with the RXF# synchronizer in an IO register, host
+        // loads dropped bytes. 12 cycles held in testing, 14 leaves margin.
+        DELAY_RD_RECOV = 4'd14,
         DELAY_WR_PULSE = 4'd7,  // WR# active pulse width (~58ns, min 50ns)
         DELAY_WR_RECOV = 4'd5;  // WR# recovery + sync pipeline (~42ns)
 
