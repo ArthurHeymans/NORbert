@@ -15,9 +15,7 @@ trap 'rm -rf "$build"' EXIT
 RTL="src/spi_trx.v src/spi_prefetch.v src/sdram.v src/glue.v src/uart.v"
 RTL="$RTL src/ft245.v src/fifo.v src/logger.v src/util.v"
 
-# Yosys' IOBUF model assigns IO to its input I instead of its output O.
-sed 's/^  assign I = IO;/  assign O = IO;/' \
-    "$(yosys-config --datdir)/gowin/cells_sim.v" >"$build/cells_sim.v"
+CELLS_SIM="$(yosys-config --datdir)/gowin/cells_sim.v"
 
 # synth <tb> <module> [keep wires] [chparam args]
 # Wires the testbench peeks at are kept so dead-register removal cannot
@@ -49,10 +47,10 @@ synth() {
 sim() {
     local tb=$1; shift
     echo "Gate-level testing $tb"
-    verilator --binary --timing -j 2 --top-module "${tb}_tb" -Isrc \
+    verilator --binary --timing -j 2 --top-module "${tb}_tb" -Isrc -DGOWIN_GW5A \
         -Wno-fatal -Wno-lint -Wno-style -Wno-PINNOTFOUND -Wno-TIMESCALEMOD \
         --Mdir "$build/$tb" "tests/${tb}_tb.sv" "$@" \
-        tests/gw5a_cells_sim.v "$build/cells_sim.v" >"$build/$tb.log" 2>&1 \
+        tests/gw5a_cells_sim.v "$CELLS_SIM" >"$build/$tb.log" 2>&1 \
         || { cat "$build/$tb.log"; exit 1; }
     "$build/$tb/V${tb}_tb"
 }

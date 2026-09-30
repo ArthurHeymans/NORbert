@@ -98,15 +98,24 @@ make flash                  # program to flash (persistent)
 ```
 
 An experimental open-source flow builds the same RTL with Yosys,
-nextpnr-himbaechel and Apicula, without the Gowin IDE:
+nextpnr-himbaechel and Apicula, without the Gowin IDE. The flake pins the
+`norbert-experimental` branches of the [Yosys](https://github.com/ArthurHeymans/yosys/tree/norbert-experimental),
+[nextpnr](https://github.com/ArthurHeymans/nextpnr/tree/norbert-experimental) and
+[Apicula](https://github.com/ArthurHeymans/apicula/tree/norbert-experimental)
+forks; stock upstream packages are not equivalent. These are local experimental
+patches, not upstream-endorsed support, and the packaged device is GW5A-25A only.
+See [the toolchain notes](docs/oss-toolchain.md) for topic branches, tests and
+remaining upstreaming work.
 
 ```sh
+nix develop .#oss          # optional: shell without proprietary Gowin tools
 make build-oss              # impl/oss/spi_flash.fs
 make prog-oss               # program FPGA (volatile)
 ```
 
-Its PLL fuses match the Gowin build, and on a Tang Primer 25K the bitstream
-loads and verifies 8 MiB images over UART, across several nextpnr seeds.
+Earlier experimental builds had PLL fuses matching the Gowin build and loaded
+and verified 8 MiB images over UART on a Tang Primer 25K, across several nextpnr
+seeds. This is not hardware sign-off of every subsequent toolchain or RTL change.
 The SPI target interface is untested on hardware, and timing is not
 signed off: nextpnr's GW5A delays are largely borrowed from GW2A, and it
 does not analyse the PLL phase offsets, the SDRAM pin timing or the SPI
