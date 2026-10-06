@@ -99,13 +99,19 @@ module sdram(
     // The values consumed by cmdtarget are sized to it (5 bits), so a
     // timing constant that stops fitting is an elaboration error rather
     // than a silent truncation. tINIT and tREFRESH stay plain integers:
-    // they size the init/refresh counters through $clog2 and are only
-    // compared against them.
+    // they size the counters; sized copies drive refresh arithmetic.
     localparam integer tINIT        = 100 * CLK_FREQ_MHZ;   // 100us init
     localparam integer tREFRESH     = (CLK_FREQ_MHZ * 32000) / 8192;  // ~468 cycles
     // Inhibit is a latency hint, not permission to lose memory retention.
     // Allow one interval of deferral, then service refresh at a safe boundary.
     localparam integer tREFRESH_MAX = 2 * tREFRESH;
+    // Keep service-latency headroom above the hard deadline so elapsed
+    // time is not lost while a row is closing or a burst is completing.
+    localparam integer REFRESH_BITS = $clog2(tREFRESH_MAX + 64);
+    localparam [REFRESH_BITS-1:0] REFRESH_PERIOD = tREFRESH[REFRESH_BITS-1:0];
+    localparam [REFRESH_BITS-1:0] REFRESH_SOFT_PRE = REFRESH_PERIOD - 1'b1;
+    localparam [REFRESH_BITS-1:0] REFRESH_HARD_PRE = (REFRESH_PERIOD << 1) - 1'b1;
+    localparam [REFRESH_BITS:0] REFRESH_BACKLOG_PRE = {1'b0, REFRESH_PERIOD} * 2'd3 - 1'b1;
     localparam [4:0] tRP            = 5'd2;   // 16.7ns precharge (min 15ns for -6)
     localparam [4:0] tRC            = 5'd8;   // 66.7ns row cycle (min 60ns for -6)
     localparam [4:0] tMRD           = 5'd2;   // 2 cycles mode register set
@@ -159,7 +165,7 @@ module sdram(
     reg initrefreshcount;
     reg [4:0] cmdcount;
     reg [4:0] cmdtarget;
-    reg [$clog2(tREFRESH):0] refreshcount;
+    reg [REFRESH_BITS-1:0] refreshcount;
     
     // Track which chip we're refreshing (alternate between chips)
     reg refresh_chip;
@@ -213,9 +219,10 @@ module sdram(
     reg spi_activate_done;
     
     wire do_inhibit_refresh = (spi_inhibit_refresh_buf[1] || inhibit_refresh);
-    /* verilator lint_off WIDTHEXPAND */
-    wire hard_refresh_due = refreshcount >= tREFRESH_MAX;
-    /* verilator lint_on WIDTHEXPAND */
+    // Registered deadline flags keep counter arithmetic/comparison out of
+    // the command/read-buffer dispatch path. Predict the increment so the
+    // flags describe the same elapsed time as refreshcount after each edge.
+    reg refresh_due, hard_refresh_due;
     reg serial_row_open;
     
     // Address decoding for MT48LC16M16A2 (2 × 32MB = 64MB)
@@ -279,6 +286,8 @@ module sdram(
             cmdcount <= 0;
             cmdtarget <= 0;
             refreshcount <= 0;
+            refresh_due <= 0;
+            hard_refresh_due <= 0;
             refresh_chip <= 0;
             serial_row_open <= 0;
             
@@ -313,9 +322,12 @@ module sdram(
             spi_post_sync <= 0;
         end
         else begin
-            // Saturate so a stopped SPI clock cannot wrap away a deadline.
-            if (!hard_refresh_due)
-                refreshcount <= refreshcount + 1;
+            // Saturate at capacity, not the dispatch deadline: elapsed
+            // service/deferral time remains owed until actually refreshed.
+            if (!(&refreshcount))
+                refreshcount <= refreshcount + 1'b1;
+            refresh_due <= refreshcount >= REFRESH_SOFT_PRE;
+            hard_refresh_due <= refreshcount >= REFRESH_HARD_PRE;
             
             // Synchronize SPI control signals. Gate requests with active CS so
             // a master that stops the clock while deasserting CS cannot leave
@@ -382,15 +394,12 @@ module sdram(
             // a new command has been posted (access_cmd != 0), or a
             // refresh is imminent and not inhibited.
             //
-            // tREFRESH and tINIT are plain integers because they size the
-            // counters holding them; Verilog-2001 has no cast to narrow a
-            // parameter expression for these comparisons.
-            /* verilator lint_off WIDTHEXPAND */
+            // Explicit acceptance makes a one-cycle lookahead unnecessary:
+            // requests that race refresh remain posted until dispatched.
             cmd_busy <= (state != STA_IDLE) ||
                         (access_cmd != 2'b00) ||
-                        ((refreshcount >= tREFRESH-1) && !do_inhibit_refresh) ||
-                        ((refreshcount >= tREFRESH_MAX-1) && !serial_row_open);
-            /* verilator lint_on WIDTHEXPAND */
+                        (refresh_due && !do_inhibit_refresh) ||
+                        (hard_refresh_due && !serial_row_open);
 
             if (state == STA_INIT) begin
                 // Wait for SDRAM power-up (100us) - chip 0 selected (CS LOW)
@@ -648,7 +657,9 @@ module sdram(
                          (!spi_activate_done || spi_cmd_read_ack)) begin
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;
-                    refreshcount <= 1;
+                    refreshcount <= refreshcount - REFRESH_PERIOD + 1'b1;
+                    refresh_due <= refreshcount >= REFRESH_HARD_PRE;
+                    hard_refresh_due <= {1'b0, refreshcount} >= REFRESH_BACKLOG_PRE;
                     cs_o <= 0;
                     ras_o <= 0;
                     cas_o <= 0;
@@ -769,15 +780,15 @@ module sdram(
                     dq_o <= write_buffer[15:0];
                     dqm_o <= 2'b00;
                 end
-                // Counter-threshold comparison; see the WIDTHEXPAND waiver
-                // on cmd_busy above for why this cannot be sized.
-                /* verilator lint_off WIDTHEXPAND */
-                else if ((refreshcount >= tREFRESH) && !do_inhibit_refresh) begin
-                /* verilator lint_on WIDTHEXPAND */
+                else if (refresh_due && !do_inhibit_refresh) begin
                     // Auto refresh - alternate between chips
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;
-                    refreshcount <= 1;
+                    // Pay one period, retaining overdue time. Resetting
+                    // here halves the nominal rate under sustained inhibit.
+                    refreshcount <= refreshcount - REFRESH_PERIOD + 1'b1;
+                    refresh_due <= refreshcount >= REFRESH_HARD_PRE;
+                    hard_refresh_due <= {1'b0, refreshcount} >= REFRESH_BACKLOG_PRE;
 
                     // REFRESH command for current chip
                     cs_o <= refresh_chip;

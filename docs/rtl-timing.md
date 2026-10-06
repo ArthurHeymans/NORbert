@@ -56,6 +56,18 @@ Audit the actual destination-capture interval and tighten individual path
 budgets if needed. Never replace these bounds with blanket asynchronous
 clock groups merely to obtain a clean report.
 
+## Refresh scheduling
+
+At 120 MHz the nominal period is 468 clocks (a conservative 32 ms / 8192
+schedule for each chip). Deferral may reach twice that period, plus bounded
+safe-row-closure/access service time. Each refresh pair pays only one period
+of elapsed time; it does not discard overdue time. This preserves the nominal
+average rate even when SCK and CS stall indefinitely. The saturating counter
+has service-latency headroom above the dispatch deadline. Registered,
+increment-predicted deadline flags remove arithmetic/comparison from the
+command/data dispatch critical path without postponing the deadline.
+The refresh bench checks both maximum gaps and sustained refresh rate.
+
 ## Required external I/O profile
 
 No universal SPI-master/board timing profile is available. The checked-in
@@ -94,7 +106,9 @@ set_input_delay -clock sdram_clk -min SDRAM_TCO_MIN_PLUS_FLIGHT [get_ports {IO_s
 Gowin Education 1.9.11.03 successfully parsed and placed/routed this design
 with the generated clocks and inter-clock bounds. Its clock report confirmed
 120 MHz offsets of 0, 3.750 and 2.083 ns; the 40 MHz SPI clock and 120 MHz
-system clock had no negative reported setup/hold slack in that build.
+system clock had no negative reported setup/hold slack in the final build
+(internal reported Fmax: SPI 74.356 MHz, system 127.979 MHz). Those are STA
+results for the declared coverage, not usable pin-frequency guarantees.
 **External paths remain unconstrained**, so those results are not full timing
 closure. Gowin also reports generic routing for the PMOD SPI clock (PR1014):
 inspect clock insertion delay/skew and minimum SCK pulse width explicitly.

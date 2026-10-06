@@ -26,6 +26,9 @@ utilization or timing sign-off. Deltas compare against the preceding row.
 | Separate host protocol and explicit SDRAM client ownership | 3435 | +93 |
 | Declare PLL phases and bound SPI/system crossings; document I/O contracts | 3435 | 0 |
 | Align strict lint mapping and acknowledge its experimental XAIG backend | 3435 | 0 |
+| Retain deferred refresh debt and register dispatch deadlines | 3398 | −37 |
+
+Final total: **3398 LUTs**, **+264** versus the 3134-LUT baseline.
 
 The logger queue also adds four `SDPX9B` BSRAM cells (the original four
 `DPX9B` cells remain). It trades those blocks and LUTs for capture-order

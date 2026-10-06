@@ -41,7 +41,7 @@ module refresh_tb;
         .cs_o(chip), .ba_o(bank));
 
     integer cycles = 0, refreshes = 0, last_refresh [0:1];
-    integer replies = 0, activates = 0, reads = 0;
+    integer replies = 0, activates = 0, reads = 0, refresh_before;
     bit checking = 0;
     bit row_open [0:1][0:3];
     always @(negedge clk) begin
@@ -96,7 +96,13 @@ module refresh_tb;
         if (replies != 0 || refreshes < 100) $fatal(1, "stalled host test failed");
         tx_ready = 1; tick(500);
         if (replies != 16) $fatal(1, "RAMREAD failed to resume: %0d bytes", replies);
-        spi_active = 1; spi_inhibit = 1; tick(5000); // SCK stopped before ACTIVATE
+        refresh_before = refreshes;
+        spi_active = 1; spi_inhibit = 1; tick(20000); // SCK stopped before ACTIVATE
+        // Deferral is bounded, but the 32ms nominal refresh schedule must
+        // also survive sustained inhibition. Allow two periods of startup
+        // phase/debt, count both chips, and require retained refresh debt.
+        if (refreshes - refresh_before < 2 * (20000 / 468 - 2))
+            $fatal(1, "refresh rate lost under sustained inhibition: %0d", refreshes-refresh_before);
         spi_activate = 1; tick(5000); // SCK stopped with a row open
         if (activates < 4) $fatal(1, "held ACTIVATE was not replayed after refresh");
         spi_read = 1; tick(100);
