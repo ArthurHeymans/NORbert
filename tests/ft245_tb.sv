@@ -51,12 +51,20 @@ module ft245_tb;
     reg [7:0] txd = 8'h00;
     reg txd_strobe = 0;
     wire txd_ready;
+    reg fifo_mode = 0;
+    wire fifo_space, fifo_available;
+    wire [7:0] fifo_data;
+    reg fifo_pop = 0;
+    fifo #(.NUM(16), .FREESPACE(1)) rx_fifo(
+        .clk(clk), .reset(reset), .write_data(rxd),
+        .write_strobe(rxd_strobe && fifo_mode), .space_available(fifo_space),
+        .data_available(fifo_available), .read_data(fifo_data), .read_strobe(fifo_pop));
 
     ft245 dut (
         .clk(clk), .reset(reset),
         .ft_data(bus), .ft_rxf_n(ft_rxf_n), .ft_txe_n(ft_txe_n),
         .ft_rd_n(ft_rd_n), .ft_wr_n(ft_wr_n),
-        .rxd(rxd), .rxd_strobe(rxd_strobe),
+        .rxd(rxd), .rxd_strobe(rxd_strobe), .rxd_ready(!fifo_mode || fifo_space),
         .txd(txd), .txd_strobe(txd_strobe), .txd_ready(txd_ready)
     );
 
@@ -286,8 +294,31 @@ module ft245_tb;
             $fatal(1, "concurrent write stored %h, expected a5",
                    written[write_count - 1]);
 
-        $display("PASS FT245: write handshake and setup, read handshake, back-to-back reads, TXE# back-pressure, %0d-byte burst, read-over-write priority",
-                 rx_total);
+        // The top-level RX FIFO can be blocked for arbitrarily long by
+        // SPI/host gating. Exercise real FIFO fullness, not a guessed delay.
+        repeat (30) @(negedge clk);
+        fifo_mode = 1;
+        for (integer i=0; i<40; i++) ft_push(8'(i+128));
+        repeat (1200) @(negedge clk);
+        if (fifo_space || rx_tail-rx_head != 26 || !ft_rd_n)
+            $fatal(1, "RX did not stop at FIFO headroom: remaining=%0d", rx_tail-rx_head);
+        // Full RX must not block transmission on the opposite direction.
+        writes_before = write_count;
+        send(8'h66, 4000);
+        repeat (60) @(negedge clk);
+        if (write_count != writes_before+1 || written[write_count-1] !== 8'h66)
+            $fatal(1, "full RX blocked TX");
+        for (integer i=0; i<40; i++) begin
+            wait(fifo_available);
+            @(negedge clk);
+            if (fifo_data !== 8'(i+128)) $fatal(1, "RX FIFO reordered byte %0d",i);
+            fifo_pop = 1;
+            @(negedge clk); fifo_pop = 0;
+            if (i == 10) repeat (1000) @(negedge clk);
+        end
+        repeat (60) @(negedge clk);
+        if (fifo_available || rx_head != rx_tail) $fatal(1,"RX failed to drain");
+        $display("PASS FT245: pin timing, TX backpressure, RX FIFO saturation/stall/resume, simultaneous TX (%0d RX bytes)", rx_total);
         $finish;
     end
 

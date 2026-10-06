@@ -455,6 +455,7 @@ module top(
     wire ft_txd_strobe;
     wire ft_rxd_strobe_raw;
     wire [7:0] ft_rxd_raw;
+    wire ft_rxfifo_space;
 
     ft245 ft245_i(
         .clk(clk),
@@ -466,6 +467,7 @@ module top(
         .ft_wr_n(ft_wr_n),
         .rxd(ft_rxd_raw),
         .rxd_strobe(ft_rxd_strobe_raw),
+        .rxd_ready(ft_rxfifo_space),
         .txd(ft_txd),
         .txd_strobe(ft_txd_strobe),
         .txd_ready(ft_txd_ready)
@@ -536,7 +538,7 @@ module top(
         .reset(reset),
         .write_data(ft_rxd_raw),
         .write_strobe(ft_rxd_strobe_raw),
-        .space_available(),      // ft245 never overflows 16-deep FIFO
+        .space_available(ft_rxfifo_space), // Stop RD# before the ring fills
         .data_available(ft_rxfifo_data_available),
         .more_available(),
         .read_data(ft_rxfifo_data),
