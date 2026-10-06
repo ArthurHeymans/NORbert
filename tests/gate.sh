@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
 
-RTL="src/spi_trx.v src/spi_prefetch.v src/sdram.v src/glue.v src/spi_program.v src/uart.v"
+RTL="src/spi_trx.v src/spi_prefetch.v src/sdram.v src/glue.v src/spi_program.v src/host_protocol.v src/sdram_client_mux.v src/uart.v"
 RTL="$RTL src/ft245.v src/fifo.v src/logger.v src/util.v"
 
 CELLS_SIM="$(yosys-config --datdir)/gowin/cells_sim.v"
@@ -68,6 +68,19 @@ sim spi_flash "$build/spi_flash.glue.v" "$build/spi_flash.spi_trx.v"
 synth sdram_controller glue
 synth sdram_controller sdram
 sim sdram_controller "$build/sdram_controller.glue.v" "$build/sdram_controller.sdram.v"
+
+synth refresh glue
+synth refresh sdram "" "-set CLK_FREQ_MHZ 120"
+sim refresh "$build/refresh.glue.v" "$build/refresh.sdram.v"
+
+synth access_handshake glue
+sim access_handshake "$build/access_handshake.glue.v"
+
+synth write_completion spi_trx
+sim write_completion "$build/write_completion.spi_trx.v"
+
+synth prefetch_health spi_trx
+sim prefetch_health "$build/prefetch_health.spi_trx.v"
 
 synth quad_fast sdram "" "-set CLK_FREQ_MHZ 120 -set BURST_LEN 4"
 synth quad_fast spi_trx

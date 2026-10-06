@@ -16,7 +16,7 @@ module spi_program(
     output wire init_finishing,
     output reg [1:0] access_cmd,
     output reg [24:0] access_addr,
-    output wire inhibit,
+    output reg inhibit,
     output reg [63:0] write_data
 );
     localparam [3:0] WRITE_ACT=2, WRITE=3, NEXT=4, DONE=5,
@@ -37,13 +37,11 @@ module spi_program(
     reg [71:0] burst;
     reg [8:0] init_count;
     assign init_finishing = init_count == 9'd256;
-    assign inhibit = writing && (state == WRITE_ACT || state == WRITE ||
-                                  state == READ_ACT || state == READ);
     always @(posedge clk) rdata <= mem[raddr];
     integer i;
     always @(posedge clk) begin
         if (reset) begin
-            writing <= 0; done <= 0; init_done <= 0;
+            writing <= 0; done <= 0; init_done <= 0; inhibit <= 0;
             access_cmd <= 0; access_addr <= 0; write_data <= 0;
             state <= READ_ACT; kind <= 0; addr <= 0; remaining <= 0;
             command_sync <= 0; byte_sync <= 0; command_ack <= 0; byte_ack <= 0;
@@ -52,6 +50,8 @@ module spi_program(
             prefetch <= 0; capture_valid <= 0; capture_idx <= 0;
             burst <= 0; burst_ready <= 0; init_count <= 0;
         end else begin
+            inhibit <= writing && (state == WRITE_ACT || state == WRITE ||
+                                   state == READ_ACT || state == READ);
             wren <= 0;
             if (wren) mem[waddr] <= wdata;
             access_addr <= {addr, 2'b00};

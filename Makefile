@@ -15,6 +15,8 @@ VERILOG_FILES = \
 	src/sdram.v \
 	src/glue.v \
 	src/spi_program.v \
+	src/host_protocol.v \
+	src/sdram_client_mux.v \
 	src/uart.v \
 	src/ft245.v \
 	src/fifo.v \

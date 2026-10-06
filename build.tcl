@@ -12,6 +12,8 @@ add_file src/spi_prefetch.v
 add_file src/sdram.v
 add_file src/glue.v
 add_file src/spi_program.v
+add_file src/host_protocol.v
+add_file src/sdram_client_mux.v
 add_file src/uart.v
 add_file src/ft245.v
 add_file src/fifo.v
