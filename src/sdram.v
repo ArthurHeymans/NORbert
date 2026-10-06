@@ -98,6 +98,9 @@ module sdram(
     // compared against them.
     localparam integer tINIT        = 100 * CLK_FREQ_MHZ;   // 100us init
     localparam integer tREFRESH     = (CLK_FREQ_MHZ * 32000) / 8192;  // ~468 cycles
+    // Inhibit is a latency hint, not permission to lose memory retention.
+    // Allow one interval of deferral, then service refresh at a safe boundary.
+    localparam integer tREFRESH_MAX = 2 * tREFRESH;
     localparam [4:0] tRP            = 5'd2;   // 16.7ns precharge (min 15ns for -6)
     localparam [4:0] tRC            = 5'd8;   // 66.7ns row cycle (min 60ns for -6)
     localparam [4:0] tMRD           = 5'd2;   // 2 cycles mode register set
@@ -201,6 +204,10 @@ module sdram(
     reg spi_activate_done;
     
     wire do_inhibit_refresh = (spi_inhibit_refresh_buf[1] || inhibit_refresh);
+    /* verilator lint_off WIDTHEXPAND */
+    wire hard_refresh_due = refreshcount >= tREFRESH_MAX;
+    /* verilator lint_on WIDTHEXPAND */
+    reg serial_row_open;
     
     // Address decoding for MT48LC16M16A2 (2 × 32MB = 64MB)
     // SPI path: 23-bit burst address
@@ -263,6 +270,7 @@ module sdram(
             cmdtarget <= 0;
             refreshcount <= 0;
             refresh_chip <= 0;
+            serial_row_open <= 0;
             
             read_buffer <= 0;
             read_buffer_b <= 0;
@@ -292,7 +300,9 @@ module sdram(
             spi_post_sync <= 0;
         end
         else begin
-            refreshcount <= refreshcount + 1;
+            // Saturate so a stopped SPI clock cannot wrap away a deadline.
+            if (!hard_refresh_due)
+                refreshcount <= refreshcount + 1;
             
             // Synchronize SPI control signals. Gate requests with active CS so
             // a master that stops the clock while deasserting CS cannot leave
@@ -364,7 +374,8 @@ module sdram(
             /* verilator lint_off WIDTHEXPAND */
             cmd_busy <= (state != STA_IDLE) ||
                         (access_cmd != 2'b00) ||
-                        ((refreshcount >= tREFRESH-1) && !do_inhibit_refresh);
+                        ((refreshcount >= tREFRESH-1) && !do_inhibit_refresh) ||
+                        ((refreshcount >= tREFRESH_MAX-1) && !serial_row_open);
             /* verilator lint_on WIDTHEXPAND */
 
             if (state == STA_INIT) begin
@@ -576,6 +587,7 @@ module sdram(
                     // bank opened for this SPI request.
                     state <= STA_SPI_ABORT_PRECHARGE;
                     cmdtarget <= tRP;
+                    spi_activate_done <= 0;
 
                     cs_o <= spi_chip_sel;
                     ras_o <= 0;
@@ -602,6 +614,30 @@ module sdram(
                     cmdtarget <= tRAS;
                     ras_o <= 1;
                     cas_o <= 1;
+                    we_o <= 1;
+                    dqm_o <= 2'b11;
+                end
+                else if (hard_refresh_due && !serial_row_open && access_cmd == 0 &&
+                         spi_activate_done && !spi_cmd_read_ack && !spi_cmd_read_buf[1]) begin
+                    // SCK may stop after ACTIVATE while CS remains low.
+                    // Close the row, refresh, then replay the held ACTIVATE.
+                    state <= STA_SPI_ABORT_WAIT;
+                    cmdtarget <= tRAS;
+                    spi_cmd_activate_ack <= 0;
+                    spi_act_armed <= 1;
+                    ras_o <= 1;
+                    cas_o <= 1;
+                    we_o <= 1;
+                    dqm_o <= 2'b11;
+                end
+                else if (hard_refresh_due && !serial_row_open && access_cmd == 0 &&
+                         (!spi_activate_done || spi_cmd_read_ack)) begin
+                    state <= STA_REFRESH;
+                    cmdtarget <= tRC;
+                    refreshcount <= 1;
+                    cs_o <= 0;
+                    ras_o <= 0;
+                    cas_o <= 0;
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
@@ -656,6 +692,7 @@ module sdram(
                 end
                 else if (access_cmd == 2'b11) begin
                     // Serial path activate
+                    serial_row_open <= 1;
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
 
@@ -670,6 +707,7 @@ module sdram(
                 end
                 else if (access_cmd == 2'b01) begin
                     // Serial path read
+                    serial_row_open <= 0;
                     state <= STA_READ;
                     cmdtarget <= tREAD + 2;
                     read_busy <= 1;
@@ -690,6 +728,7 @@ module sdram(
                 end
                 else if (access_cmd == 2'b10) begin
                     // Serial path write
+                    serial_row_open <= 0;
                     state <= STA_WRITE;
                     cmdtarget <= tWRITE;
                     wrbuf_read_ptr <= 1;

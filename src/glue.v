@@ -557,18 +557,14 @@ module glue(
                 (!write_strobe && (write_state == 3'd0)))
                 sdram_write_buffer <= write_buffer;
             
-            // Inhibit SDRAM refresh while a serial-path operation is active.
-            // We inhibit for ANY non-zero read/write state (not just 1-2)
-            // to prevent a refresh from sneaking in during the state 3->1
-            // transition between consecutive bursts, where there would
-            // otherwise be a one-cycle gap in the inhibit signal.
-            // The SPI fast-path has its own spi_inhibit_refresh signal;
-            // this covers the serial (UART tool) and SPI write paths.
-            sdram_inhibit_refresh <= (read_state != 0) ||
-                                    (write_state != 0) ||
+            // Protect only the ACTIVATE -> READ/WRITE pair. Once the
+            // auto-precharged burst completes, transport backpressure and
+            // BSRAM merging must not block refresh. cmd_busy prevents the
+            // next ACTIVATE pulse from racing an already-started refresh.
+            sdram_inhibit_refresh <= (read_state == 3'd1 || read_state == 3'd2) ||
+                                    (write_state == 3'd1 || write_state == 3'd2) ||
                                     (spi_writing && (i_spi_write_state == 4'd2 || i_spi_write_state == 4'd3 ||
-                                                     i_spi_write_state == 4'd6 || i_spi_write_state == 4'd7 ||
-                                                     i_spi_write_state == 4'd8));
+                                                     i_spi_write_state == 4'd6 || i_spi_write_state == 4'd7));
     
             if (sdram_access_cmd != 2'b00)
                 sdram_access_cmd <= 0;
