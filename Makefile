@@ -14,6 +14,7 @@ VERILOG_FILES = \
 	src/spi_prefetch.v \
 	src/sdram.v \
 	src/glue.v \
+	src/spi_program.v \
 	src/uart.v \
 	src/ft245.v \
 	src/fifo.v \

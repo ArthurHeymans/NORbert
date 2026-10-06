@@ -41,8 +41,8 @@ module glue(
     output reg [7:0] ft_txd_data,
 
     // SDRAM control signals
-    output reg [1:0] sdram_access_cmd, // 00=nop 01=read 10=write 11=activate
-    output reg [24:0] sdram_access_addr,  // 25-bit: {chip, row, bank, col}
+    output wire [1:0] sdram_access_cmd, // 00=nop 01=read 10=write 11=activate
+    output wire [24:0] sdram_access_addr,  // 25-bit: {chip, row, bank, col}
     output reg sdram_inhibit_refresh,
     input wire sdram_cmd_busy,
     input wire sdram_access_accept, // A posted command was actually dispatched
@@ -50,7 +50,7 @@ module glue(
     input wire [63:0] sdram_read_buffer,
     input wire sdram_read_busy,
 
-    output reg [63:0] sdram_write_buffer,
+    output wire [63:0] sdram_write_buffer,
     
     // SPI signals
     input wire spi_reset,
@@ -60,7 +60,7 @@ module glue(
     input wire [1:0] spi_write_type,  // 00=page program, 01=erase, 10=AAI RMW
     input wire [22:0] spi_write_addr,   // 23-bit burst address
     input wire [22:0] spi_write_len,
-    output reg spi_write_done,   // Toggles once per completed write/erase
+    output wire spi_write_done,   // Toggles once per completed write/erase
     
     input wire spi_write_buf_strobe,
     input wire [7:0] spi_write_buf_offset,
@@ -256,39 +256,36 @@ module glue(
     // Heartbeat counter
     reg [25:0] heartbeat;
     
-    reg spi_writing;
-    reg spi_write_ack;
-    reg [1:0] spi_cmd_write_buf;
-    
-    reg [1:0] i_spi_write_type;
-    reg [3:0] i_spi_write_state;
-    reg [22:0] i_spi_len;
-    
-    // Page program buffer: 256 bytes + write flags in one BSRAM.
-    // Prefetch eight entries while SDRAM activates/reads the old burst,
-    // hiding the synchronous byte-wide RAM latency behind the SDRAM access.
-    reg [8:0] pp_mem [0:255];
-    reg [7:0] pp_waddr;
-    reg [8:0] pp_wdata;
-    reg pp_wren;
-    reg [7:0] pp_raddr;
-    reg [8:0] pp_rdata;
-    reg pp_prefetch;
-    reg pp_capture_valid;
-    reg [2:0] pp_capture_idx;
-    reg [71:0] pp_burst;
-    reg pp_burst_ready;
-    reg [8:0] pp_init_cnt;      // boot init cursor (zero all 256 entries)
-    reg pp_init_done;
+    wire spi_writing, pp_init_done, pp_init_finishing, program_inhibit;
+    wire [1:0] program_access_cmd;
+    wire [24:0] program_access_addr;
+    wire [63:0] program_write_data;
+    reg [1:0] host_access_cmd;
+    reg [24:0] host_access_addr;
+    reg [63:0] host_write_data;
     reg spi_run_requested;
-    // START may arrive during initialization, but SPI cannot fill the
-    // page buffer until its final initialization write has committed.
     assign spi_running = spi_run_requested && pp_init_done;
-    reg [1:0] spi_write_buf_strobe_buf;
-    reg spi_write_buf_ack;
-    
-    reg [7:0] spi_write_buf_offset_reg;
-    reg [7:0] spi_write_buf_val_reg;
+
+    // Ownership lasts for the entire program/RMW operation. Host parsing
+    // is gated while writing; requests cannot change owners before grant
+    // or before an accepted burst completes.
+    assign sdram_access_cmd = spi_writing ? program_access_cmd : host_access_cmd;
+    assign sdram_access_addr = spi_writing ? program_access_addr : host_access_addr;
+    assign sdram_write_buffer = spi_writing ? program_write_data : host_write_data;
+    spi_program program_i(
+        .clk(clk), .reset(reset),
+        .deselected(spi_csel_buf[1] && read_state == 0 && write_state == 0 &&
+                    !write_strobe && host_access_cmd == 0 &&
+                    !sdram_cmd_busy && !sdram_read_busy),
+        .command(spi_cmd_write), .command_type(spi_write_type),
+        .command_addr(spi_write_addr), .command_len(spi_write_len),
+        .byte_strobe(spi_write_buf_strobe), .byte_offset(spi_write_buf_offset),
+        .byte_value(spi_write_buf_val), .busy(sdram_busy),
+        .accept(sdram_access_accept && spi_writing), .read_data(sdram_read_buffer),
+        .writing(spi_writing), .done(spi_write_done), .init_done(pp_init_done),
+        .init_finishing(pp_init_finishing), .inhibit(program_inhibit),
+        .access_cmd(program_access_cmd), .access_addr(program_access_addr),
+        .write_data(program_write_data));
 
     // SFDP table storage: 128 bytes in a dual-clock BSRAM.  A valid
     // length makes unwritten bytes read as 0xFF without a boot scrub
@@ -338,12 +335,6 @@ module glue(
 
     integer i;
 
-    // Page-buffer BSRAM read port (system clock domain -- same domain as
-    // the write port, so this infers single-clock simple-dual-port RAM).
-    always @(posedge clk) begin
-        pp_rdata <= pp_mem[pp_raddr];
-    end
-
     // SFDP BSRAM read port (SPI clock domain -- same domain as the
     // sfdp_raddr source and sfdp_rdata consumer in spi_trx, so there is
     // no clock-domain crossing on this path).
@@ -371,7 +362,7 @@ module glue(
             log_poll_escape_code <= 0;
             log_fifo_read_strobe <= 0;
 
-            sdram_access_cmd <= 0;
+            host_access_cmd <= 0;
             sdram_inhibit_refresh <= 0;
 
             write_strobe <= 0;
@@ -392,19 +383,8 @@ module glue(
             led <= 0;
             prefetch_faults <= 2'b00;
             
-            spi_writing <= 0;
-            spi_write_ack <= 0;
-            spi_cmd_write_buf <= 0;
-            spi_write_done <= 0;
-            i_spi_write_type <= 0;
-            i_spi_write_state <= 0;
-            i_spi_len <= 0;
-            
-            spi_write_buf_strobe_buf <= 0;
-            spi_write_buf_ack <= 0;
-            spi_write_buf_offset_reg <= 0;
-            spi_write_buf_val_reg <= 0;
-            
+            host_access_addr <= 0;
+            host_write_data <= 0;
             write_buffer <= 0;
             
             hold_out <= 0;
@@ -443,20 +423,6 @@ module glue(
             
             tx_wait <= 0;
 
-            // Scrub page-buffer flags after reset before enabling SPI.
-            // SFDP needs only a validity reset, not physical RAM writes.
-            pp_waddr <= 0;
-            pp_wdata <= 0;
-            pp_wren <= 0;
-            pp_raddr <= 0;
-            pp_prefetch <= 0;
-            pp_capture_valid <= 0;
-            pp_capture_idx <= 0;
-            pp_burst <= 0;
-            pp_burst_ready <= 0;
-            pp_init_cnt <= 0;
-            pp_init_done <= 0;
-
             sfdp_waddr <= 0;
             sfdp_wdata <= 8'hFF;
             sfdp_wren <= 0;
@@ -465,7 +431,6 @@ module glue(
         else begin
             txd_strobe_buf <= 0;
             log_fifo_read_strobe <= 0;
-            pp_wren <= 0;
             sfdp_wren <= 0;
 
             // TX pipeline cooldown
@@ -511,34 +476,17 @@ module glue(
                 if (ft_rx_hold) ft_rx_hold <= 0;
             end
             
-            // Keep SPI disabled until all 256 flag clears have reached RAM.
-            if (!pp_init_done) begin
-                if (pp_init_cnt == 9'd256) begin
-                    pp_init_done <= 1'b1;
-                    // A boot-time START is acknowledged only once SPI
-                    // can actually run, not while its buffer is dirty.
-                    if (spi_run_requested) begin
-                        txd_strobe_buf <= 1;
-                        txd_data_buf <= 8'h01;
-                    end
-                end else begin
-                    pp_waddr <= pp_init_cnt[7:0];
-                    pp_wdata <= 9'h000;
-                    pp_wren <= 1'b1;
-                    pp_init_cnt <= pp_init_cnt + 1'b1;
-                end
+            // Boot-time START is acknowledged at the final committed scrub.
+            if (!pp_init_done && pp_init_finishing && spi_run_requested) begin
+                txd_strobe_buf <= 1;
+                txd_data_buf <= 8'h01;
             end
 
-            // BSRAM write ports: one shared statement per RAM covers the
-            // boot init, the SPI fill / CHIPCONFIG protocol writes, and
-            // the prefetch self-clear (all arbitrated via pp_wren/sfdp_wren
-            // above and below -- later assignments win the port regs).
-            if (pp_wren)
-                pp_mem[pp_waddr] <= pp_wdata;
+            // CHIPCONFIG owns the SFDP write port.
             if (sfdp_wren)
                 sfdp_mem[sfdp_waddr] <= sfdp_wdata;
 
-            sdram_access_addr <= addr_to_access;
+            host_access_addr <= addr_to_access;
             // Snapshot write_buffer into sdram_write_buffer.
             //
             // Problem: FT245 delivers bytes ~12 cycles apart.  After byte 7
@@ -551,12 +499,11 @@ module glue(
             // after byte 7 arrives, so write_buffer has all 8 bytes) and
             // do one final mirror.  After that, freeze until both
             // write_strobe and write_state are clear (write complete).
-            // SPI writes don't use write_strobe/write_state, so they
-            // get continuous mirroring as before.
+            // The separate program engine owns its own write payload.
             write_strobe_r <= write_strobe;
             if ((write_strobe && !write_strobe_r) ||
                 (!write_strobe && (write_state == 3'd0)))
-                sdram_write_buffer <= write_buffer;
+                host_write_data <= write_buffer;
             
             // Protect only the ACTIVATE -> READ/WRITE pair. Once the
             // auto-precharged burst completes, transport backpressure and
@@ -564,14 +511,13 @@ module glue(
             // next ACTIVATE pulse from racing an already-started refresh.
             sdram_inhibit_refresh <= (read_state == 3'd1 || read_state == 3'd2) ||
                                     (write_state == 3'd1 || write_state == 3'd2) ||
-                                    (spi_writing && (i_spi_write_state == 4'd2 || i_spi_write_state == 4'd3 ||
-                                                     i_spi_write_state == 4'd6 || i_spi_write_state == 4'd7));
+                                    program_inhibit;
     
             // Hold the request/address until the controller grants it.
             // busy describes progress, not acceptance; a refresh or another
             // owner can defer dispatch after the caller posts a request.
-            if (sdram_access_accept)
-                sdram_access_cmd <= 0;
+            if (sdram_access_accept && !spi_writing)
+                host_access_cmd <= 0;
                 
             spi_csel_buf <= {spi_csel_buf[0], spi_csel};
             heartbeat <= heartbeat + 1;
@@ -641,158 +587,6 @@ module glue(
             if (!spi_active_sync)
                 redirect_active <= 0;
                 
-            // SPI write buffer handling
-            spi_write_buf_strobe_buf <= {spi_write_buf_strobe_buf[0], spi_write_buf_strobe};
-            
-            if (spi_write_buf_strobe_buf[0] && !spi_write_buf_strobe_buf[1]) begin
-                spi_write_buf_offset_reg <= spi_write_buf_offset;
-                spi_write_buf_val_reg <= spi_write_buf_val;
-            end
-            
-            if (!spi_write_buf_strobe_buf[1])
-                spi_write_buf_ack <= 0;
-                
-            // Page-buffer fill: single-cycle BSRAM write pulse.  Never
-            // overlaps the RMW prefetch for a compliant master:
-            // a new data phase cannot start until WIP clears, i.e.
-            // until spi_writing drops.
-            if (spi_write_buf_strobe_buf[1] && !spi_write_buf_ack && pp_init_done) begin
-                pp_waddr <= spi_write_buf_offset_reg;
-                pp_wdata <= {1'b1, spi_write_buf_val_reg};
-                pp_wren <= 1'b1;
-                spi_write_buf_ack <= 1;
-            end
-            
-            // SPI write command handling    
-            spi_cmd_write_buf <= {spi_cmd_write_buf[0], spi_cmd_write};
-            
-            if (!spi_cmd_write_buf[1])
-                spi_write_ack <= 0;
-
-            // The page buffer must be initialized before accepting writes.
-            if (spi_cmd_write_buf[1] && !spi_write_ack && spi_csel_buf[1] && pp_init_done) begin
-                spi_writing <= 1;
-                spi_write_ack <= 1;
-                
-                i_spi_write_type <= spi_write_type;
-                case (spi_write_type)
-                    2'd0: i_spi_write_state <= 6;  // Page program: read-modify-write bursts
-                    2'd1: i_spi_write_state <= 2;  // Erase: activate for write
-                    2'd2: i_spi_write_state <= 6;  // AAI: read-modify-write
-                    default: i_spi_write_state <= 0;
-                endcase
-                
-                addr <= spi_write_addr;
-                i_spi_len <= spi_write_len;
-                
-                if (spi_write_type == 2'd1)
-                    write_buffer <= 64'hFFFFFFFFFFFFFFFF;
-            end
-            
-            // Stream the page-buffer burst independently of sdram_busy.
-            // pp_raddr is registered, then pp_rdata: skip the first cycle
-            // before capturing byte 0.  Consumed flags are cleared through
-            // the write port, behind the advancing read address.
-            if (pp_prefetch) begin
-                pp_capture_valid <= 1'b1;
-                if (pp_raddr[2:0] != 3'd7)
-                    pp_raddr <= pp_raddr + 1'b1;
-                if (pp_capture_valid) begin
-                    pp_burst[pp_capture_idx*9 +: 9] <= pp_rdata;
-                    pp_waddr <= {addr[4:0], pp_capture_idx};
-                    pp_wdata <= 9'h000;
-                    pp_wren <= 1'b1;
-                    if (pp_capture_idx == 3'd7) begin
-                        pp_prefetch <= 0;
-                        pp_burst_ready <= 1;
-                    end else
-                        pp_capture_idx <= pp_capture_idx + 1'b1;
-                end
-            end
-
-            // SPI write state machine
-            if (spi_writing && !sdram_busy) begin
-                if (i_spi_write_state == 0) begin
-                    // Legacy direct page-program state is no longer used.
-                    // Page program now uses the RMW path (states 6-8) so
-                    // partial programs preserve untouched bytes.
-                    i_spi_write_state <= 6;
-                end
-                else if (i_spi_write_state == 1) begin
-                    i_spi_write_state <= 2;
-                end
-                else if (i_spi_write_state == 2) begin
-                    // Activate for write
-                    sdram_access_cmd <= 2'b11;
-                    i_spi_write_state <= 3;
-                end
-                else if (i_spi_write_state == 3) begin
-                    // Write burst to SDRAM
-                    sdram_access_cmd <= 2'b10;
-                    
-                    if (i_spi_len == 0) begin
-                        i_spi_write_state <= 5;
-                    end
-                    else begin
-                        i_spi_write_state <= 4;
-                    end
-                end
-                else if (i_spi_write_state == 4) begin
-                    case (i_spi_write_type)
-                        2'd0: i_spi_write_state <= 6;  // Page program: next RMW burst
-                        2'd1: i_spi_write_state <= 2;  // Erase: next burst
-                        default: i_spi_write_state <= 0;
-                    endcase
-                    addr <= addr + 1;
-                    i_spi_len <= i_spi_len - 1;
-                end
-                else if (i_spi_write_state == 5) begin
-                    spi_writing <= 0;
-                    spi_write_done <= !spi_write_done;
-                    // The prefetch cleared all consumed flags.  PP visits
-                    // all 32 bursts; AAI accepts only one aligned word.
-                end
-                // ---------------------------------------------------------
-                // SPI program Read-Modify-Write (page program or AAI).
-                //
-                // Page program writes a full 256-byte page window but only
-                // updates bytes whose write flags were set by the SPI data
-                // phase. AAI writes exactly the flagged bytes in one burst.
-                // Programmed bytes are merged as old & new to preserve NOR
-                // flash semantics (program can clear bits, not set them).
-                //
-                // State 6: Activate SDRAM row and start BSRAM prefetch
-                // State 7: Issue SDRAM read command
-                // State 8: Merge both bursts, then activate for write
-                // ---------------------------------------------------------
-                else if (i_spi_write_state == 6) begin
-                    // Fetch the page-buffer bytes during SDRAM latency.
-                    pp_raddr <= {addr[4:0], 3'b000};
-                    pp_prefetch <= 1;
-                    pp_capture_valid <= 0;
-                    pp_capture_idx <= 0;
-                    pp_burst_ready <= 0;
-                    sdram_access_cmd <= 2'b11;
-                    i_spi_write_state <= 7;
-                end
-                else if (i_spi_write_state == 7) begin
-                    // Issue read
-                    sdram_access_cmd <= 2'b01;
-                    i_spi_write_state <= 8;
-                end
-                else if (i_spi_write_state == 8) begin
-                    if (pp_burst_ready) begin
-                        for (i = 0; i < 8; i = i + 1) begin
-                            if (pp_burst[i*9 + 8])
-                                write_buffer[i*8 +: 8] <= sdram_read_buffer[i*8 +: 8] & pp_burst[i*9 +: 8];
-                            else
-                                write_buffer[i*8 +: 8] <= sdram_read_buffer[i*8 +: 8];
-                        end
-                        i_spi_write_state <= 2;
-                    end
-                end
-            end
-            
             // Serial protocol idle timeout: reset parser if stuck in
             // multi-byte command header with no data for ~137us.
             // Exclude active read/write operations: during reads the
@@ -833,7 +627,7 @@ module glue(
                     // The init completion path replies to an earlier START.
                     // Include this edge's final write to avoid losing an
                     // ACK when START coincides with initialization completion.
-                    if (pp_init_done || pp_init_cnt == 9'd256) begin
+                    if (pp_init_done || pp_init_finishing) begin
                         txd_strobe_buf <= 1;
                         txd_data_buf <= 8'h01;
                     end
@@ -1191,12 +985,12 @@ module glue(
                     if (read_state != 3'd0) begin
                         if ((read_state == 1) && !sdram_busy) begin
                             // Activate
-                            sdram_access_cmd <= 2'b11;
+                            host_access_cmd <= 2'b11;
                             read_state <= 2;
                         end
                         else if ((read_state == 2) && !sdram_busy) begin
                             // Read
-                            sdram_access_cmd <= 2'b01;
+                            host_access_cmd <= 2'b01;
                             read_state <= 3;
                         end
                         else if ((read_state == 3) && !sdram_busy && can_send) begin
@@ -1223,13 +1017,13 @@ module glue(
                     else if (write_state != 3'd0) begin
                         if ((write_state == 1) && !sdram_busy) begin
                             // Activate
-                            sdram_access_cmd <= 2'b11;
+                            host_access_cmd <= 2'b11;
                             write_strobe <= 0;
                             write_state <= 2;
                         end
                         else if ((write_state == 2) && !sdram_busy) begin
                             // Write
-                            sdram_access_cmd <= 2'b10;
+                            host_access_cmd <= 2'b10;
                             write_state <= 3;
                         end
                         else if ((write_state == 3) && !sdram_busy) begin

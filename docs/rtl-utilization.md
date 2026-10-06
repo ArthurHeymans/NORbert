@@ -22,6 +22,7 @@ utilization or timing sign-off. Deltas compare against the preceding row.
 | Check consumed beats and preserve progressive-fill ownership | 3202 | +24 |
 | Queue logger frames chronologically and report dropped events | 3494 | +292 |
 | Hold SDRAM requests until explicit acceptance | 3532 | +38 |
+| Isolate page-buffer and NOR program/RMW engine | 3342 | −190 |
 
 The logger queue also adds four `SDPX9B` BSRAM cells (the original four
 `DPX9B` cells remain). It trades those blocks and LUTs for capture-order

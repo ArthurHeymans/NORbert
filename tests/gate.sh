@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
 
-RTL="src/spi_trx.v src/spi_prefetch.v src/sdram.v src/glue.v src/uart.v"
+RTL="src/spi_trx.v src/spi_prefetch.v src/sdram.v src/glue.v src/spi_program.v src/uart.v"
 RTL="$RTL src/ft245.v src/fifo.v src/logger.v src/util.v"
 
 CELLS_SIM="$(yosys-config --datdir)/gowin/cells_sim.v"
