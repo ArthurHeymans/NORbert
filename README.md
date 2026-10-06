@@ -120,6 +120,9 @@ The SPI target interface is untested on hardware, and timing is not
 signed off: nextpnr's GW5A delays are largely borrowed from GW2A, and it
 does not analyse the PLL phase offsets, the SDRAM pin timing or the SPI
 pin timing that the design relies on. Releases stay on the Gowin flow.
+See [timing and CDC contracts](docs/rtl-timing.md) for the phase-aware Gowin
+constraints, required board I/O profile and remaining hardware sign-off.
+Per-change mapped LUT counts are in [RTL utilization](docs/rtl-utilization.md).
 
 ### RTL checks
 
@@ -449,8 +452,11 @@ src/
   sdram.v      Dual-chip SDRAM controller, byte-serial bursts, ping-pong prefetch
   spi_flash_cmds.vh  Emulated SPI flash opcodes and read wait states
   host_protocol.vh   Host serial protocol opcodes and log packet types
-  glue.v       Protocol handler, UART/FT245 I/O, SPI write engine, TOCTOU trap engine, LOGPOLL state machine, prefetch fault latch, LED control
-  logger.v     SPI event capture into a 512-byte ring FIFO drained by CMD_LOGPOLL
+  glue.v       Composition of independent host and SPI program clients
+  host_protocol.v  UART/FT245 protocol, configuration, TOCTOU, LOGPOLL, fault latch and LEDs
+  spi_program.v    Page-buffer BSRAM, NOR program/erase/RMW and completion
+  sdram_client_mux.v  Stable client ownership and acceptance routing
+  logger.v     Ordered capture-frame queue, loss accounting and 512-byte output FIFO
   uart.v       UART TX/RX (2 Mbaud)
   ft245.v      FT2232H async 245 FIFO interface
   fifo.v       Synchronous FIFO (first-word-fall-through)
