@@ -5,7 +5,7 @@
 // tool/src/rtl_sync.rs parses this file and checks tool/src/protocol.rs
 // against it, so `cargo test` fails if the two drift apart.
 
-localparam VERSION = 8'h06;  // Version 6: CMD_PREFETCH diagnostics
+localparam VERSION = 8'h07;  // Version 7: ordered logging and loss-count packets
 
 localparam
     CMD_NOP          = 8'h00,
@@ -26,7 +26,7 @@ localparam
 // reports and clears them, so a fault hit during a long read is still
 // visible once the transaction has ended.
 localparam
-    PREFETCH_UNDERRUN = 8'h01,  // A consumed burst was never filled: stale bytes
+    PREFETCH_UNDERRUN = 8'h01,  // An output sample used an unready SDRAM beat
     PREFETCH_THIN     = 8'h02,  // The next burst had not landed when needed
     PREFETCH_VALID    = 8'h80;  // Always set: a clean reply must not be 0x00 noise
 
@@ -50,4 +50,5 @@ localparam
     LOG_PKT_CMD      = 8'hA1,  // opcode (1)
     LOG_PKT_ADDR     = 8'hA2,  // address (4)
     LOG_PKT_END      = 8'hA3,  // byte count (3)
-    LOG_PKT_TRAP     = 8'hA4;  // trap index, address (3), pad (1)
+    LOG_PKT_TRAP     = 8'hA4,  // trap index, address (3), pad (1)
+    LOG_PKT_LOST     = 8'hA6;  // dropped event count (2), saturated at 65535

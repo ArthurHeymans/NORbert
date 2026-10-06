@@ -77,6 +77,7 @@ fn host_protocol_matches_rtl() {
         ("LOG_PKT_ADDR", LOG_ADDR),
         ("LOG_PKT_END", LOG_END),
         ("LOG_PKT_TRAP", LOG_TRAP),
+        ("LOG_PKT_LOST", LOG_LOST),
     ]
     .into_iter()
     .collect();

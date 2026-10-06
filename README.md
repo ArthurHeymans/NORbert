@@ -299,15 +299,18 @@ TXN#   COMMAND            ADDRESS    INFO
        end: 4097 bytes from 0x001000
 ```
 
-The monitor also tracks double-reads of the same (opcode, address) pair and flags them as TOCTOU candidates. Press Ctrl+C to stop. The underlying protocol is a poll-based ring-buffer drain (`CMD_LOGPOLL` = 0x3A); packet types are `0xA1` (command), `0xA2` (address), `0xA3` (end + byte count) and `0xA4` (TOCTOU trap fired), with `0xA0` as the per-poll terminator. Log bytes equal to `0xA0` or `0xA5` are sent as `0xA5 0x00` and `0xA5 0x05`.
+The monitor also tracks double-reads of the same (opcode, address) pair and flags them as TOCTOU candidates. Press Ctrl+C to stop. The underlying protocol is a poll-based ring-buffer drain (`CMD_LOGPOLL` = 0x3A); packet types are `0xA1` (command), `0xA2` (address), `0xA3` (end + byte count), `0xA4` (TOCTOU trap fired), and `0xA6` (dropped event count), with `0xA0` as the per-poll terminator. Log bytes equal to `0xA0` or `0xA5` are sent as `0xA5 0x00` and `0xA5 0x05`.
 
-The ring holds 503 bytes (512 entries less FIFO headroom), with one event
-pending per packet type behind it. A host that polls slower than the target
-reads will therefore see gaps: the FPGA drops the events it has no pending
-slot for rather than overwriting the ring, so a transaction can lose some of
-its packets (its address, say) and keep others. Packets that do arrive are
-always whole and in order, never torn, corrupted or reordered.
-`tests/logger_tb.sv` checks both the loss and the integrity.
+The byte ring holds 503 bytes, backed by six queued capture frames and one
+frame being emitted. Each frame holds all events seen on one system edge;
+frames are served in capture order, with CMD, ADDR, TRAP, END order for ties.
+When the frame queue fills, new events are dropped without overwriting old
+payloads. A `0xA6` packet reports the gap with a two-byte big-endian count
+(saturated at 65535) before later accepted events. The monitor displays
+`LOG GAP` and discards the previous transaction association. A transaction
+can still lose some packets and keep others, but surviving packets stay
+whole and chronological. `tests/logger_tb.sv` checks cross-type ordering
+behind a full ring and accounts for every retained or dropped event.
 
 ### TOCTOU traps
 
@@ -468,14 +471,14 @@ All opcodes reply with a single `0x01` ACK unless otherwise noted. The FPGA
 accepts command bytes from whichever port (UART or FT245) first delivers one
 while the parser is idle, and routes the response back to the same port.
 
-`VERSION` reports the protocol version, currently 6. The host tool talks to
+`VERSION` reports the protocol version, currently 7. The host tool talks to
 any version from 3 up to its own and enables commands by version, but it
-refuses a newer bitstream rather than guess at its protocol: a version 6
+refuses a newer bitstream rather than guess at its protocol: a version 7
 bitstream needs a tool from the same release or later.
 
 | Opcode | Name       | Args                                                | Reply                            |
 |--------|------------|-----------------------------------------------------|----------------------------------|
-| `0x30` | VERSION    | none                                                | 1 byte (current: `0x06`)         |
+| `0x30` | VERSION    | none                                                | 1 byte (current: `0x07`)         |
 | `0x31` | RAMREAD    | 3-byte burst addr + 2-byte burst count              | `count*8` data bytes             |
 | `0x32` | RAMWRITE   | 3-byte burst addr + 2-byte burst count + data       | `0x01`                           |
 | `0x33` | CHIPCONFIG | JEDEC(3) + flags + erase_bursts(3) + sfdp_len + sfdp| `0x01`                           |

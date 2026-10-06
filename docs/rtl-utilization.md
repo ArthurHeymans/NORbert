@@ -20,3 +20,8 @@ utilization or timing sign-off. Deltas compare against the preceding row.
 | Preserve write completion while deselected | 3190 | +21 |
 | Backpressure FT245 reads with RX FIFO capacity | 3178 | −12 |
 | Check consumed beats and preserve progressive-fill ownership | 3202 | +24 |
+| Queue logger frames chronologically and report dropped events | 3494 | +292 |
+
+The logger queue also adds four `SDPX9B` BSRAM cells (the original four
+`DPX9B` cells remain). It trades those blocks and LUTs for capture-order
+preservation, atomic event payloads, and explicit loss accounting.

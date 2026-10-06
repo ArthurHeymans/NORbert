@@ -48,6 +48,7 @@ module logger_tb;
     localparam LOG_PKT_ADDR = 8'hA2;
     localparam LOG_PKT_END  = 8'hA3;
     localparam LOG_PKT_TRAP = 8'hA4;
+    localparam LOG_PKT_LOST = 8'hA6;
 
     // -----------------------------------------------------------------
     // Capture: a byte queue fed by draining, compared against what the
@@ -203,6 +204,7 @@ module logger_tb;
     endtask
 
     integer total_packets;
+    integer lost_events, kept_events;
 
     initial begin
         repeat (4) @(negedge clk);
@@ -278,10 +280,9 @@ module logger_tb;
 
         // ---- back-pressure: stop draining, nothing torn or reordered ----
         // Stop draining entirely and push far more traffic than the ring
-        // holds. The ring is a byte FIFO with one pending slot per event
-        // type, so under sustained back-pressure it is *lossy*: an event
-        // that arrives while one of its type is still pending is dropped,
-        // and a transaction can keep some of its packets but lose others.
+        // holds. The capture-frame FIFO is lossy under backpressure:
+        // a full queue drops new frames and reports their event count.
+        // A transaction can keep some packets and lose others.
         // What must hold is that every packet that does come out is whole,
         // belongs to a transaction that was sent, and is in order.
         out_read_strobe = 0;
@@ -300,10 +301,11 @@ module logger_tb;
         drain(8192, 200);
         if (got_len == 0)
             $fatal(1, "back-pressure destroyed the whole ring");
-        // At most the ring's usable depth plus one pending packet per type.
-        if (got_len > RING_BYTES + 2 + 5 + 4 + 6)
+        // Byte ring, one emitting frame, six queued frames, and loss records.
+        if (got_len > RING_BYTES + 7*17 + 8*3)
             $fatal(1, "ring produced %0d bytes, more than it can hold", got_len);
         pos = 0; decoded = 0; last_index = -1; last_end = -1;
+        lost_events = 0; kept_events = 0;
         while (pos < got_len) begin
             case (got[pos])
                 LOG_PKT_CMD: begin
@@ -315,6 +317,7 @@ module logger_tb;
                         $fatal(1, "packet %0d has opcode %h, expected 03",
                                decoded, opcode_seen);
                     pos = pos + 2;
+                    kept_events++;
                 end
                 LOG_PKT_ADDR: begin
                     if (got_len - pos < 5)
@@ -333,8 +336,11 @@ module logger_tb;
                     if ($signed(addr_value >> 12) < last_index)
                         $fatal(1, "packet %0d address %h precedes the previous one (%0d): reordered",
                                decoded, addr_value, last_index);
+                    if ($signed(addr_value >> 12) < last_end)
+                        $fatal(1, "old address emitted after newer end: reordered across types");
                     last_index = addr_value >> 12;
                     pos = pos + 5;
+                    kept_events++;
                 end
                 LOG_PKT_END: begin
                     if (got_len - pos < 4)
@@ -350,6 +356,12 @@ module logger_tb;
                                decoded, count_value, last_end);
                     last_end = {8'h00, count_value};
                     pos = pos + 4;
+                    kept_events++;
+                end
+                LOG_PKT_LOST: begin
+                    if (got_len-pos < 3) $fatal(1, "truncated loss packet");
+                    lost_events += int'({got[pos+1],got[pos+2]});
+                    pos += 3;
                 end
                 default:
                     $fatal(1, "packet %0d at byte %0d has type %h, not a packet header",
@@ -357,8 +369,27 @@ module logger_tb;
             endcase
             decoded = decoded + 1;
         end
+        if (kept_events + lost_events != 600 || lost_events == 0)
+            $fatal(1, "loss accounting: kept=%0d lost=%0d, expected 600",kept_events,lost_events);
         $display("LOGGER: 200 transactions pushed with no draining; %0d packets survived (%0d bytes), none torn, corrupted or reordered",
                  decoded, got_len);
+
+        // Reproduce cross-type reordering: freeze a full byte ring, then
+        // capture an older ADDR/END followed by a newer command. They must
+        // survive in capture order rather than command-priority order.
+        quiesce(); got_len = 0; want_len = 0;
+        for (integer i=0; i<252; i++) begin
+            spi_cmd(8'h00);
+            expect_byte(LOG_PKT_CMD); expect_byte(8'h00);
+        end
+        settle(200);
+        spi_addr(32'h0012_3456); spi_deselect(24'h08); spi_cmd(8'h0b);
+        expect_byte(LOG_PKT_ADDR); expect_byte(0); expect_byte(8'h12);
+        expect_byte(8'h34); expect_byte(8'h56);
+        expect_byte(LOG_PKT_END); expect_byte(0); expect_byte(0); expect_byte(8'h08);
+        expect_byte(LOG_PKT_CMD); expect_byte(8'h0b);
+        drain(515, 200);
+        compare_stream("cross-type order behind full ring");
 
         // ---- a full ring followed by a drain, for the wrap path ----
         // Push more traffic than the 512-byte ring holds while draining at
@@ -405,7 +436,7 @@ module logger_tb;
                 $fatal(1, "empty logger reports data");
         end
 
-        $display("PASS LOGGER: %0d packets, byte-exact stream, event priority, enable gate, back-pressure, ring wrap",
+        $display("PASS LOGGER: %0d packets, byte-exact stream, capture order, full-ring cross-type order, loss counts, enable gate and wrap",
                  total_packets);
         $finish;
     end

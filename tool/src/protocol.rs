@@ -9,7 +9,7 @@
 
 use zerocopy::{Immutable, IntoBytes};
 
-pub const PROTOCOL_VERSION: u8 = 6;
+pub const PROTOCOL_VERSION: u8 = 7;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 3;
 
 pub const fn is_supported_protocol_version(version: u8) -> bool {
@@ -83,6 +83,7 @@ pub const LOG_CMD: u8 = 0xA1;
 pub const LOG_ADDR: u8 = 0xA2;
 pub const LOG_END: u8 = 0xA3;
 pub const LOG_TRAP: u8 = 0xA4;
+pub const LOG_LOST: u8 = 0xA6;
 
 #[derive(Clone, Copy, Debug, Eq, Immutable, IntoBytes, PartialEq)]
 #[repr(transparent)]
