@@ -66,6 +66,7 @@ module sdram(
     input wire [24:0] access_addr,   // Access address (25-bit: chip + row + bank + col)
     input wire inhibit_refresh,
     output reg cmd_busy,
+    output reg access_accept,   // One cycle at actual serial-path dispatch
 
     output reg [63:0] read_buffer,
     output reg [63:0] read_buffer_b,
@@ -258,6 +259,7 @@ module sdram(
     integer i;
 
     always @(posedge clk) begin
+        access_accept <= 0;
         if (reset) begin
             state <= STA_INIT;
             cs_o <= 0;           // Select chip 0 for init (CS LOW = chip 0)
@@ -707,6 +709,7 @@ module sdram(
                 end
                 else if (access_cmd == 2'b11) begin
                     // Serial path activate
+                    access_accept <= 1;
                     serial_row_open <= 1;
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
@@ -722,6 +725,7 @@ module sdram(
                 end
                 else if (access_cmd == 2'b01) begin
                     // Serial path read
+                    access_accept <= 1;
                     serial_row_open <= 0;
                     state <= STA_READ;
                     cmdtarget <= tREAD + 2;
@@ -744,6 +748,7 @@ module sdram(
                 end
                 else if (access_cmd == 2'b10) begin
                     // Serial path write
+                    access_accept <= 1;
                     serial_row_open <= 0;
                     state <= STA_WRITE;
                     cmdtarget <= tWRITE;

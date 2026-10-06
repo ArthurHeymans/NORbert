@@ -27,7 +27,7 @@ module spi_flash_tb;
     wire [24:0] access_addr;
     wire [63:0] write_buffer;
     reg [63:0] read_buffer = 0;
-    reg busy = 0;
+    reg busy = 0, accept = 0;
     integer busy_cycles = 0;
     integer outside_model = 0;
     // 8 KiB of model: one SDRAM row of four banks, which is what the
@@ -66,6 +66,7 @@ module spi_flash_tb;
         .ft_rx_pop(ft_rx_pop), .ft_txd_ready(1'b1),
         .ft_txd_strobe(ft_tx_strobe), .ft_txd_data(ft_tx_data),
         .sdram_access_cmd(access), .sdram_access_addr(access_addr), .sdram_cmd_busy(busy),
+        .sdram_access_accept(accept),
         .sdram_read_busy(1'b0), .sdram_read_buffer(read_buffer), .sdram_write_buffer(write_buffer),
         .spi_reset(spi_reset), .spi_csel(cs), .spi_cmd_write(write_cmd),
         .spi_write_type(write_type), .spi_write_addr(write_addr), .spi_write_len(write_len),
@@ -88,12 +89,13 @@ module spi_flash_tb;
     // Model only the glue-facing interface, not SDRAM electrical timings.
     // sdram_controller_tb separately exercises the real controller.
     always @(posedge clk) begin
+        accept <= 0;
         if (busy_cycles > 0) begin
             busy_cycles <= busy_cycles - 1;
             if (busy_cycles == 1) busy <= 0;
         end
-        if (access != 0) begin
-            if (busy) $fatal(1, "SDRAM request while busy");
+        if (access != 0 && !busy) begin
+            accept <= 1;
             busy <= 1;
             busy_cycles <= access == 3 ? 3 : 10;
             // The model flattens (row 0, bank, column) into 8 KiB, so a

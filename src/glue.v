@@ -45,6 +45,7 @@ module glue(
     output reg [24:0] sdram_access_addr,  // 25-bit: {chip, row, bank, col}
     output reg sdram_inhibit_refresh,
     input wire sdram_cmd_busy,
+    input wire sdram_access_accept, // A posted command was actually dispatched
 
     input wire [63:0] sdram_read_buffer,
     input wire sdram_read_busy,
@@ -566,7 +567,10 @@ module glue(
                                     (spi_writing && (i_spi_write_state == 4'd2 || i_spi_write_state == 4'd3 ||
                                                      i_spi_write_state == 4'd6 || i_spi_write_state == 4'd7));
     
-            if (sdram_access_cmd != 2'b00)
+            // Hold the request/address until the controller grants it.
+            // busy describes progress, not acceptance; a refresh or another
+            // owner can defer dispatch after the caller posts a request.
+            if (sdram_access_accept)
                 sdram_access_cmd <= 0;
                 
             spi_csel_buf <= {spi_csel_buf[0], spi_csel};

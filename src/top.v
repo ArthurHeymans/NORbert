@@ -377,6 +377,7 @@ module top(
     wire [24:0] sdram_access_addr;   // 25-bit for serial path
     wire sdram_inhibit_refresh;
     wire sdram_cmd_busy;
+    wire sdram_access_accept;
     
     sdram #(
         .CLK_FREQ_MHZ(120),
@@ -409,6 +410,7 @@ module top(
         .access_addr(sdram_access_addr),
         .inhibit_refresh(sdram_inhibit_refresh),
         .cmd_busy(sdram_cmd_busy),
+        .access_accept(sdram_access_accept),
         
         .read_buffer(sdram_read_buffer),
         .read_buffer_b(sdram_read_buffer_b),
@@ -582,6 +584,7 @@ module top(
         .sdram_access_addr(sdram_access_addr),
         .sdram_inhibit_refresh(sdram_inhibit_refresh),
         .sdram_cmd_busy(sdram_cmd_busy),
+        .sdram_access_accept(sdram_access_accept),
         
         .sdram_read_buffer(sdram_read_buffer),
         .sdram_read_busy(sdram_read_busy),

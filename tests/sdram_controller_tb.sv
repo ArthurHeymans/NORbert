@@ -9,7 +9,7 @@ module sdram_controller_tb;
     reg [1:0] kind = 0;
     reg [22:0] address = 0, length = 0;
     reg [7:0] offset = 0, value = 0;
-    wire done, busy, read_busy, inhibit;
+    wire done, busy, read_busy, inhibit, accept;
     wire [1:0] access;
     wire [24:0] access_addr;
     wire [63:0] write_buffer, read_buffer;
@@ -24,6 +24,7 @@ module sdram_controller_tb;
         .clk(clk), .reset(reset), .rxd_strobe(1'b0), .rxd_data(8'b0), .txd_ready(1'b1),
         .ft_rx_data_available(1'b0), .ft_rx_data(8'b0), .ft_txd_ready(1'b1),
         .sdram_access_cmd(access), .sdram_access_addr(access_addr), .sdram_cmd_busy(busy),
+        .sdram_access_accept(accept),
         .sdram_read_busy(read_busy), .sdram_inhibit_refresh(inhibit),
         .sdram_read_buffer(read_buffer), .sdram_write_buffer(write_buffer),
         .spi_reset(1'b0), .spi_csel(cs), .spi_cmd_write(command), .spi_write_type(kind),
@@ -37,14 +38,14 @@ module sdram_controller_tb;
         .clk(clk), .aux_clk(clk), .reset(reset), .dq_io(dq),
         .spi_active(1'b0), .spi_inhibit_refresh(1'b0), .spi_cmd_activate(1'b0),
         .spi_cmd_read(1'b0), .spi_addr(23'b0), .access_cmd(access), .access_addr(access_addr),
-        .inhibit_refresh(inhibit), .cmd_busy(busy), .read_buffer(read_buffer),
+        .inhibit_refresh(inhibit), .cmd_busy(busy), .access_accept(accept), .read_buffer(read_buffer),
         .read_busy(read_busy), .write_buffer(write_buffer), .ras_o(ras), .cas_o(cas), .we_o(we)
     );
 
     always @(posedge clk) begin
         cycles <= cycles + 1;
         previous_access <= access;
-        if (checking && access != 0) requests <= requests + 1;
+        if (checking && access != 0 && previous_access == 0) requests <= requests + 1;
     end
     always @(negedge clk) begin
         if (checking) begin
@@ -54,7 +55,7 @@ module sdram_controller_tb;
                     max_refresh_gap = cycles-last_refresh;
                 last_refresh = cycles;
             end
-            case (previous_access)
+            if (accept) case (previous_access)
                 3: begin
                     if (!(!ras && cas && we)) $fatal(1, "ACTIVATE was not accepted");
                     accepted++;
@@ -67,7 +68,7 @@ module sdram_controller_tb;
                     if (!(ras && !cas && !we)) $fatal(1, "WRITE was not accepted");
                     accepted++; writes++;
                 end
-                default: ;
+                default: $fatal(1, "accept without a request");
             endcase
         end
     end
