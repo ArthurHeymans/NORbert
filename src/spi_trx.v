@@ -276,11 +276,14 @@ module spi_trx(
     always @(posedge spi_clk) begin
         write_done_sync <= {write_done_sync[1:0], write_done};
 
+        // SCK can keep running for another slave while this CS is high.
+        // Consume completion independently of selection, before the
+        // selected state machine (which may start a new operation).
+        if (write_busy_clr)
+            status_reg[0] <= 0;
+
         if (is_selected) begin
             fresh_read <= 0;
-            
-            if (status_reg[0] && write_busy_clr)
-                status_reg[0] <= 0;
             
             if (reset_cs || reset_power) begin
                 bit_count_in <= 6;
