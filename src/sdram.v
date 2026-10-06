@@ -71,6 +71,10 @@ module sdram(
     output reg [63:0] read_buffer_b,
     output reg read_valid_a,
     output reg read_valid_b,
+    // One bit per published 16-bit beat. Cleared before reuse and set
+    // with its data, so high-offset/short reads can check their own bytes.
+    output reg [3:0] read_beats_a,
+    output reg [3:0] read_beats_b,
     output reg read_busy,
 
     input wire [63:0] write_buffer
@@ -178,6 +182,10 @@ module sdram(
     // serial-path reads are impossible while SPI is active (glue
     // serial_gate) and both sides restart at buffer A on every CS drop.
     reg fill_sel;
+    // Posts describe future buffers, not the fill currently in flight.
+    // Track their order separately so a post during progressive publish
+    // cannot invalidate already-published beats of the current burst.
+    reg post_fill_sel;
     reg fill_reset_armed;
     reg serial_read_active;
     // Edge-arming for the SPI fast path. A dispatch additionally requires
@@ -276,6 +284,8 @@ module sdram(
             read_buffer_b <= 0;
             read_valid_a <= 0;
             read_valid_b <= 0;
+            read_beats_a <= 0;
+            read_beats_b <= 0;
             read_busy <= 0;
             readcount <= 0;
 
@@ -293,6 +303,7 @@ module sdram(
             spi_activate_done <= 0;
             spi_addr_latched <= 0;
             fill_sel <= 0;
+            post_fill_sel <= 1;
             fill_reset_armed <= 0;
             serial_read_active <= 0;
             spi_act_armed <= 1;
@@ -353,8 +364,9 @@ module sdram(
             // invalidating here can never clobber a completed fill.
             spi_post_sync <= {spi_post_sync[1:0], spi_cmd_post_toggle};
             if (spi_post_sync[1] ^ spi_post_sync[2]) begin
-                if (fill_sel) read_valid_b <= 0;
-                else read_valid_a <= 0;
+                if (post_fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
+                else begin read_valid_a <= 0; read_beats_a <= 0; end
+                post_fill_sel <= ~post_fill_sel;
             end
             
             if (spi_cmd_activate_ack && !spi_cmd_activate_buf[1]) begin
@@ -651,8 +663,11 @@ module sdram(
                     spi_act_armed <= 0;
                     if (fill_reset_armed) begin
                         fill_sel <= 0;
+                        post_fill_sel <= 1;
                         read_valid_a <= 0;
                         read_valid_b <= 0;
+                        read_beats_a <= 0;
+                        read_beats_b <= 0;
                         fill_reset_armed <= 0;
                     end
 
@@ -675,8 +690,8 @@ module sdram(
                     serial_read_active <= 0;
                     // Invalidate the fill target up front; set again below
                     // when the final beat publishes.
-                    if (fill_sel) read_valid_b <= 0;
-                    else read_valid_a <= 0;
+                    if (fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
+                    else begin read_valid_a <= 0; read_beats_a <= 0; end
 
                     // READ command with auto-precharge
                     cs_o <= spi_chip_sel;
@@ -713,6 +728,7 @@ module sdram(
                     read_busy <= 1;
                     serial_read_active <= 1;
                     read_valid_a <= 0;
+                    read_beats_a <= 0;
 
                     // READ command with auto-precharge
                     cs_o <= access_chip_sel;
@@ -792,12 +808,15 @@ module sdram(
                 // ping-pong fill target). Beats of one READ arrive
                 // back-to-back, so later bytes are always ready long before
                 // the SPI side shifts them out; only the first byte(s) of a
-                // burst are timing-critical. Validity (bytes 0-1 ready) is
-                // therefore set with beat 0; the underrun check only ever
-                // inspects a buffer whose full fill completed a whole burst
-                // earlier, so early-valid is conservative-safe.
+                // burst are timing-critical. read_valid marks beat 0 for
+                // the thin-margin check; read_beats marks each beat for
+                // actual output checks, including high-offset short reads.
                 // (Explicit lanes rather than variable part-selects: safest
                 // across Yosys, Verilator, and Gowin synthesis.)
+                if (serial_read_active || !fill_sel)
+                    read_beats_a[rdbuf_write_ptr] <= 1;
+                else
+                    read_beats_b[rdbuf_write_ptr] <= 1;
                 case (rdbuf_write_ptr)
                     2'd0: begin
                         if (serial_read_active) begin
@@ -828,6 +847,7 @@ module sdram(
                             read_buffer[63:48] <= dq_captured;
                             read_valid_a <= 1;
                             read_valid_b <= 0;
+                            read_beats_b <= 0;
                             fill_sel <= 0;
                             serial_read_active <= 0;
                         end

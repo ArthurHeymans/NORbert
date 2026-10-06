@@ -19,3 +19,4 @@ utilization or timing sign-off. Deltas compare against the preceding row.
 | Bound refresh deferral and release refresh during host TX stalls | 3169 | +35 |
 | Preserve write completion while deselected | 3190 | +21 |
 | Backpressure FT245 reads with RX FIFO capacity | 3178 | −12 |
+| Check consumed beats and preserve progressive-fill ownership | 3202 | +24 |

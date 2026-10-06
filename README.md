@@ -9,7 +9,7 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 - **SPI NOR flash emulation** with full command support: read, fast read, page program, sector/block/chip erase, JEDEC ID, status registers, SFDP
 - **Configurable chip identity** at runtime -- load any chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database to set JEDEC ID, size, and SFDP parameters (defaults to Winbond W25Q64FV)
 - **Multi-I/O modes**: 1-1-1, 1-1-2, 1-2-2, 1-1-4, and 1-4-4 SPI read modes
-- **Fast SPI reads**: one-burst lookahead with ping-pong SDRAM buffers sustains 50 MHz single/dual/quad reads and 60-70 MHz quad reads (see limits below)
+- **Fast SPI reads**: one-burst lookahead with ping-pong SDRAM buffers supports 40 MHz dummy-less/quad-I/O reads and 50-70 MHz dummy-assisted reads in simulation (see limits below)
 - **64MB backing store** using two SDRAM chips with byte-serial burst layout for minimal first-byte latency
 - **Pipelined prefetch**: SDRAM reads are issued during SPI address/dummy phases so data is ready on the first clock edge
 - **2 Mbaud UART** interface for loading and dumping images from a host PC
@@ -384,22 +384,27 @@ not replace that.
 
 | Command | Mode | Simulated max (all offsets) | Notes |
 |---------|------|-----------------------------|-------|
-| 0x03 Read | 1-1-1 | 50 MHz | No dummy clocks; hardest first burst |
+| 0x03 Read | 1-1-1 | 40 MHz | No dummy clocks; hardest first burst |
 | 0x0B Fast Read | 1-1-1 | 70 MHz | 8 dummy clocks |
 | 0x3B Dual Output | 1-1-2 | 50 MHz (spot) | 8 dummy clocks |
 | 0xBB Dual I/O | 1-2-2 | 60 MHz | 4 mode clocks |
 | 0x6B Quad Output | 1-1-4 | 70 MHz | 8 dummy clocks |
-| 0xEB Quad I/O | 1-4-4 | 50 MHz | 6 mode clocks; offset 7 flags thin |
+| 0xEB Quad I/O | 1-4-4 | 40 MHz | 6 mode clocks; offset 7 is limiting |
 
-Known corners (all flagged by the FPGA's prefetch fault flags -- see
-`spi-flash-tool prefetch` below, never silent):
+The matrix requires both correct data and ready beats at the output edges.
+Earlier 50 MHz claims for 0x03/0xEB relied on an eventual burst-valid flag
+and a linear pattern whose high bits could hide stale first bits. The new
+mixed-address pattern and per-beat checks expose those failures, including
+short reads. The same limits apply to the corresponding four-byte opcodes.
 
-- **Quad-I/O reads starting at offset 7 above 50 MHz** need the second burst
-  ~30 ns before a single SDRAM controller can physically produce it. Use
-  offset <= 6 or <= 50 MHz for 0xEB.
-- **Slow reads above ~60 MHz** run out of first-burst window (3.5 clocks, no
-  dummy). Real NOR flashes cap 0x03 the same way (f_R < f_C).
-- **70 MHz dual-I/O offset 7** passes with thin margin flagged.
+Known corners detected by the simulated prefetch fault checks:
+
+- **Quad-I/O offset 7 at 50 MHz and above** can need the second burst before
+  it is ready. Use <= 40 MHz for all offsets, or validate a narrower range.
+- **Slow reads above 40 MHz** can run out of their 3.5-clock first-burst
+  window, particularly at high offsets. Real NOR flashes likewise impose a
+  lower clock limit on 0x03 than on dummy-assisted reads.
+- **70 MHz dual-I/O reads** can underrun; 60 MHz is the all-offset limit.
 
 If you need more: the levers are open-row (skip re-ACTIVATE on same-row
 bursts, saves ~2 sysclks per burst) and master-configured extra dummy clocks
@@ -417,12 +422,13 @@ spi-flash-tool prefetch
 The flags are latched in the FPGA and cleared by the read that reports them,
 so the check covers everything since the previous one:
 
-- **underrun** (`0x01`) -- a burst was shifted out of the SPI data path
-  before the SDRAM controller filled it. The target read stale bytes. This
-  is a correctness failure, not a margin warning.
-- **thin margin** (`0x02`) -- the next burst had not landed when its first
-  byte was needed. Not necessarily corruption, but the margin is gone and a
-  slightly longer SDRAM access would turn it into an underrun.
+- **underrun** (`0x01`) -- an output bit used a byte whose SDRAM beat was
+  not ready when the output path sampled it. The data is untrusted even if
+  stale bits happened to equal the intended data. Checked on each data
+  sampling edge, not only at burst end, so short reads are covered.
+- **thin margin** (`0x02`) -- the upcoming burst's first beat was not ready
+  at the burst boundary. Not necessarily corruption; individual beat
+  validity determines whether later output actually underruns.
 
 The command is safe to run while the target is reading, and the web UI has
 the same check as **Check prefetch** on the Device panel. An underrun means

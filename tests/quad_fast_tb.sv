@@ -27,6 +27,7 @@ module quad_fast_tb;
     wire ram_act, ram_read, ram_cont, ram_inh;
     wire [63:0] read_buffer_a, read_buffer_b;
     wire read_valid_a, read_valid_b, read_busy;
+    wire [3:0] read_beats_a, read_beats_b;
     wire post_toggle;
     wire thin;
     integer thin_hits = 0;
@@ -42,6 +43,7 @@ module quad_fast_tb;
         .ram_continuation(ram_cont), .ram_addr(ram_addr),
         .ram_read_buffer(read_buffer_a), .ram_read_buffer_b(read_buffer_b),
         .ram_read_valid_a(read_valid_a), .ram_read_valid_b(read_valid_b),
+        .ram_read_beats_a(read_beats_a), .ram_read_beats_b(read_beats_b),
         .ram_read_busy(read_busy), .ram_post_toggle(post_toggle), .prefetch_thin(thin),
         .write_done(1'b0), .cfg_jedec_id(24'h4125bf), .cfg_4byte(cfg_4byte),
         .cfg_chip_erase_bursts(23'h7fffff),
@@ -64,6 +66,7 @@ module quad_fast_tb;
         .access_cmd(2'b00), .access_addr(25'b0), .inhibit_refresh(1'b0),
         .read_buffer(read_buffer_a), .read_buffer_b(read_buffer_b),
         .read_valid_a(read_valid_a), .read_valid_b(read_valid_b),
+        .read_beats_a(read_beats_a), .read_beats_b(read_beats_b),
         .read_busy(read_busy), .write_buffer(64'b0)
     );
 
@@ -79,8 +82,10 @@ module quad_fast_tb;
     integer refreshes = 0;
 
     function [7:0] exp_byte(input [22:0] burst, input [2:0] idx);
-        exp_byte = burst[7:0] + idx * 8'd37 + burst[15:8]
-                 + burst[22:16] * 8'd3 + 8'h51;
+        // Mix low address bits into high data bits. A linear counter can
+        // hide stale MSBs when the first beat arrives after an output edge.
+        exp_byte = (burst[7:0] * 8'h9d) ^ (burst[15:8] * 8'hcb)
+                 ^ (burst[22:16] * 8'h7f) ^ (idx * 8'h57) ^ 8'h51;
     endfunction
 
     // Expected byte i of a read from byte address a. The DUT addresses
@@ -284,6 +289,8 @@ module quad_fast_tb;
     // checking every byte against the pattern function.
     task cell_mismatch(input [8:0] opcode, input [31:0] a, input integer i,
                         input [7:0] got, input [7:0] want);
+        if (!underrun)
+            $fatal(1, "corrupt read was not flagged: opcode %h addr %h+%0d", opcode, a, i);
         cell_fail($sformatf("opcode %h addr %h+%0d: got %h want %h @ %0.1fMHz",
                             opcode, a, i, got, want, 1000.0/(2*sclk_half)));
     endtask
@@ -466,10 +473,10 @@ module quad_fast_tb;
         sweep_offsets(9'h6b, 32, 32'h002000);
         $display("quad_fast: 30MHz calibration OK");
 
-        // Slow read at 50MHz, all offsets (no dummy: hardest first burst).
-        sclk_half = 10.0;
+        // Slow read at 40MHz, all offsets (no dummy: hardest first burst).
+        sclk_half = 12.5;
         sweep_offsets(9'h03, 32, 32'h003000);
-        $display("quad_fast: 0x03 @50MHz OK");
+        $display("quad_fast: 0x03 @40MHz OK");
 
         // Fast single at 70MHz.
         sclk_half = 7.143;
@@ -500,19 +507,23 @@ module quad_fast_tb;
         sweep_offsets(9'h6b, 32, 32'h00a000);
         $display("quad_fast: 0x6B @70MHz OK");
 
-        // Quad-IO at 50MHz (supported), 60/70MHz (explore: offset 7 is
-        // physics-limited -- second burst needed ~30ns before the single
-        // controller can produce it -- expect EXPLORE-FAIL there).
-        sclk_half = 10.0;
+        // Quad-IO at 40MHz supports every offset. At 50MHz and above,
+        // offset 7 can use unready first bits even when their values happen
+        // to match; classify those cells as exploration, not supported.
+        sclk_half = 12.5;
         sweep_offsets(9'heb, 32, 32'h00b000);
-        $display("quad_fast: 0xEB @50MHz OK");
+        $display("quad_fast: 0xEB @40MHz OK");
+        sclk_half = 10.0;
+        sweep_offsets(9'heb, 32, 32'h00b800, 0);
         sclk_half = 8.333;
         sweep_offsets(9'heb, 32, 32'h00c000, 0);
         sclk_half = 7.143;
         sweep_offsets(9'heb, 32, 32'h00d000, 0);
         // Dual-IO at 70MHz (explore: short mode phase + tiny first bursts).
         sweep_offsets(9'hbb, 32, 32'h00e000, 0);
-        // Slow read at 60MHz (explore: 3.5-clock first-burst window).
+        // Slow read above 40MHz (explore: only 3.5 clocks for all beats).
+        sclk_half = 10.0;
+        sweep_offsets(9'h03, 32, 32'h00f800, 0);
         sclk_half = 8.333;
         sweep_offsets(9'h03, 32, 32'h00f000, 0);
 
@@ -522,9 +533,9 @@ module quad_fast_tb;
         // offsets each, at the frequency each command is documented for.
         // cfg_4byte is set so the engine accepts the mode commands too.
         cfg_4byte = 1'b1;
-        sclk_half = 10.0;   // 50 MHz: no-dummy read, same limit as 0x03
+        sclk_half = 12.5;   // 40 MHz: no-dummy read, same limit as 0x03
         sweep_offsets(9'h13, 32, 32'h0023_4500);
-        $display("quad_fast: 0x13 4-byte read @50MHz OK");
+        $display("quad_fast: 0x13 4-byte read @40MHz OK");
         sclk_half = 7.143;  // 70 MHz: 8 dummy clocks, same as 0x0B
         sweep_offsets(9'h0c, 32, 32'h0123_4500);
         $display("quad_fast: 0x0C 4-byte fast read @70MHz OK");
@@ -537,9 +548,9 @@ module quad_fast_tb;
         sclk_half = 8.333;  // 60 MHz, same as 0xBB
         sweep_offsets(9'hbc, 32, 32'h0123_4500);
         $display("quad_fast: 0xBC 4-byte dual-io @60MHz OK");
-        sclk_half = 10.0;   // 50 MHz, same as 0xEB
+        sclk_half = 12.5;   // 40 MHz, same as 0xEB
         sweep_offsets(9'hec, 32, 32'h0023_4500);
-        $display("quad_fast: 0xEC 4-byte quad-io @50MHz OK");
+        $display("quad_fast: 0xEC 4-byte quad-io @40MHz OK");
         // Long sequential runs across row/bank boundaries with refresh
         // coexistence: 2KB from 0x3FF800 crosses the 4KB row at 0x400000
         // plus bank boundaries on the way. (Chip select is byte 25,
