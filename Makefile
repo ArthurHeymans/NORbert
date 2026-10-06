@@ -76,7 +76,9 @@ $(OSS_BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) $(OSS_SDC)
 	gowin_pack -d GW5A-25A --i2c_as_gpio --sspi_as_gpio --mspi_as_gpio \
 		--ready_as_gpio --done_as_gpio --cpu_as_gpio -o $@ $(OSS_DIR)/pnr.json
 
-# Open-source syntax, elaboration, and synthesis checks.
+# Open-source syntax, elaboration, and synthesis checks. Match build-oss's
+# plain-LUT/BSRAM mapping. Acknowledge only ABC9's experimental XAIG writer;
+# genuine design warnings still fail the build.
 lint: lint-yosys lint-verilator
 
 # The pinned ABC9 backend uses the experimental XAIG writer. Acknowledge
@@ -86,7 +88,7 @@ lint-yosys:
 		-w "define gw1n not used.*" \
 		-w "Yosys has only limited support for tri-state logic.*" \
 		-e ".*" \
-		-p "read_verilog -lib $(GOWIN_CELLS); read_verilog -Isrc $(VERILOG_FILES); synth_gowin -family gw5a -top top -noflatten; check"
+		-p "read_verilog -lib $(GOWIN_CELLS); read_verilog -Isrc $(VERILOG_FILES); synth_gowin -family gw5a -nolutram -nowidelut -top top -noflatten; check"
 
 # Width warnings are on deliberately: the address arithmetic here is 23-bit
 # burst addresses wrapped by a mask, so a silent truncation is the most
