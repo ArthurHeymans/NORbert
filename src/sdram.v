@@ -217,13 +217,20 @@ module sdram(
     // independent 2-FF synchronizers cause read_buf[1] to appear before
     // activate_buf[1] (Bug #3 fix).
     reg spi_activate_done;
+    assign spi_row_idle = !spi_activate_done || spi_cmd_read_ack;
     
     wire do_inhibit_refresh = (spi_inhibit_refresh_buf[1] || inhibit_refresh);
     // Registered deadline flags keep counter arithmetic/comparison out of
     // the command/read-buffer dispatch path. Predict the increment so the
     // flags describe the same elapsed time as refreshcount after each edge.
     reg refresh_due, hard_refresh_due;
+    // At most one client may hold a row between its ACTIVATE and the
+    // auto-precharged READ/WRITE. The SPI fast path outranks serial
+    // requests, so both directions are interlocked explicitly: an SPI
+    // post cannot open a bank under a serial pair, and a serial request
+    // or refresh cannot run while an SPI row waits for its READ.
     reg serial_row_open;
+    wire spi_row_idle;
     
     // Address decoding for MT48LC16M16A2 (2 × 32MB = 64MB)
     // SPI path: 23-bit burst address
@@ -385,7 +392,14 @@ module sdram(
             
             if (spi_cmd_activate_ack && !spi_cmd_activate_buf[1]) begin
                 spi_cmd_activate_ack <= 0;
-                spi_activate_done <= 0;
+                // The SPI side can withdraw a post (re-arm drop or CS
+                // release) after its ACTIVATE but before its READ was
+                // dispatched, e.g. when a refresh delayed the pair. The row
+                // is then still open: keep tracking it and close it.
+                if (spi_cmd_read_ack || !spi_activate_done)
+                    spi_activate_done <= 0;
+                else
+                    spi_abort_pending <= 1;
             end
             if (spi_cmd_read_ack && !spi_cmd_read_buf[1]) spi_cmd_read_ack <= 0;
 
@@ -666,7 +680,8 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
-                else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed) begin
+                else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
+                         !serial_row_open) begin
                     // SPI fast-path activate
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
@@ -693,7 +708,8 @@ module sdram(
                     ba_o <= spi_addr[8:7];
                     a_o <= spi_addr[21:9];
                 end
-                else if (spi_cmd_read_buf[1] && !spi_cmd_read_ack && spi_activate_done && spi_read_armed) begin
+                else if (spi_cmd_read_buf[1] && !spi_cmd_read_ack && spi_activate_done && spi_read_armed &&
+                         !serial_row_open) begin
                     // SPI fast-path read
                     state <= STA_READ;
                     cmdtarget <= tREAD;
@@ -718,7 +734,7 @@ module sdram(
                     dq_oe_o <= 0;
                     dqm_o <= 2'b00;
                 end
-                else if (access_cmd == 2'b11) begin
+                else if (access_cmd == 2'b11 && spi_row_idle) begin
                     // Serial path activate
                     access_accept <= 1;
                     serial_row_open <= 1;
@@ -734,7 +750,7 @@ module sdram(
                     ba_o <= access_bank;
                     a_o <= access_row;
                 end
-                else if (access_cmd == 2'b01) begin
+                else if (access_cmd == 2'b01 && spi_row_idle) begin
                     // Serial path read
                     access_accept <= 1;
                     serial_row_open <= 0;
@@ -757,7 +773,7 @@ module sdram(
                     dq_oe_o <= 0;
                     dqm_o <= 2'b00;
                 end
-                else if (access_cmd == 2'b10) begin
+                else if (access_cmd == 2'b10 && spi_row_idle) begin
                     // Serial path write
                     access_accept <= 1;
                     serial_row_open <= 0;
@@ -780,7 +796,7 @@ module sdram(
                     dq_o <= write_buffer[15:0];
                     dqm_o <= 2'b00;
                 end
-                else if (refresh_due && !do_inhibit_refresh) begin
+                else if (refresh_due && !do_inhibit_refresh && spi_row_idle) begin
                     // Auto refresh - alternate between chips
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;

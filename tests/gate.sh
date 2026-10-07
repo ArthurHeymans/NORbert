@@ -49,7 +49,7 @@ sim() {
     echo "Gate-level testing $tb"
     verilator --binary --timing -j 2 --top-module "${tb}_tb" -Isrc -DGOWIN_GW5A \
         -Wno-fatal -Wno-lint -Wno-style -Wno-PINNOTFOUND -Wno-TIMESCALEMOD \
-        --Mdir "$build/$tb" "tests/${tb}_tb.sv" "$@" \
+        --Mdir "$build/$tb" "tests/${tb}_tb.sv" tests/sdram_bank_checker.sv "$@" \
         tests/gw5a_cells_sim.v "$CELLS_SIM" >"$build/$tb.log" 2>&1 \
         || { cat "$build/$tb.log"; exit 1; }
     "$build/$tb/V${tb}_tb"
@@ -72,6 +72,9 @@ sim sdram_controller "$build/sdram_controller.glue.v" "$build/sdram_controller.s
 synth refresh glue
 synth refresh sdram "" "-set CLK_FREQ_MHZ 120"
 sim refresh "$build/refresh.glue.v" "$build/refresh.sdram.v"
+
+synth sdram_protocol sdram "serial_read_active refreshcount spi_activate_done serial_row_open" "-set CLK_FREQ_MHZ 120"
+sim sdram_protocol "$build/sdram_protocol.sdram.v"
 
 synth access_handshake glue
 sim access_handshake "$build/access_handshake.glue.v"
