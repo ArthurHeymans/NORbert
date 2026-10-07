@@ -4,18 +4,26 @@
 // Ported for Tang Primer 25K with 64MB external SDRAM (23-bit burst addresses)
 // Serial path uses 25-bit access_addr = {chip, row[12:0], bank[1:0], col[8:0]}
 //
-// Accepts bytes from EITHER UART or FT245.  When idle (no active command),
-// whichever port delivers a byte first becomes the "active port" for that
-// entire command.  Responses are routed back to the same port.
+// Accepts bytes from EITHER UART or FT245, each through its own receive
+// FIFO.  When idle (no active command), whichever port has a byte first
+// becomes the "active port" for that entire command; bytes from the other
+// port wait in their FIFO until the command ends.  Responses are routed
+// back to the same port.
+//
+// A byte is only popped when it can be processed, never dropped: bytes of
+// the SDRAM/configuration commands (RAMREAD, RAMWRITE, CHIPCONFIG) wait
+// while the SPI bus is selected or the program engine owns SDRAM. All
+// other commands (including HOLDCTL, LOGCTL and TOCTOU and their argument
+// bytes) touch neither and are processed regardless of the SPI bus.
 //
 // SPI emulation is gated by `spi_running`, controlled by the START (0x34)
 // and STOP (0x35) serial commands.  At power-on/reset the FPGA starts in
 // STOPPED state, which means spi_trx is held in reset via top.v (so SPI
 // pin state never blocks serial traffic) and all serial commands are
-// accepted.  When RUNNING, only the always-safe commands (VERSION, START,
-// STOP, STATUS) are processed so the host can reach NORbert regardless of
-// what the emulated master is doing; destructive commands (RAMREAD,
-// RAMWRITE, CHIPCONFIG) are rejected until the host sends STOP.
+// accepted.  When RUNNING, the SDRAM/configuration commands (RAMREAD,
+// RAMWRITE, CHIPCONFIG) are rejected until the host sends STOP; all other
+// commands keep working so the host can reach NORbert regardless of what
+// the emulated master is doing.
 
 `default_nettype none
 
@@ -129,11 +137,16 @@ module host_protocol(
     reg [7:0] cmd;
     reg [7:0] in_count;
     
-    // Idle timeout: reset serial parser if no byte received within ~546us
-    // while in middle of a multi-byte command.  Handles spurious bytes
-    // from USB-UART bridge on port open/close.
-    // At 120MHz, 2^16 = 65536 cycles = ~546us
-    reg [16:0] serial_idle_count;
+    // Idle timeout: reset the parser if no byte arrives for a while in the
+    // middle of a multi-byte command. Handles spurious bytes from the
+    // USB-UART bridge on port open/close. Headers time out after 2^16
+    // cycles (~546us). A RAMWRITE payload gets 2^22 cycles (~35ms): after
+    // a timeout the remaining payload bytes would be parsed as commands,
+    // so a USB stall inside a block must not trigger it. Hosts wait longer
+    // than that before resynchronizing (tool/src/protocol.rs).
+    reg [22:0] serial_idle_count;
+    wire serial_idle_expired = (cmd == CMD_RAMWRITE && in_count > 8'd5) ?
+                               serial_idle_count[22] : serial_idle_count[16];
 
     reg [22:0] addr;       // 23-bit burst address
     reg [15:0] len;        // 16-bit burst count (v3: 2 header bytes)
@@ -204,36 +217,57 @@ module host_protocol(
                     (log_poll_state == 0);
     wire mux_txd_ready = active_port ? ft_txd_ready : txd_ready;
 
-    // Serial handler gate: only consume FIFO bytes when SPI is inactive.
-    // This prevents popping bytes that the serial handler would ignore,
-    // which is the root cause of the ACK corruption (0x00 instead of 0x01).
-    // When spi_running=0, top.v forces this module's spi_reset input high
-    // so this gate collapses to just !spi_writing (which is always 0 when
-    // stopped, since spi_trx is in reset and cannot initiate writes).
+    // SDRAM gate: SDRAM/configuration commands only proceed while the SPI
+    // bus is idle and the program engine does not own SDRAM. When
+    // spi_running=0, top.v forces this module's spi_reset input high so
+    // this gate collapses to just !spi_writing.
     wire serial_gate = (spi_reset || spi_csel_buf[1]) && !spi_writing;
 
-    // Always-safe command bypass: when the parser is idle and the next
-    // byte waiting in the FT245 RX FIFO is an argument-free
-    // VERSION/START/STOP/STATUS/PREFETCH/LOGPOLL opcode, pop it even if
-    // serial_gate is closed (SPI master mid-transaction).  Any argument
-    // byte would stay stuck here until CS rises, so only argument-free
-    // commands qualify.  These commands do not touch SDRAM or spi_trx state
-    // and are handled in a separate dispatcher below, so letting them
-    // through while SPI is live is safe and guarantees the host can
-    // always reach the FPGA.
-    wire peek_is_always_safe = cmd_idle &&
-                               ((ft_rx_data == CMD_VERSION) ||
-                                (ft_rx_data == CMD_START)   ||
-                                (ft_rx_data == CMD_STOP)    ||
-                                (ft_rx_data == CMD_STATUS)  ||
-                                (ft_rx_data == CMD_PREFETCH) ||
-                                (ft_rx_data == CMD_LOGPOLL));
+    // Commands that never touch SDRAM, chip configuration or spi_trx state.
+    // They and their argument bytes bypass the SDRAM gate.
+    function ungated_opcode;
+        input [7:0] op;
+        begin
+            case (op)
+            CMD_VERSION, CMD_START, CMD_STOP, CMD_STATUS, CMD_PREFETCH,
+            CMD_LOGPOLL, CMD_HOLDCTL, CMD_LOGCTL, CMD_TOCTOU:
+                ungated_opcode = 1'b1;
+            default:
+                ungated_opcode = 1'b0;
+            endcase
+        end
+    endfunction
 
-    // Hold flag: prevent double-consume from FIFO.  Set for 1 cycle
-    // after popping a byte, cleared the next cycle.  Gives a 2-cycle
-    // cadence (consume, process, consume, ...) which is well within
-    // the FT245's ~12-cycle byte delivery rate.
-    reg ft_rx_hold;
+    // UART receive FIFO. The UART has no flow control, so its bytes are
+    // buffered here like the FT245's (in top.v) instead of being dropped
+    // while they cannot be processed.
+    wire uart_rx_available;
+    wire [7:0] uart_rx_data;
+    wire uart_rx_space;
+    reg uart_rx_pop;
+    fifo #(.WIDTH(8), .NUM(16), .FREESPACE(1)) uart_rx_fifo(
+        .clk(clk), .reset(reset),
+        .write_data(rxd_data), .write_strobe(rxd_strobe && uart_rx_space),
+        .space_available(uart_rx_space),
+        .data_available(uart_rx_available), .more_available(),
+        .read_data(uart_rx_data), .read_strobe(uart_rx_pop));
+
+    // Pull arbitration. Between commands either port may start one; during
+    // a command only its port is read, and nothing is read while LOGPOLL
+    // drains or a RAMREAD response streams. A byte is popped only if it
+    // will be processed: the next one opens or continues an ungated
+    // command, or the SDRAM gate is open. Both FIFOs pop with registered
+    // strobes, so rx_hold spaces pops two cycles apart (well within the
+    // FT245's ~22-cycle byte delivery).
+    reg rx_hold;
+    wire cmd_ungated = cmd == CMD_HOLDCTL || cmd == CMD_LOGCTL || cmd == CMD_TOCTOU;
+    wire rx_parser_ready = !rx_hold && (cmd_idle || (in_count != 0 && read_state == 0));
+    wire ft_rx_take = rx_parser_ready && ft_rx_data_available &&
+                      (cmd_idle || active_port) &&
+                      (serial_gate || (cmd_idle ? ungated_opcode(ft_rx_data) : cmd_ungated));
+    wire uart_rx_take = rx_parser_ready && uart_rx_available && !ft_rx_take &&
+                        (cmd_idle || !active_port) &&
+                        (serial_gate || (cmd_idle ? ungated_opcode(uart_rx_data) : cmd_ungated));
 
     // Pipeline-aware TX flow control.
     // After txd_strobe_buf fires, it takes 2 cycles for ft245 to latch
@@ -258,8 +292,10 @@ module host_protocol(
     reg spi_run_requested;
     assign spi_running = spi_run_requested && pp_init_done;
 
-    // A program command can take ownership only between host operations.
-    assign program_allowed = spi_csel_buf[1] && read_state == 0 && write_state == 0 &&
+    // A program command can take ownership only between host commands: a
+    // multi-byte command's remaining bytes must not wait behind it.
+    assign program_allowed = spi_csel_buf[1] && in_count == 0 &&
+                             read_state == 0 && write_state == 0 &&
                              !write_strobe && host_access_cmd == 0 &&
                              !sdram_cmd_busy && !sdram_read_busy;
     assign sdram_access_cmd = host_access_cmd;
@@ -354,7 +390,8 @@ module host_protocol(
             
             active_port <= 0;
             ft_rx_pop <= 0;
-            ft_rx_hold <= 0;
+            uart_rx_pop <= 0;
+            rx_hold <= 0;
             ft_txd_strobe <= 0;
             ft_txd_data <= 0;
             
@@ -428,32 +465,20 @@ module host_protocol(
                 ft_txd_strobe <= 0;
             end
 
-            // Pull-based RX mux: FT245 FIFO has priority over UART.
-            // Normally we only pop when the serial handler gate is open,
-            // preventing byte loss during SPI CS noise or spi_writing.
-            // However, if the byte at the head of the FIFO is an always-
-            // safe command (see peek_is_always_safe) AND the parser is
-            // idle, pop it anyway -- the always-safe dispatcher below can
-            // handle it without touching SDRAM or spi_trx state.  This is
-            // what lets the host issue STOP while SPI is actively being
-            // read, recovering control of the device.
-            ft_rx_pop <= 0;
-            if (ft_rx_data_available && !ft_rx_hold &&
-                (serial_gate || peek_is_always_safe)) begin
-                rxd_strobe_buf <= 1;
+            // Pull-based RX mux (see ft_rx_take/uart_rx_take): FT245 first
+            // between commands, otherwise only the command's own port.
+            ft_rx_pop <= ft_rx_take;
+            uart_rx_pop <= uart_rx_take;
+            rx_hold <= ft_rx_take || uart_rx_take;
+            rxd_strobe_buf <= ft_rx_take || uart_rx_take;
+            if (ft_rx_take) begin
                 rxd_data_buf <= ft_rx_data;
-                ft_rx_pop <= 1;
-                ft_rx_hold <= 1;
                 if (cmd_idle) active_port <= 1;
-            end else if (rxd_strobe) begin
-                rxd_strobe_buf <= 1;
-                rxd_data_buf <= rxd_data;
+            end else if (uart_rx_take) begin
+                rxd_data_buf <= uart_rx_data;
                 if (cmd_idle) active_port <= 0;
-            end else begin
-                rxd_strobe_buf <= 0;
-                if (ft_rx_hold) ft_rx_hold <= 0;
             end
-            
+
             // Boot-time START is acknowledged at the final committed scrub.
             if (!pp_init_done && pp_init_finishing && spi_run_requested) begin
                 txd_strobe_buf <= 1;
@@ -572,7 +597,7 @@ module host_protocol(
             if (in_count != 0 && !rxd_strobe_buf &&
                 (read_state == 3'd0) && (write_state == 3'd0)) begin
                 serial_idle_count <= serial_idle_count + 1;
-                if (serial_idle_count[16]) begin
+                if (serial_idle_expired) begin
                     in_count <= 0;
                     cmd <= CMD_NOP;
                 end
@@ -699,17 +724,17 @@ module host_protocol(
             end
 
             // -----------------------------------------------------------
-            // Gated command dispatcher.
+            // Command parser and SDRAM state machines.
             //
-            // Handles RAMREAD/RAMWRITE/CHIPCONFIG (which touch SDRAM or
-            // chip config) plus all multi-byte continuations and the
-            // serial SDRAM read/write state machines.  Gated on SPI bus
-            // idle so we never race with an in-flight SPI transaction,
-            // and initial commands are additionally gated on !spi_run_requested
-            // so the host cannot accidentally disturb live emulation.
+            // Popped bytes were already checked against the SDRAM gate
+            // (ft_rx_take/uart_rx_take), so every popped byte is parsed.
+            // The serial SDRAM read/write state machines themselves run
+            // only while the gate is open, so they never race an in-flight
+            // SPI transaction or the program engine. RAMREAD, RAMWRITE and
+            // CHIPCONFIG are additionally only accepted while emulation is
+            // stopped, so the host cannot disturb live emulation.
             // -----------------------------------------------------------
-            if ((spi_reset || spi_csel_buf[1]) && !spi_writing) begin
-                
+            begin
                 if (rxd_strobe_buf) begin
                     serial_idle_count <= 0;
 
@@ -954,7 +979,7 @@ module host_protocol(
                     end
 
                 end
-                else begin
+                else if (serial_gate) begin
 
                     if (write_strobe && !sdram_busy)
                         write_state <= 1;

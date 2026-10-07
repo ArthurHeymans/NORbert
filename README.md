@@ -480,6 +480,10 @@ that `tool/src/protocol.rs` matches it.
 All opcodes reply with a single `0x01` ACK unless otherwise noted. The FPGA
 accepts command bytes from whichever port (UART or FT245) first delivers one
 while the parser is idle, and routes the response back to the same port.
+Each port has a receive FIFO; while a command is in progress, bytes from the
+other port wait there until it completes. A parser left mid-command returns
+to idle after ~546 us without a byte, or ~35 ms inside a RAMWRITE payload, so
+a USB stall within a data block is not mistaken for an abandoned command.
 
 `VERSION` reports the protocol version, currently 7. The host tool talks to
 any version from 3 up to its own and enables commands by version, but it
@@ -503,9 +507,7 @@ bitstream needs a tool from the same release or later.
 
 A clean PREFETCH reply is `0x80` (not `0x00`, which the host discards as
 transport noise); `0x81`, `0x82` and `0x83` report faults. PREFETCH is a
-single byte with no argument, like STATUS: over FT245 the FPGA only takes
-the always-safe opcodes while the target holds CS low, so a stray argument
-byte would block every command queued behind it. It is safe to issue in any
+single byte with no argument, like STATUS. It is safe to issue in any
 emulation state, and reading it clears the flags it reports, so a fault is
 reported to exactly one reader.
 
@@ -520,9 +522,11 @@ TOCTOU sub-commands (all prefixed with opcode `0x39`):
 | `0x05` | RESET_ALL | none -- disarm + clear all four                      |
 
 RAMREAD/RAMWRITE/CHIPCONFIG are only accepted while emulation is stopped, to
-avoid racing the SPI fast path on SDRAM. The other commands are always safe to
-issue and bypass the SPI-idle gate so the host can reach the tool even while a
-target is hammering the bus.
+avoid racing the SPI fast path on SDRAM, and their bytes wait (on either
+port) while the target holds CS low or an SPI program/erase owns SDRAM. All
+other commands, including HOLDCTL, LOGCTL and TOCTOU with their arguments,
+touch neither and are processed immediately, so the host can reach the tool
+even while a target is hammering the bus.
 
 ## Acknowledgments
 

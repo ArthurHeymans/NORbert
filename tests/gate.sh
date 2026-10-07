@@ -4,8 +4,9 @@
 # build) instead of the RTL. This catches RTL that Yosys maps differently
 # from Gowin synthesis. Zero-delay: no place-and-route or timing.
 #
-# uart_tb (two parameterisations of one module) and ft245_tb (peeks FSM
-# state that synthesis re-encodes) stay RTL-only.
+# uart_tb (two parameterisations of one module), ft245_tb (peeks FSM
+# state that synthesis re-encodes) and host_protocol_tb (peeks the TOCTOU
+# tables, which synthesis splits into separate registers) stay RTL-only.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

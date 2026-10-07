@@ -1,7 +1,7 @@
 use crate::device::{ConnectionKind, FlashDevice, Transport, UART_BAUD_RATE};
 #[cfg(feature = "ftdi")]
 use crate::device::{FT2232H_PID, FTDI_VID};
-use crate::protocol::{CMD_VERSION, is_supported_protocol_version};
+use crate::protocol::{CMD_VERSION, PARSER_IDLE_RESET_MS, is_supported_protocol_version};
 #[cfg(feature = "ftdi")]
 use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
@@ -53,8 +53,10 @@ impl SerialTransport {
         // a few ms to several tens of ms after port open.  We defend in
         // two layers: a generous settle + drain, then an *active*
         // resync that sends CMD_VERSION and discards any non-version
-        // bytes that appear before the real reply.
-        thread::sleep(Duration::from_millis(20));
+        // bytes that appear before the real reply. The settle also lets
+        // the FPGA parser time out of a command an earlier session left
+        // unfinished.
+        thread::sleep(Duration::from_millis(u64::from(PARSER_IDLE_RESET_MS)));
 
         let mut discard = [0u8; 256];
         port.set_timeout(Duration::from_millis(5))?;
@@ -198,11 +200,11 @@ impl Ft245Transport {
         dev.set_write_chunksize(65536);
 
         // The USB reset can glitch the FT2232H data bus, injecting
-        // garbage bytes into the FPGA's protocol parser.  Wait for the
-        // FPGA's idle timeout (~546µs at 120MHz) to reset the parser.
-        // Use 5ms for margin (covers USB reset settling + idle timeout).
-        // Then drain any residual response bytes.
-        thread::sleep(Duration::from_millis(5));
+        // garbage bytes into the FPGA's protocol parser, and an earlier
+        // session may have stopped mid-command.  Wait for the FPGA's
+        // parser idle timeout to return it to idle, then drain any
+        // residual response bytes.
+        thread::sleep(Duration::from_millis(u64::from(PARSER_IDLE_RESET_MS)));
         dev.flush_all().ok();
 
         let mut trash = [0u8; 4096];

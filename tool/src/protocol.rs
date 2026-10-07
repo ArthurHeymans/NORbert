@@ -10,6 +10,14 @@
 use zerocopy::{Immutable, IntoBytes};
 
 pub const PROTOCOL_VERSION: u8 = 7;
+
+/// Upper bound on how long the FPGA parser can stay inside an abandoned
+/// command before its idle timeout returns it to idle: about 35 ms inside a
+/// RAMWRITE payload (546 us in command headers), see `serial_idle_count` in
+/// `src/host_protocol.v`. A new session waits at least this long before its
+/// first command, so stray bytes or an interrupted earlier session cannot
+/// swallow it.
+pub const PARSER_IDLE_RESET_MS: u32 = 50;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 3;
 
 pub const fn is_supported_protocol_version(version: u8) -> bool {

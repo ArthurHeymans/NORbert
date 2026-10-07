@@ -107,7 +107,7 @@ lint-verilator:
 # width bug in the RTL it is exercising.
 test:
 	@set -eu; build=$$(mktemp -d); trap 'rm -rf "$$build"' EXIT; \
-	for test in spi_flash sdram_controller refresh sdram_protocol access_handshake write_completion prefetch_health toctou quad_fast fifo logger uart ft245; do \
+	for test in spi_flash host_protocol sdram_controller refresh sdram_protocol access_handshake write_completion prefetch_health toctou quad_fast fifo logger uart ft245; do \
 		echo "Testing $$test"; \
 		verilator --binary --timing -j 2 --top-module $${test}_tb -Isrc \
 			-Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD \
