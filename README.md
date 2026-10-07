@@ -27,20 +27,24 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 
 ## SPI Flash Pin Mapping
 
-NORbert exposes the SPI flash interface on the **PMOD J5** connector of the Tang Primer 25K Dock. The table below maps the standard SPI flash signals to the corresponding FPGA I/O pins:
+NORbert exposes the SPI flash interface on the dock PMOD connector called
+**PMOD 1** in `tangprimer25k.cst` (the authoritative pin list). Positions
+count from the end of each row away from the GND/3V3 pins:
 
-| SPI Signal | FPGA Pin | PMOD J5 Pin | Notes                              |
-|------------|----------|-------------|------------------------------------|
-| `/CS#`     | `T9`     | 1           | Chip Select (active-low)           |
-| `SCK`      | `T8`     | 2           | SPI Clock                          |
-| `D0/DO`    | `R9`     | 3           | Data Out / IO0                     |
-| `D1/DI`    | `R8`     | 4           | Data In / IO1                      |
-| `D2`       | `L8`     | 5           | IO2 (used for Dual/Quad reads)     |
-| `D3`       | `L9`     | 6           | IO3 / `#HOLD#` (shared function)   |
-| `GND`      | —        | 10          | Ground                             |
-| `VCC`      | —        | 9           | 3.3V Power                         |
+| SPI Signal | FPGA Pin | PMOD 1 position | Notes                                   |
+|------------|----------|-----------------|-----------------------------------------|
+| `/CS#`     | `G11`    | top 1           | Chip Select (active-low, pulled up)     |
+| `SCK`      | `D11`    | top 2           | SPI Clock (pulled down)                 |
+| `D0/DI`    | `B11`    | top 3           | IO0: data in, output in dual/quad reads |
+| `D1/DO`    | `C11`    | top 4           | IO1: data out                           |
+| `D2`       | `G10`    | bottom 1        | IO2 / `/WP` (quad reads)                |
+| `D3`       | `D10`    | bottom 2        | IO3 / `/HOLD` (quad reads, hold control)|
+| Power det. | `B10`    | bottom 3        | Optional; ignored by default            |
+| Debug      | `C10`    | bottom 4        | Debug output                            |
+| `GND`      | —        | 5 (both rows)   | Ground                                  |
+| `VCC`      | —        | 6 (both rows)   | 3.3V                                    |
 
-*Note: D3 and `#HOLD#` share the physical IO3 pin. Asserting `#HOLD` drives it low to silence a real flash on a shared bus. Consult `tangprimer25k.cst` for exact pin assignments.*
+*Note: D3 and `#HOLD#` share the physical IO3 pin. Asserting `#HOLD` drives it low to silence a real flash on a shared bus.* The power-detect input has a pull-down and is bypassed by default (`BYPASS_POWER_DETECT` in `src/top.v`); clear that parameter to hold emulation in reset and keep the outputs disabled while the target is unpowered.
 
 ## Releases
 
@@ -128,7 +132,7 @@ Per-change mapped LUT counts are in [RTL utilization](docs/rtl-utilization.md).
 
 ```sh
 make lint                   # Yosys synthesis checks and Verilator lint
-make test                   # SPI, SDRAM, TOCTOU, FIFO, logger, UART, FT245
+make test                   # SPI, host protocol, SDRAM, TOCTOU, FIFO, logger, UART, FT245
 make test-gate              # the same benches on the Yosys GW5A netlist
 ```
 
@@ -362,15 +366,16 @@ The FT2232H is used in asynchronous 245 FIFO mode. This requires a **one-time EE
 
 **Wiring:** Connect the FT2232H Channel A pins to the FPGA dock as follows:
 
-| FT2232H Pin | Signal   | FPGA Pin | Dock Location    |
-|-------------|----------|----------|------------------|
-| AD0-AD7     | D[0:7]   | H5, H8, G7, F5, H7, G8, G5, F3 | PMOD J7 |
-| RXF#        | ft_rxf_n | D10      | PMOD J6 top      |
-| TXE#        | ft_txe_n | G10      | PMOD J6 top      |
-| RD#         | ft_rd_n  | B10      | PMOD J6 top      |
-| WR#         | ft_wr_n  | H11      | Button S0 (core board) |
+| FT2232H Pin | Signal   | FPGA Pin | Dock Location (`tangprimer25k.cst`) |
+|-------------|----------|----------|-------------------------------------|
+| AD0-AD3     | D[0:3]   | H5, H8, G7, F5 | PMOD 3 top 4, 3, 2, 1         |
+| AD4-AD7     | D[4:7]   | H7, G8, G5, J5 | PMOD 3 bottom 3, 2, 1, 4      |
+| RXF#        | ft_rxf_n | A11      | PMOD 2 top 1                        |
+| TXE#        | ft_txe_n | E11      | PMOD 2 top 2                        |
+| RD#         | ft_rd_n  | K11      | PMOD 2 top 3                        |
+| WR#         | ft_wr_n  | L5       | PMOD 2 top 4                        |
 
-Note: H11 is a core board button pin, repurposed for FT245 (buttons are unused by NORbert). CLKOUT and OE# are not used in async mode. All signals are 3.3V LVCMOS.
+CLKOUT and OE# are not used in async mode. All signals are 3.3V LVCMOS.
 
 ## SPI read performance
 

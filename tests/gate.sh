@@ -94,3 +94,6 @@ synth toctou top "spi_addr_latched refreshcount spi_cmd_read_ack trap_triggered
                   spi_cmd_read_buf spi_activate_done
                   log_addr_sync log_addr_valid_sync reset spi_reset_effective"
 sim toctou "$build/toctou.top.v"
+
+synth top_io top "spi_io1_oe spi_active_out reset spi_reset_effective"
+sim top_io "$build/top_io.top.v"

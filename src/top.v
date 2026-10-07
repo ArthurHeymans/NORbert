@@ -4,15 +4,12 @@
  * Ported from Tang Nano 20K version. Uses external SDRAM module on dock
  * with two W9825G6KH chips (64MB total) via 16-bit shared bus.
  *
- * SPI wiring on dock PMOD J5 (all on bank 6):
- *   A11 = CS          E11 = CLK
- *   C11 = IO0 (MOSI)  D11 = IO1 (MISO)
- *   G11 = IO2 (/WP)   B11 = IO3 (/HOLD)
- *   A10 = POWER det    E10 = Debug
- *
- * FT245 wiring (FT2232H async FIFO, EEPROM set to "245 FIFO"):
- *   Data D[7:0] on right PMOD J7: H5 H8 G7 F5 H7 G8 G5 F3
- *   RXF#=D10  TXE#=G10  RD#=B10  WR#=H11
+ * Pin assignments live in tangprimer25k.cst (authoritative):
+ *   PMOD 1 top:    G11 = CS     D11 = CLK    B11 = IO0    C11 = IO1
+ *   PMOD 1 bottom: G10 = IO2    D10 = IO3    B10 = POWER  C10 = Debug
+ *   PMOD 2 top:    A11 = RXF#   E11 = TXE#   K11 = RD#    L5  = WR#
+ *   PMOD 3:        FT245 D[7:0] = H5 H8 G7 F5 H7 G8 G5 J5
+ * (FT2232H Channel A in async 245 FIFO mode, EEPROM set to "245 FIFO".)
  *
  * Emulated flash chip is configured at runtime via the serial
  * CHIPCONFIG command (defaults to Winbond W25Q64FV 8MB).
@@ -152,8 +149,15 @@ module top(
     wire spi_io3_oe;    // IO3 output enable
     wire spi_debug_out;
     
+    // Set to 1 to bypass power detection (for use without the power pin
+    // connected). It then neither holds spi_trx in reset nor gates the
+    // output drivers; the pin has a pull-down and would otherwise keep
+    // every output disabled.
+    localparam BYPASS_POWER_DETECT = 1;
+    wire spi_power_present = BYPASS_POWER_DETECT ? 1'b1 : spi_power_in;
+
     // IO0 (MOSI pin): input normally, output during dual/quad read data phase
-    wire spi_active_out = !spi_cs_pin && spi_power_in;
+    wire spi_active_out = !spi_cs_pin && spi_power_present;
     assign spi_mosi_pin = (spi_io0_oe && spi_active_out) ? spi_io0_out : 1'bz;
     wire spi_io0_in = spi_mosi_pin;
     
@@ -182,9 +186,6 @@ module top(
     reg [1:0] spi_power_reg;
     reg spi_reset = 1;
     reg [16:0] spi_reset_count = 0;
-    
-    // Set to 1 to bypass power detection (for debugging without power pin connected)
-    localparam BYPASS_POWER_DETECT = 1;
     
     wire power_ok = BYPASS_POWER_DETECT ? 1'b1 : spi_power_reg[1];
     
