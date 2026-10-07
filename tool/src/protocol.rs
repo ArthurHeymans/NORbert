@@ -9,7 +9,7 @@
 
 use zerocopy::{Immutable, IntoBytes};
 
-pub const PROTOCOL_VERSION: u8 = 7;
+pub const PROTOCOL_VERSION: u8 = 8;
 
 /// Upper bound on how long the FPGA parser can stay inside an abandoned
 /// command before its idle timeout returns it to idle: about 35 ms inside a
@@ -45,6 +45,11 @@ pub const fn supports_prefetch_diagnostics(version: u8) -> bool {
     version >= 6
 }
 
+/// Version 8 added log-only (sniff) mode.
+pub const fn supports_log_only(version: u8) -> bool {
+    version >= 8
+}
+
 /// Convert a flash capacity to the FPGA's combined erase-count/address-mask
 /// field. The mask representation only works for power-of-two capacities.
 pub const fn capacity_erase_bursts(total_size: u32) -> Option<u32> {
@@ -73,6 +78,12 @@ pub const CMD_LOGCTL: u8 = 0x38;
 pub const CMD_TOCTOU: u8 = 0x39;
 pub const CMD_LOGPOLL: u8 = 0x3A;
 pub const CMD_PREFETCH: u8 = 0x3B;
+pub const CMD_SNIFFCTL: u8 = 0x3C;
+
+/// STATUS reply while emulation runs in log-only mode.
+pub const STATUS_LOG_ONLY: u8 = 0x03;
+/// SNIFFCTL/HOLDCTL reply when the request conflicts with the current mode.
+pub const REPLY_REFUSED: u8 = 0x02;
 
 pub const PREFETCH_UNDERRUN: u8 = 0x01;
 pub const PREFETCH_THIN: u8 = 0x02;
@@ -177,6 +188,13 @@ impl ControlRequest {
     pub const fn hold(enable: bool) -> Self {
         Self {
             command: CMD_HOLDCTL,
+            value: enable as u8,
+        }
+    }
+
+    pub const fn sniff(enable: bool) -> Self {
+        Self {
+            command: CMD_SNIFFCTL,
             value: enable as u8,
         }
     }
@@ -344,6 +362,8 @@ mod tests {
         assert!(supports_toctou(5));
         assert!(!supports_prefetch_diagnostics(5));
         assert!(supports_prefetch_diagnostics(6));
+        assert!(!supports_log_only(7));
+        assert!(supports_log_only(8));
     }
 
     #[test]
@@ -365,6 +385,7 @@ mod tests {
     fn control_requests_match_the_existing_wire_format() {
         assert_eq!(ControlRequest::hold(true).as_bytes(), &[CMD_HOLDCTL, 1]);
         assert_eq!(ControlRequest::log(false).as_bytes(), &[CMD_LOGCTL, 0]);
+        assert_eq!(ControlRequest::sniff(true).as_bytes(), &[CMD_SNIFFCTL, 1]);
         assert_eq!(
             ControlRequest::toctou_reset_all().as_bytes(),
             &[CMD_TOCTOU, TOCTOU_RESET_ALL]

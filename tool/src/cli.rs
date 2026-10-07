@@ -99,11 +99,24 @@ pub(crate) enum Commands {
     ///
     /// Asserts #HOLD on the existing SPI flash so NORbert can respond
     /// instead.  The target flash tristates its outputs and ignores
-    /// all SPI commands while held.  Mutually exclusive with quad I/O.
+    /// all SPI commands while held.  Mutually exclusive with quad I/O
+    /// and with log-only mode.
     Hold {
         /// Assert or release the target flash #HOLD pin
         #[arg(value_enum)]
-        state: HoldState,
+        state: Switch,
+    },
+
+    /// Log-only mode: observe a real flash on the same SPI bus
+    ///
+    /// NORbert stops serving data and never drives the bus; it only decodes
+    /// the traffic between the target and the real flash for `monitor`.
+    /// `on` (re)starts the SPI side in this mode; `off` leaves emulation
+    /// stopped until `start`. Mutually exclusive with `hold on`.
+    Sniff {
+        /// Enter or leave log-only mode
+        #[arg(value_enum)]
+        state: Switch,
     },
 
     /// Monitor SPI bus activity in real time via FT245 logging.
@@ -147,7 +160,7 @@ pub(crate) enum Commands {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-pub(crate) enum HoldState {
+pub(crate) enum Switch {
     On,
     Off,
 }

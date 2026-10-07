@@ -175,9 +175,13 @@ module top(
     //
     // Keep the 1'bz in the outermost mux: Yosys only infers a tristate
     // buffer there, and otherwise turns the pin into a plain output.
+    // host_protocol keeps hold and log-only mode exclusive; gate here too so
+    // log-only mode can never silence the flash it is observing.
     wire hold_out;
-    wire spi_io3_drive = hold_out || (spi_io3_oe && spi_active_out);
-    assign spi_io3_pin = spi_io3_drive ? (spi_io3_out && !hold_out) : 1'bz;
+    wire log_only;
+    wire hold_drive = hold_out && !log_only;
+    wire spi_io3_drive = hold_drive || (spi_io3_oe && spi_active_out);
+    assign spi_io3_pin = spi_io3_drive ? (spi_io3_out && !hold_drive) : 1'bz;
     wire spi_io3_in = spi_io3_pin;
     
     assign spi_debug_pin = spi_debug_out;
@@ -310,6 +314,7 @@ module top(
         .cfg_jedec_id(cfg_jedec_id),
         .cfg_4byte(cfg_4byte),
         .cfg_chip_erase_bursts(cfg_chip_erase_bursts),
+        .log_only(log_only),
         
         .sfdp_raddr(sfdp_raddr),
         .sfdp_rdata(sfdp_rdata),
@@ -627,6 +632,7 @@ module top(
         
         .spi_running(spi_running),
         .hold_out(hold_out),
+        .log_only(log_only),
 
         .log_active(log_active),
 

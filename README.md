@@ -17,6 +17,7 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 - **SPI bus logging**: real-time command/address/byte-count packets drained over either transport via a 512-byte ring FIFO (`monitor` subcommand)
 - **TOCTOU traps**: four independent address-match entries that transparently redirect reads to a different SDRAM location on the second access, for exercising verify-then-use flows
 - **Target flash #HOLD control**: drive IO3 low to silence a real flash chip sharing the SPI bus
+- **Log-only mode**: sit on the bus next to a real flash and log what the target does with it, without serving data
 
 ## Hardware
 
@@ -342,7 +343,19 @@ Arguments to `toctou set` are `<index 0..3> <start-address> <match-mask> <replac
 
 ### Target flash #HOLD
 
-When NORbert shares a SPI bus with a real flash chip, `hold on` drives IO3 low continuously, asserting `#HOLD` on the target flash so it tristates and ignores all commands. `hold off` releases it. Mutually exclusive with quad I/O because IO3 is shared.
+When NORbert shares a SPI bus with a real flash chip, `hold on` drives IO3 low continuously, asserting `#HOLD` on the target flash so it tristates and ignores all commands. `hold off` releases it. Mutually exclusive with quad I/O because IO3 is shared, and with log-only mode.
+
+### Log-only mode
+
+To see what a target does with its own flash, connect NORbert to the same bus and switch it to log-only mode. NORbert then never drives an SPI pin; the real flash answers and NORbert only decodes the traffic:
+
+```sh
+spi-flash-tool sniff on     # stops emulation, enters log-only mode, starts the SPI side
+spi-flash-tool monitor      # decoded commands, addresses and byte counts
+spi-flash-tool sniff off    # leaves emulation stopped; `start` serves data again
+```
+
+In this mode the decoder follows the real flash rather than its own emulated state: programs and erases are logged whether or not WREN preceded them, reads are decoded while the real flash is busy, and quad and 4-byte commands are decoded regardless of the configured chip. Nothing is written to the SDRAM image, the SDRAM is not read, and TOCTOU traps do not fire. `status` reports the mode. The mode can only change while emulation is stopped (the tool handles that), and the FPGA refuses `hold on` in log-only mode and log-only mode while `#HOLD` is asserted. Decoding is limited by the `spi_clk` timing closure (see [SPI read performance](#spi-read-performance)).
 
 ### FT245 transport (FT2232H)
 
@@ -490,25 +503,26 @@ other port wait there until it completes. A parser left mid-command returns
 to idle after ~546 us without a byte, or ~35 ms inside a RAMWRITE payload, so
 a USB stall within a data block is not mistaken for an abandoned command.
 
-`VERSION` reports the protocol version, currently 7. The host tool talks to
+`VERSION` reports the protocol version, currently 8. The host tool talks to
 any version from 3 up to its own and enables commands by version, but it
-refuses a newer bitstream rather than guess at its protocol: a version 7
+refuses a newer bitstream rather than guess at its protocol: a version 8
 bitstream needs a tool from the same release or later.
 
 | Opcode | Name       | Args                                                | Reply                            |
 |--------|------------|-----------------------------------------------------|----------------------------------|
-| `0x30` | VERSION    | none                                                | 1 byte (current: `0x07`)         |
+| `0x30` | VERSION    | none                                                | 1 byte (current: `0x08`)         |
 | `0x31` | RAMREAD    | 3-byte burst addr + 2-byte burst count              | `count*8` data bytes             |
 | `0x32` | RAMWRITE   | 3-byte burst addr + 2-byte burst count + data       | `0x01`                           |
 | `0x33` | CHIPCONFIG | JEDEC(3) + flags + erase_bursts(3) + sfdp_len + sfdp| `0x01`                           |
 | `0x34` | START      | none -- enable SPI emulation                        | `0x01`                           |
 | `0x35` | STOP       | none -- hold spi_trx in reset                       | `0x01`                           |
-| `0x36` | STATUS     | none                                                | `0x01` running / `0x02` stopped  |
-| `0x37` | HOLDCTL    | 1 byte: `0x01` assert, `0x00` release               | `0x01`                           |
+| `0x36` | STATUS     | none                                                | `0x01` running / `0x02` stopped / `0x03` running log-only |
+| `0x37` | HOLDCTL    | 1 byte: `0x01` assert, `0x00` release               | `0x01`, `0x02` refused in log-only mode |
 | `0x38` | LOGCTL     | 1 byte: `0x01` start capture, `0x00` stop capture   | `0x01`                           |
 | `0x39` | TOCTOU     | sub-command + args (see below)                      | `0x01`                           |
 | `0x3A` | LOGPOLL    | none                                                | log bytes terminated by `0xA0`   |
 | `0x3B` | PREFETCH   | none                                                | 1 byte: `0x80` valid + `0x01` underrun + `0x02` thin |
+| `0x3C` | SNIFFCTL   | 1 byte: `0x01` enter log-only mode, `0x00` leave    | `0x01`, `0x02` refused while running or with #HOLD asserted |
 
 A clean PREFETCH reply is `0x80` (not `0x00`, which the host discards as
 transport noise); `0x81`, `0x82` and `0x83` report faults. PREFETCH is a
@@ -529,7 +543,7 @@ TOCTOU sub-commands (all prefixed with opcode `0x39`):
 RAMREAD/RAMWRITE/CHIPCONFIG are only accepted while emulation is stopped, to
 avoid racing the SPI fast path on SDRAM, and their bytes wait (on either
 port) while the target holds CS low or an SPI program/erase owns SDRAM. All
-other commands, including HOLDCTL, LOGCTL and TOCTOU with their arguments,
+other commands, including HOLDCTL, LOGCTL, TOCTOU and SNIFFCTL with their arguments,
 touch neither and are processed immediately, so the host can reach the tool
 even while a target is hammering the bus.
 

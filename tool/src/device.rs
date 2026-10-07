@@ -46,6 +46,17 @@ pub(crate) struct ProtocolCapabilities {
     pub(crate) activity_log: bool,
     pub(crate) toctou: bool,
     pub(crate) prefetch_diagnostics: bool,
+    pub(crate) log_only: bool,
+}
+
+/// What the SPI side is doing, as reported by STATUS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EmulationMode {
+    Stopped,
+    /// Serving the SDRAM image to the target.
+    Serving,
+    /// Only observing a real flash on the bus and logging its traffic.
+    LogOnly,
 }
 
 impl ProtocolCapabilities {
@@ -62,6 +73,7 @@ impl ProtocolCapabilities {
             activity_log: supports_activity_log(version),
             toctou: supports_toctou(version),
             prefetch_diagnostics: supports_prefetch_diagnostics(version),
+            log_only: supports_log_only(version),
         })
     }
 }
@@ -227,15 +239,47 @@ impl FlashDevice {
         self.command_with_ack(CMD_STOP, "stop").await
     }
 
+    /// Whether the SPI side runs (serving data or in log-only mode).
     pub(crate) async fn status(&mut self) -> Result<bool> {
+        Ok(self.emulation_mode().await? != EmulationMode::Stopped)
+    }
+
+    pub(crate) async fn emulation_mode(&mut self) -> Result<EmulationMode> {
         self.require_capability("emulation status", |c| c.emulation_control)
             .await?;
         self.transport.write_all(&[CMD_STATUS]).await?;
         match self.read_ack("status").await? {
-            0x01 => Ok(true),
-            0x02 => Ok(false),
+            0x01 => Ok(EmulationMode::Serving),
+            0x02 => Ok(EmulationMode::Stopped),
+            STATUS_LOG_ONLY if self.capabilities().await?.log_only => Ok(EmulationMode::LogOnly),
             response => bail!("status: unexpected response 0x{response:02x}"),
         }
+    }
+
+    /// Enter or leave log-only mode. The FPGA only switches while emulation
+    /// is stopped, so a running emulation is stopped first. Entering starts
+    /// the SPI side again in log-only mode; leaving leaves it stopped, as
+    /// serving data needs the intended image loaded first.
+    pub(crate) async fn set_log_only(&mut self, enabled: bool) -> Result<()> {
+        self.require_capability("log-only mode", |c| c.log_only)
+            .await?;
+        if self.status().await? {
+            self.stop_emulation().await?;
+        }
+        self.transport
+            .write_all(ControlRequest::sniff(enabled).as_bytes())
+            .await?;
+        match self.read_ack("log-only mode").await? {
+            0x01 => {}
+            REPLY_REFUSED => {
+                bail!("log-only mode refused: release the target flash #HOLD first")
+            }
+            response => bail!("log-only mode: unexpected response 0x{response:02x}"),
+        }
+        if enabled {
+            self.start_emulation().await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn prepare_stopped(&mut self) -> Result<bool> {
@@ -498,7 +542,13 @@ impl FlashDevice {
         self.transport
             .write_all(ControlRequest::hold(enabled).as_bytes())
             .await?;
-        self.expect_ack("hold control").await
+        match self.read_ack("hold control").await? {
+            0x01 => Ok(()),
+            REPLY_REFUSED if self.capabilities().await?.log_only => {
+                bail!("#HOLD refused: log-only mode needs the target flash to answer")
+            }
+            response => bail!("hold control: unexpected response 0x{response:02x}"),
+        }
     }
 
     /// Read and clear the sticky SDRAM prefetch fault flags.
@@ -857,6 +907,64 @@ mod tests {
 
         assert!(error.contains("unsupported protocol version"));
         assert_eq!(&*writes.borrow(), &[vec![CMD_VERSION]]);
+    }
+
+    #[test]
+    fn entering_log_only_mode_stops_switches_and_restarts() {
+        // STATUS running, STOP ack, SNIFFCTL ack, START ack.
+        let (transport, writes) = MockTransport::new([1, 1, 1, 1]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+
+        device.set_log_only(true).unwrap();
+        assert_eq!(
+            &*writes.borrow(),
+            &[
+                vec![CMD_STATUS],
+                vec![CMD_STOP],
+                vec![CMD_SNIFFCTL, 1],
+                vec![CMD_START],
+            ]
+        );
+    }
+
+    #[test]
+    fn leaving_log_only_mode_leaves_emulation_stopped() {
+        // STATUS log-only, STOP ack, SNIFFCTL ack.
+        let (transport, writes) = MockTransport::new([STATUS_LOG_ONLY, 1, 1]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+
+        device.set_log_only(false).unwrap();
+        assert_eq!(
+            &*writes.borrow(),
+            &[vec![CMD_STATUS], vec![CMD_STOP], vec![CMD_SNIFFCTL, 0]]
+        );
+    }
+
+    #[test]
+    fn hold_and_log_only_refusals_are_reported() {
+        let (transport, _) = MockTransport::new([2, REPLY_REFUSED]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+        let error = device.set_log_only(true).unwrap_err().to_string();
+        assert!(error.contains("release the target flash #HOLD"), "{error}");
+
+        let (transport, _) = MockTransport::new([REPLY_REFUSED]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+        let error = device.set_hold(true).unwrap_err().to_string();
+        assert!(error.contains("log-only mode"), "{error}");
+    }
+
+    #[test]
+    fn status_reports_log_only_mode() {
+        let (transport, _) = MockTransport::new([STATUS_LOG_ONLY, 1, 2]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+        assert_eq!(device.emulation_mode().unwrap(), EmulationMode::LogOnly);
+        assert_eq!(device.emulation_mode().unwrap(), EmulationMode::Serving);
+        assert!(!device.status().unwrap());
     }
 
     #[test]

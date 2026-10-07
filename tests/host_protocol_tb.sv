@@ -11,6 +11,7 @@
 // - A RAMWRITE payload survives a USB stall longer than the header idle
 //   timeout, so payload bytes are never reinterpreted as commands.
 module host_protocol_tb;
+    `include "host_protocol.vh"
     reg clk = 0;
     always #4.167 clk = ~clk;
     reg reset = 1, uart_strobe = 0, cs = 1, program_command = 0;
@@ -151,7 +152,7 @@ module host_protocol_tb;
         expect_reply(ft_replies, 8'h01, "FT245 TOCTOU SET across a UART byte");
         if (dut.host_i.trap_replace[1] !== 24'h005600)
             $fatal(1, "UART byte leaked into the FT245 command");
-        expect_reply(uart_replies, 8'h07, "queued UART VERSION");
+        expect_reply(uart_replies, VERSION, "queued UART VERSION");
 
         // Wait for the program, then stop emulation for SDRAM commands.
         while (dut.spi_writing) tick(1);

@@ -1,5 +1,5 @@
 use crate::device::{
-    ConnectionKind, FT2232H_PID, FTDI_VID, FlashDevice, Transport, UART_BAUD_RATE,
+    ConnectionKind, EmulationMode, FT2232H_PID, FTDI_VID, FlashDevice, Transport, UART_BAUD_RATE,
 };
 use crate::protocol::{
     CMD_VERSION, PARSER_IDLE_RESET_MS, PrefetchFaults, is_supported_protocol_version,
@@ -719,6 +719,32 @@ impl WebFlashDevice {
 
     pub async fn set_hold(&mut self, enabled: bool) -> Result<(), JsValue> {
         self.inner.set_hold(enabled).await.map_err(js_error)
+    }
+
+    pub async fn supports_log_only(&mut self) -> Result<bool, JsValue> {
+        self.inner
+            .capabilities()
+            .await
+            .map(|capabilities| capabilities.log_only)
+            .map_err(js_error)
+    }
+
+    /// Enter (and start) or leave (leaving emulation stopped) log-only mode.
+    pub async fn set_log_only(&mut self, enabled: bool) -> Result<(), JsValue> {
+        self.inner.set_log_only(enabled).await.map_err(js_error)
+    }
+
+    /// 0 = stopped, 1 = serving data, 2 = running in log-only mode.
+    pub async fn emulation_mode(&mut self) -> Result<u8, JsValue> {
+        self.inner
+            .emulation_mode()
+            .await
+            .map(|mode| match mode {
+                EmulationMode::Stopped => 0,
+                EmulationMode::Serving => 1,
+                EmulationMode::LogOnly => 2,
+            })
+            .map_err(js_error)
     }
 
     pub async fn log_start(&mut self) -> Result<(), JsValue> {

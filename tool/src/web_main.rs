@@ -46,6 +46,10 @@ struct SharedState {
     activity_log: bool,
     prefetch_diagnostics: bool,
     hold_enabled: Option<bool>,
+    log_only_supported: bool,
+    /// Log-only flag as last seen running or set (the FPGA only reports it
+    /// while the SPI side runs, so a stopped device keeps the last value).
+    log_only: Option<bool>,
     prefetch_faults: Option<PrefetchFaults>,
     status: String,
     status_error: bool,
@@ -70,6 +74,8 @@ impl Default for SharedState {
             activity_log: false,
             prefetch_diagnostics: false,
             hold_enabled: None,
+            log_only_supported: false,
+            log_only: None,
             prefetch_faults: None,
             status: "Choose a transport to connect to NORbert".to_owned(),
             status_error: false,
@@ -184,8 +190,9 @@ impl NorbertWebApp {
                         let emulation_control = device.supports_emulation_control().await?;
                         let activity_log = device.supports_activity_log().await?;
                         let prefetch_diagnostics = device.supports_prefetch_diagnostics().await?;
-                        let running = if emulation_control {
-                            Some(device.status().await?)
+                        let log_only_supported = device.supports_log_only().await?;
+                        let mode = if emulation_control {
+                            Some(device.emulation_mode().await?)
                         } else {
                             None
                         };
@@ -194,7 +201,8 @@ impl NorbertWebApp {
                             emulation_control,
                             activity_log,
                             prefetch_diagnostics,
-                            running,
+                            log_only_supported,
+                            mode,
                         ))
                     }
                     .await;
@@ -205,7 +213,8 @@ impl NorbertWebApp {
                             emulation_control,
                             activity_log,
                             prefetch_diagnostics,
-                            running,
+                            log_only_supported,
+                            mode,
                         )) => {
                             let mut shared = state.borrow_mut();
                             shared.device = Some(device);
@@ -214,7 +223,9 @@ impl NorbertWebApp {
                             shared.emulation_control = emulation_control;
                             shared.activity_log = activity_log;
                             shared.prefetch_diagnostics = prefetch_diagnostics;
-                            shared.running = running;
+                            shared.running = mode.map(|mode| mode != 0);
+                            shared.log_only_supported = log_only_supported;
+                            shared.log_only = mode.filter(|&mode| mode != 0).map(|mode| mode == 2);
                             shared.prefetch_faults = None;
                             shared.status = "Connected successfully".to_owned();
                             shared.status_error = false;
@@ -267,6 +278,8 @@ impl NorbertWebApp {
             shared.activity_log = false;
             shared.prefetch_diagnostics = false;
             shared.hold_enabled = None;
+            shared.log_only_supported = false;
+            shared.log_only = None;
             shared.prefetch_faults = None;
             shared.configured_chip = None;
             shared.connection = ConnectionState::Disconnected;
@@ -334,15 +347,18 @@ impl NorbertWebApp {
         spawn_local(async move {
             let mut device = state.borrow_mut().device.take();
             let result = match device.as_mut() {
-                Some(device) => device.status().await,
+                Some(device) => device.emulation_mode().await,
                 None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
             };
             let mut shared = state.borrow_mut();
             shared.device = device;
             shared.busy = false;
             match result {
-                Ok(running) => {
-                    shared.running = Some(running);
+                Ok(mode) => {
+                    shared.running = Some(mode != 0);
+                    if mode != 0 {
+                        shared.log_only = Some(mode == 2);
+                    }
                     shared.status = "Status refreshed".to_owned();
                     shared.status_error = false;
                 }
@@ -649,6 +665,40 @@ impl NorbertWebApp {
                 Err(error) => set_error(
                     &mut shared,
                     format!("Hold control failed: {}", js_error(error)),
+                ),
+            }
+            repaint.request_repaint();
+        });
+    }
+
+    fn set_log_only(&self, enabled: bool, ctx: &egui::Context) {
+        let state = self.state.clone();
+        let repaint = ctx.clone();
+        state.borrow_mut().busy = true;
+        spawn_local(async move {
+            let mut device = state.borrow_mut().device.take();
+            let result = match device.as_mut() {
+                Some(device) => device.set_log_only(enabled).await,
+                None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
+            };
+            let mut shared = state.borrow_mut();
+            shared.device = device;
+            shared.busy = false;
+            match result {
+                Ok(()) => {
+                    shared.log_only = Some(enabled);
+                    shared.running = Some(enabled);
+                    shared.status = if enabled {
+                        "Log-only mode: observing the bus, not serving data"
+                    } else {
+                        "Log-only mode off; emulation stopped"
+                    }
+                    .to_owned();
+                    shared.status_error = false;
+                }
+                Err(error) => set_error(
+                    &mut shared,
+                    format!("Log-only mode failed: {}", js_error(error)),
                 ),
             }
             repaint.request_repaint();
@@ -1009,10 +1059,11 @@ impl NorbertWebApp {
                     ui.label(version.map_or_else(|| "Unknown".to_owned(), |v| v.to_string()));
                     ui.end_row();
                     ui.label("Emulation:");
-                    ui.label(match running {
-                        Some(true) => "Running",
-                        Some(false) => "Stopped",
-                        None => "Unavailable",
+                    ui.label(match (running, self.state.borrow().log_only) {
+                        (Some(true), Some(true)) => "Running (log only)",
+                        (Some(true), _) => "Running",
+                        (Some(false), _) => "Stopped",
+                        (None, _) => "Unavailable",
                     });
                     ui.end_row();
                     ui.label("Emulated chip:");
@@ -1165,12 +1216,13 @@ impl NorbertWebApp {
                     self.refresh(ctx);
                 }
             });
+            let log_only = self.state.borrow().log_only;
             ui.horizontal(|ui| {
                 ui.label("Target flash #HOLD:");
                 let hold_enabled = self.state.borrow().hold_enabled;
                 if ui
                     .add_enabled(
-                        !busy && hold_enabled != Some(true),
+                        !busy && hold_enabled != Some(true) && log_only != Some(true),
                         egui::Button::new("Assert"),
                     )
                     .clicked()
@@ -1185,6 +1237,35 @@ impl NorbertWebApp {
                     .clicked()
                 {
                     self.set_hold(false, ctx);
+                }
+            });
+            let (log_only_supported, hold_enabled) = {
+                let shared = self.state.borrow();
+                (shared.log_only_supported, shared.hold_enabled)
+            };
+            ui.horizontal(|ui| {
+                ui.label("Log only (observe a real flash):")
+                    .on_hover_text("Stop serving data and only log the traffic between the target and a real flash on the same bus. Exclusive with #HOLD.");
+                if ui
+                    .add_enabled(
+                        log_only_supported
+                            && !busy
+                            && log_only != Some(true)
+                            && hold_enabled != Some(true),
+                        egui::Button::new("Enable"),
+                    )
+                    .clicked()
+                {
+                    self.set_log_only(true, ctx);
+                }
+                if ui
+                    .add_enabled(
+                        log_only_supported && !busy && log_only != Some(false),
+                        egui::Button::new("Disable"),
+                    )
+                    .clicked()
+                {
+                    self.set_log_only(false, ctx);
                 }
             });
 
