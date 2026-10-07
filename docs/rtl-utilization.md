@@ -27,8 +27,17 @@ utilization or timing sign-off. Deltas compare against the preceding row.
 | Declare PLL phases and bound SPI/system crossings; document I/O contracts | 3435 | 0 |
 | Align strict lint mapping and acknowledge its experimental XAIG backend | 3435 | 0 |
 | Retain deferred refresh debt and register dispatch deadlines | 3398 | −37 |
+| Close SDRAM rows left open by withdrawn SPI reads; SPI/serial row interlock | 3448 | +50 |
+| Refresh only in acknowledged SPI lookahead windows | 3429 | −19 |
+| Ignore commands while busy; hold program commands; abort unaligned programs | 3442 | +13 |
+| Buffer UART input; gate only SDRAM-owning host commands; payload timeout | 3563 | +121 |
+| Restrict TOCTOU traps to array reads; redirect before lookahead | 3528 | −35 |
+| Continuous read mode for dual and quad I/O reads | 3615 | +87 |
+| Honor the power-detect bypass for output enables | 3627 | +12 |
 
-Final total: **3398 LUTs**, **+264** versus the 3134-LUT baseline.
+Final total: **3627 LUTs**, **+493** versus the 3134-LUT baseline. Most of
+the last block is the 16-entry UART receive FIFO, which `-nolutram` maps to
+flip-flops and LUT multiplexers, and the continuous-read decode.
 
 The logger queue also adds four `SDPX9B` BSRAM cells (the original four
 `DPX9B` cells remain). It trades those blocks and LUTs for capture-order
