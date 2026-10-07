@@ -66,6 +66,13 @@ module toctou_tb;
         repeat (3) @(negedge clk);
     endtask
 
+    task automatic delay_initial_read(input integer cycles);
+        @(posedge dut.sdram_i.spi_activate_done);
+        force dut.sdram_i.spi_cmd_read_buf = 2'b00;
+        repeat (cycles) @(negedge clk);
+        release dut.sdram_i.spi_cmd_read_buf;
+    endtask
+
     task host_address(input [23:0] a);
         host_byte(a[23:16]); host_byte(a[15:8]); host_byte(a[7:0]);
     endtask
@@ -165,16 +172,17 @@ module toctou_tb;
         read_flash(24'h001235, 4'b0000, 0, 0, 0, 0);
         read_flash(24'h001234, 4'b1000, 0, 0, 0, 0);
         read_flash(24'h001234, 4'b1000, 1, 3, 24'hffffff, 24'h006000);
-        // 0xEB posts its initial READ and address event together. Sweep
-        // refresh phases so the trap can finish between ACTIVATE and READ.
+        // 0xEB posts its initial READ and address event together. Delay
+        // the initial READ's synchronized request by a sweep of clocks so
+        // the trap can finish between ACTIVATE and READ (refresh can no
+        // longer open that gap: it is inhibited from the opcode on).
         // The first burst must stay original (both row AND column).
         host_byte(8'h39); host_byte(5);
         set_trap(0, 24'h001238, 24'hfffff8, 24'h007458);
         read_flash(24'h001238, 4'b0001, 0, 0, 0, 0, 8'heb);
         delayed_initial_reads = 0;
-        for (integer phase = 0; phase < 40; phase++) begin
-            // refreshcount is 10 bits wide; size the target to match.
-            while (dut.sdram_i.refreshcount != 10'(392+phase)) @(negedge clk);
+        for (integer phase = 0; phase < 10; phase++) begin
+            fork delay_initial_read(phase); join_none
             read_flash(24'h001238, 4'b0001, 1, 0, 24'hfffff8, 24'h007458, 8'heb);
         end
         if (delayed_initial_reads == 0) $fatal(1, "Missing initial-READ/redirect overlap coverage");

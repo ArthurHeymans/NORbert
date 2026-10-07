@@ -404,6 +404,7 @@ module top(
         .spi_cmd_read(spi_ram_read),
         .spi_addr(spi_ram_addr_final),
         .spi_cmd_post_toggle(spi_ram_post_toggle),
+        .spi_cmd_continuation(spi_ram_continuation),
         
         // Serial path control
         .access_cmd(sdram_access_cmd),

@@ -60,6 +60,7 @@ module sdram(
     input wire spi_cmd_read,
     input wire [22:0] spi_addr,      // 23-bit burst address (64MB)
     input wire spi_cmd_post_toggle, // Toggles on every SPI prefetch post
+    input wire spi_cmd_continuation, // Post is a lookahead (bundled with spi_addr)
 
     // Control signals from glue (serial path)
     input wire [1:0] access_cmd,     // 00=nop 01=read 10=write 11=activate
@@ -219,7 +220,15 @@ module sdram(
     reg spi_activate_done;
     assign spi_row_idle = !spi_activate_done || spi_cmd_read_ack;
     
-    wire do_inhibit_refresh = (spi_inhibit_refresh_buf[1] || inhibit_refresh);
+    // SPI refresh window: while an array read inhibits refresh, a refresh
+    // may still start after a lookahead READ was dispatched and until the
+    // SPI side re-arms that post (see spi_prefetch). The next request is
+    // then at least the post's remaining burst away, so the refresh pair
+    // cannot delay it by more than the clocks between re-arm and post.
+    reg spi_read_continuation;
+    wire spi_refresh_window = spi_cmd_read_ack && spi_cmd_read_buf[1] && spi_read_continuation;
+    wire do_inhibit_refresh = (spi_inhibit_refresh_buf[1] && !spi_refresh_window) ||
+                              inhibit_refresh;
     // Registered deadline flags keep counter arithmetic/comparison out of
     // the command/read-buffer dispatch path. Predict the increment so the
     // flags describe the same elapsed time as refreshcount after each edge.
@@ -319,6 +328,7 @@ module sdram(
             spi_cmd_read_ack <= 0;
             spi_abort_pending <= 0;
             spi_activate_done <= 0;
+            spi_read_continuation <= 0;
             spi_addr_latched <= 0;
             fill_sel <= 0;
             post_fill_sel <= 1;
@@ -716,6 +726,7 @@ module sdram(
                     read_busy <= 1;
                     spi_cmd_read_ack <= 1;
                     spi_read_armed <= 0;
+                    spi_read_continuation <= spi_cmd_continuation;
                     serial_read_active <= 0;
                     // Invalidate the fill target up front; set again below
                     // when the final beat publishes.

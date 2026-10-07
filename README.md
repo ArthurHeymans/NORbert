@@ -383,7 +383,11 @@ latency. SDRAM runs at CAS latency 2 (in spec to 133 MHz for the W9825G6KH-6)
 with a byte-serial burst layout, so the first beat already completes bytes 0-1.
 
 Validated by simulation (`make test`, `tests/quad_fast_tb.sv`: all start
-offsets 0-7, row/bank crossings, refresh coexistence). 60-70 MHz operation
+offsets 0-7, row/bank crossings, and a refresh that becomes due at every
+system-clock offset into the transaction, with an SDRAM bank-protocol
+checker on the command bus). During an array read, refresh only starts
+right after a lookahead burst has been dispatched, so a refresh pair can
+no longer land in front of a burst the SPI side is about to need. 60-70 MHz operation
 also needs timing closure past the default 30 MHz `spi_clk` constraint plus
 signal-integrity validation on the PMOD leads -- simulated margins below do
 not replace that.

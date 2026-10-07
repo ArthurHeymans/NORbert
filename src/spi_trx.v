@@ -237,6 +237,29 @@ module spi_trx(
     // SDRAM prefetch. Each strobe marks the clock on which the SPI
     // transaction reaches the corresponding point; spi_prefetch documents
     // what it does with it.
+    // Opcode completing on this clock (valid when bit_count_in == 0).
+    wire [7:0] cmd_byte = {mosi_byte[7:1], spi_io0_in};
+
+    // Opcodes the decoder below turns into an array read, with the same
+    // enable conditions. Kept next to the decoder's case labels: a read it
+    // misses would only lose the early refresh inhibit, not data.
+    function array_read_opcode;
+        input [7:0] op;
+        begin
+            case (op)
+            CMD_READ, CMD_FASTREAD, CMD_DUALREAD, CMD_DUALREAD_4B,
+            CMD_DUALIOREAD, CMD_DUALIOREAD_4B:
+                array_read_opcode = 1'b1;
+            CMD_READ_4B, CMD_FASTREAD_4B:
+                array_read_opcode = cfg_4byte;
+            CMD_QUADREAD, CMD_QUADREAD_4B, CMD_QUADIOREAD, CMD_QUADIOREAD_4B:
+                array_read_opcode = status_reg2[1];
+            default:
+                array_read_opcode = 1'b0;
+            endcase
+        end
+    endfunction
+
     wire addr_read = state == STA_ADDR && addr_kind == ADDR_KIND_READ && !is_sfdp_read;
     wire in_read = state == STA_READ;
 
@@ -248,17 +271,14 @@ module spi_trx(
         .fresh_read(fresh_read),
         .in_read(in_read),
         .sample_missing(sample_missing),
-        .first_inhibit(addr_read && addr_count == 15),
+        .release_inhibit(state == STA_CMD && bit_count_in == 0 &&
+                         !array_read_opcode(cmd_byte)),
         // Quad: IO3/IO2 carry byte-address bits 11/10 on this clock.
         .first_activate(addr_read && addr_count == (addr_quad ? 11 : 9)),
         .first_row(addr_quad ? {addr[13:0], spi_io3_in, spi_io2_in} : addr[15:0]),
         .first_read(addr_read && addr_count == 3),
         .first_col({addr[5:0], addr_lane_msb}),
         .first_done(addr_read && addr_last && !addr_dual && !addr_quad),
-        // No refresh gap before the initial lookahead: an offset-7
-        // dummy-less read has only one byte to hide that burst's latency.
-        .hold_inhibit(1'b1),
-        .release_inhibit(state == STA_DUMMY && dummy_count == 0),
         .post_lookahead((state == STA_DUMMY && dummy_count == 5 && !is_sfdp_read) ||
                         (state == STA_MODE_MULTI && mode_count == 1)),
         .drop((state == STA_MODE_MULTI && mode_count == 3) ||

@@ -8,6 +8,14 @@
 // and the prefetch_underrun diagnostic (must stay clear: the check is
 // conservative, so a set flag means "no margin left").
 //
+// Every documented limit is also swept against the refresh scheduler: the
+// refresh becomes due at each system-clock offset into the transaction,
+// so a refresh pair landing in front of a critical burst is exercised
+// rather than left to the phase a fixed sequence happens to hit. A bank
+// checker on the command bus fails any SDRAM protocol violation, including
+// in the exploratory (beyond-limit) cells, where underruns are allowed but
+// memory corruption is not.
+//
 // Data pattern is a pure function of the 23-bit burst address, so the model
 // needs no backing store; the tb recomputes the same function per byte.
 module quad_fast_tb;
@@ -62,7 +70,7 @@ module quad_fast_tb;
         .dqm_o(dqm), .dq_io(dq),
         .spi_active(!cs), .spi_inhibit_refresh(ram_inh),
         .spi_cmd_activate(ram_act), .spi_cmd_read(ram_read), .spi_addr(ram_addr),
-        .spi_cmd_post_toggle(post_toggle),
+        .spi_cmd_post_toggle(post_toggle), .spi_cmd_continuation(ram_cont),
         .access_cmd(2'b00), .access_addr(25'b0), .inhibit_refresh(1'b0),
         .read_buffer(read_buffer_a), .read_buffer_b(read_buffer_b),
         .read_valid_a(read_valid_a), .read_valid_b(read_valid_b),
@@ -76,6 +84,9 @@ module quad_fast_tb;
     // posedge), drives read beats on negedge so they are stable for the
     // controller's aux_clk (== clk) posedge capture.
     // ---------------------------------------------------------------
+    sdram_bank_checker banks(.clk(clk), .enable(!reset), .cs(cs_n), .ras(ras),
+        .cas(cas), .we(we), .ba(ba), .a(a));
+
     reg [12:0] active_row [0:1][0:3];
     reg [15:0] beat_pipe [0:7];
     reg beat_valid [0:7];
@@ -458,6 +469,36 @@ module quad_fast_tb;
         explore_mode = 0;
     endtask
 
+    // Make the next refresh due k system clocks after CS falls, for every k
+    // in one refresh period, with a sub-cycle SPI/system phase that also
+    // walks. Each transaction starts at a different offset in the burst.
+    localparam integer REFRESH_PERIOD = (120 * 32000) / 8192;
+    reg refresh_seen = 0;
+    always @(negedge clk) if (!reset && {ras, cas, we} == 3'b001 && !cs_n) refresh_seen = 1;
+    task refresh_sweep(input [8:0] opcode, input real half, input [31:0] base,
+                       input bit must_pass = 1);
+        integer fails_before, thin_before;
+        sclk_half = half;
+        explore_mode = !must_pass;
+        fails_before = explore_fails; thin_before = thin_hits;
+        for (integer k = 0; k < REFRESH_PERIOD; k += 1) begin
+            // Start k clocks short of the next refresh: wait for a chip-0
+            // REFRESH (idle, so no debt is pending), then one period less k.
+            refresh_seen = 0;
+            while (!refresh_seen) @(negedge clk);
+            repeat (REFRESH_PERIOD - 1 - k) @(negedge clk);
+            // Never zero: 0.25..8.5 ns, stepping 0.37 ns per transaction.
+            /* verilator lint_off ZERODLY */
+            #(0.25 + (k * 0.37) - $floor(k * 0.37 / 8.333) * 8.333);
+            /* verilator lint_on ZERODLY */
+            read_check(opcode, base + 32'(k % 8) + 32'((k / 8) * 64), 16);
+        end
+        explore_mode = 0;
+        $display("quad_fast: refresh sweep %h @%0.1fMHz: %0d reads, %0d explore fails, %0d thin",
+                 opcode[7:0], 1000.0/(2*half), REFRESH_PERIOD,
+                 explore_fails - fails_before, thin_hits - thin_before);
+    endtask
+
     initial begin
         integer ref_before;
         repeat (4) @(negedge clk); reset = 0;
@@ -569,6 +610,18 @@ module quad_fast_tb;
             $fatal(1, "no SDRAM refresh during 2KB streaming read");
         $display("quad_fast: 2KB 0xEB @60MHz row/bank crossing OK (%0d refreshes)",
                  refreshes - ref_before);
+
+        // Refresh-phase sweeps at each documented limit (must pass), then
+        // beyond them (underruns allowed, protocol violations are not).
+        refresh_sweep(9'h03, 12.5,  32'h010000);
+        refresh_sweep(9'h0b, 7.143, 32'h018000);
+        refresh_sweep(9'h3b, 10.0,  32'h020000);
+        refresh_sweep(9'hbb, 8.333, 32'h028000);
+        refresh_sweep(9'h6b, 7.143, 32'h030000);
+        refresh_sweep(9'heb, 12.5,  32'h038000);
+        refresh_sweep(9'heb, 10.0,  32'h040000, 0);
+        refresh_sweep(9'hbb, 7.143, 32'h048000, 0);
+        refresh_sweep(9'h03, 10.0,  32'h050000, 0);
 
         // The mode pair: 0xB7 widens the address phase of the plain 0x03
         // and 0xE9 narrows it again. Placed after the streaming runs
