@@ -76,8 +76,10 @@ $(OSS_BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) $(OSS_SDC)
 # Open-source syntax, elaboration, and synthesis checks.
 lint: lint-yosys lint-verilator
 
+# The pinned ABC9 backend uses the experimental XAIG writer. Acknowledge
+# that feature explicitly; genuine design warnings still fail lint.
 lint-yosys:
-	yosys -Q -q \
+	yosys -Q -q -x write_xaiger2 \
 		-w "define gw1n not used.*" \
 		-w "Yosys has only limited support for tri-state logic.*" \
 		-e ".*" \
