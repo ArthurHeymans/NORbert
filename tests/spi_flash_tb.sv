@@ -17,7 +17,7 @@ module spi_flash_tb;
     // Whether the emulated chip advertises 4-byte addressing at all.
     reg cfg_4byte = 1'b0;
     wire spi_reset = reset || !running;
-    wire write_cmd, write_done, write_strobe;
+    wire write_cmd, write_done, write_strobe, write_partial;
     wire [1:0] write_type;
     wire [22:0] write_addr, write_len;
     wire [7:0] write_offset, write_value;
@@ -28,7 +28,11 @@ module spi_flash_tb;
     wire [63:0] write_buffer;
     reg [63:0] read_buffer = 0;
     reg busy = 0, accept = 0;
+    // Holds off SDRAM ownership for the program engine (as a refresh or a
+    // host access would) without affecting the model.
+    reg stall = 0;
     integer busy_cycles = 0;
+    integer model_reads = 0;
     integer outside_model = 0;
     // 8 KiB of model: one SDRAM row of four banks, which is what the
     // existing page-program and AAI tests stay within.
@@ -54,7 +58,7 @@ module spi_flash_tb;
         .spi_io1_out(miso), .spi_io1_oe(miso_oe),
         .ram_read_buffer(read_buffer), .ram_read_busy(busy),
         .write_cmd(write_cmd), .write_type(write_type), .write_addr(write_addr),
-        .write_len(write_len), .write_done(write_done),
+        .write_len(write_len), .write_partial(write_partial), .write_done(write_done),
         .write_buf_strobe(write_strobe), .write_buf_offset(write_offset),
         .write_buf_val(write_value), .cfg_jedec_id(24'h4125bf), .cfg_4byte(cfg_4byte),
         .cfg_chip_erase_bursts(23'h7fffff), .sfdp_raddr(sfdp_addr), .sfdp_rdata(sfdp_data)
@@ -65,11 +69,12 @@ module spi_flash_tb;
         .ft_rx_data_available(ft_rx_available), .ft_rx_data(ft_rx_byte),
         .ft_rx_pop(ft_rx_pop), .ft_txd_ready(1'b1),
         .ft_txd_strobe(ft_tx_strobe), .ft_txd_data(ft_tx_data),
-        .sdram_access_cmd(access), .sdram_access_addr(access_addr), .sdram_cmd_busy(busy),
+        .sdram_access_cmd(access), .sdram_access_addr(access_addr), .sdram_cmd_busy(busy || stall),
         .sdram_access_accept(accept),
         .sdram_read_busy(1'b0), .sdram_read_buffer(read_buffer), .sdram_write_buffer(write_buffer),
         .spi_reset(spi_reset), .spi_csel(cs), .spi_cmd_write(write_cmd),
         .spi_write_type(write_type), .spi_write_addr(write_addr), .spi_write_len(write_len),
+        .spi_write_partial(write_partial),
         .spi_write_done(write_done), .spi_write_buf_strobe(write_strobe),
         .spi_write_buf_offset(write_offset), .spi_write_buf_val(write_value),
         .spi_clk(sck),
@@ -104,7 +109,10 @@ module spi_flash_tb;
             // modelled row are dropped and counted rather than aliased. The
             // long erases below are the only thing that goes out there.
             if (access_addr[24:12] == 0) begin
-                if (access == 1) read_buffer <= memory[mem_index];
+                if (access == 1) begin
+                    read_buffer <= memory[mem_index];
+                    model_reads = model_reads + 1;
+                end
                 if (access == 2) memory[mem_index] <= write_buffer;
             end
             else begin
@@ -272,6 +280,20 @@ module spi_flash_tb;
         #35; cs = 1; #70;
     endtask
 
+    // Send only the first `count` (MSB-first) bits of a byte, leaving the
+    // transaction off a byte boundary.
+    task send_bits(input [7:0] b, input integer count);
+        for (integer bit_index = 7; bit_index > 7 - count; bit_index--) begin
+            mosi = b[bit_index];
+            #16.667; sck = 1;
+            #16.667; sck = 0;
+        end
+    endtask
+
+    task automatic read_status(output [7:0] status);
+        select_spi; send(8'h05); spi_byte(0, status); deselect_spi;
+    endtask
+
     task command(input [7:0] opcode);
         select_spi; send(opcode); deselect_spi;
     endtask
@@ -359,6 +381,79 @@ module spi_flash_tb;
         end
         if (status[0])
             $fatal(1, "WIP failed to clear within %0d system clocks", max_cycles);
+    endtask
+
+    // A real NOR flash only executes a program or erase when CS rises on a
+    // byte boundary. Neither may change memory, both must finish (WIP
+    // clears), and the aborted program's bytes must not leak into a later
+    // program of the same page buffer.
+    task check_partial_commands;
+        command(8'h06);
+        select_spi; send(8'h02); address('h1c0);
+        send(8'h00); send(8'h00); send_bits(8'h00, 3);
+        deselect_spi; poll_done;
+        check_memory;
+        command(8'h06);
+        select_spi; send(8'h20); address('h1000); send_bits(8'hff, 5);
+        deselect_spi; poll_done;
+        check_memory;
+        // A one-byte program at another offset of that page. Had the two
+        // aborted bytes (0x00 at 0x1c0/0x1c1) survived, they would land too.
+        page_program('h1d0, 1, 8'h0f);
+    endtask
+
+    // The engine may only get SDRAM ownership after the master has already
+    // started polling WIP. The command must survive those transactions.
+    task automatic check_delayed_program_start;
+        reg [7:0] status;
+        command(8'h06);
+        select_spi; send(8'h02); address('h1f4); send(8'h5a);
+        stall = 1;
+        deselect_spi;
+        repeat (3) begin
+            read_status(status);
+            if (!status[0]) $fatal(1, "WIP clear while the program could not start");
+        end
+        stall = 0;
+        poll_done;
+        expected['h1f4] &= 8'h5a;
+        check_memory;
+    endtask
+
+    // While WIP is set only status reads are decoded: array reads do not
+    // drive data or touch SDRAM, WREN does not set WEL, and a program
+    // issued then is dropped completely, page-buffer bytes included.
+    task automatic check_busy_commands;
+        reg [7:0] status, got;
+        integer reads_before;
+        command(8'h06);
+        select_spi; send(8'h20); address('h1000); deselect_spi;
+        read_status(status);
+        if (!status[0]) $fatal(1, "sector erase did not set WIP");
+        command(8'h06);
+        read_status(status);
+        if (status[1]) $fatal(1, "WREN set WEL while WIP");
+        reads_before = model_reads;
+        select_spi; send(8'h03); address('h0100);
+        for (integer i = 0; i < 4; i++) begin
+            spi_byte(0, got);
+            if (miso_oe) $fatal(1, "array read drove MISO while WIP");
+        end
+        deselect_spi;
+        select_spi; send(8'h9f); spi_byte(0, got);
+        if (miso_oe) $fatal(1, "JEDEC ID drove MISO while WIP");
+        deselect_spi;
+        // WEL is clear, so force the attempt through as far as the decoder
+        // goes: the PP opcode, address and data must all be ignored.
+        select_spi; send(8'h02); address('h1e0); send(8'h00); send(8'h00); deselect_spi;
+        if (model_reads != reads_before) $fatal(1, "array read during WIP accessed SDRAM");
+        read_status(status);
+        if (!status[0]) $fatal(1, "erase finished too early to cover WIP");
+        poll_done;
+        for (integer i = 'h1000; i < 'h2000; i++) expected[i] = 8'hff;
+        check_memory;
+        // The ignored program's bytes must not be in the page buffer.
+        page_program('h1e8, 1, 8'h3c);
     endtask
 
     task check_memory;
@@ -482,6 +577,9 @@ module spi_flash_tb;
         command(8'h04);
         page_program('h600, 1, 8'h56); // No stale AAI bytes may follow this PP
         page_program('ha00, 0, 0);    // Empty PP must also preserve all bytes
+        check_partial_commands;
+        check_delayed_program_start;
+        check_busy_commands;
 
         // ---- four-byte addressing -------------------------------------
 

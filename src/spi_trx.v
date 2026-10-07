@@ -49,8 +49,14 @@ module spi_trx(
     output wire prefetch_underrun,
     output wire prefetch_thin,
 
-    // For writing
-    output reg write_cmd,
+    // For writing. write_cmd rises when a program/erase is issued and is
+    // held until its completion clears WIP, so the system side cannot miss
+    // it however long it waits for CS high and SDRAM ownership. The other
+    // write_* outputs are held as long. write_partial is frozen at the end
+    // of the issuing transaction: set if CS rose mid-byte, in which case a
+    // real NOR flash does not execute the command.
+    output reg write_cmd = 0,
+    output reg write_partial = 0,
     output reg [1:0] write_type,  // 00=page program, 01=erase, 10=AAI RMW
     output reg [22:0] write_addr,     // 23-bit burst address
     output reg [22:0] write_len,
@@ -237,8 +243,14 @@ module spi_trx(
     // SDRAM prefetch. Each strobe marks the clock on which the SPI
     // transaction reaches the corresponding point; spi_prefetch documents
     // what it does with it.
-    // Opcode completing on this clock (valid when bit_count_in == 0).
+    // Opcode completing on this clock (valid when bit_count_in == 0), and
+    // the same with everything but status reads masked while WIP is set.
+    // 8'h00 is not a decoded opcode.
     wire [7:0] cmd_byte = {mosi_byte[7:1], spi_io0_in};
+    wire [7:0] cmd_accepted = (status_reg[0] && cmd_byte != CMD_READSTATUS &&
+                               cmd_byte != CMD_READSTATUS2) ? 8'h00 : cmd_byte;
+    // The issuing transaction of a pending write command is still selected.
+    reg write_open = 0;
 
     // Opcodes the decoder below turns into an array read, with the same
     // enable conditions. Kept next to the decoder's case labels: a read it
@@ -272,7 +284,7 @@ module spi_trx(
         .in_read(in_read),
         .sample_missing(sample_missing),
         .release_inhibit(state == STA_CMD && bit_count_in == 0 &&
-                         !array_read_opcode(cmd_byte)),
+                         !array_read_opcode(cmd_accepted)),
         // Quad: IO3/IO2 carry byte-address bits 11/10 on this clock.
         .first_activate(addr_read && addr_count == (addr_quad ? 11 : 9)),
         .first_row(addr_quad ? {addr[13:0], spi_io3_in, spi_io2_in} : addr[15:0]),
@@ -311,8 +323,10 @@ module spi_trx(
         // SCK can keep running for another slave while this CS is high.
         // Consume completion independently of selection, before the
         // selected state machine (which may start a new operation).
-        if (write_busy_clr)
+        if (write_busy_clr) begin
             status_reg[0] <= 0;
+            write_cmd <= 0;
+        end
 
         if (is_selected) begin
             fresh_read <= 0;
@@ -351,11 +365,11 @@ module spi_trx(
                 log_addr_valid <= 0;
                 log_byte_count <= 0;
                 
-                write_cmd <= 0;
-                
+                write_open <= 0;
                 write_buf_strobe <= 0;
                 
                 if (reset_power) begin
+                    write_cmd <= 0;
                     status_reg[1:0] <= 2'b00;
                     status_reg[6] <= 0;     // AAI bit
                     addr_4byte <= 0;
@@ -368,13 +382,20 @@ module spi_trx(
                 log_addr_valid <= 0;
                     
                 write_buf_strobe <= 0;
+
+                // A completed byte leaves the transaction at a boundary.
+                if (write_open)
+                    write_partial <= bit_count_in != 0;
                 
                 mosi_byte[bit_count_in] <= spi_io0_in;
 
 
                 if ((state == STA_CMD) && (bit_count_in == 0)) begin
                     
-                    case ({mosi_byte[7:1], spi_io0_in})
+                    // While WIP is set only status reads are accepted, as
+                    // on a real part: no array reads, writes or WEL changes
+                    // can race the program engine or its page buffer.
+                    case (cmd_accepted)
                         
                     CMD_READSTATUS: begin
                         state <= STA_READSTATUS;
@@ -539,6 +560,7 @@ module spi_trx(
                         if (status_reg[1]) begin
                             state <= STA_ERASE;
                             write_cmd <= 1;
+                            write_open <= 1;
                             write_type <= 2'd1;
                             write_addr <= 23'b0;
                             write_len <= cfg_chip_erase_bursts;
@@ -589,6 +611,7 @@ module spi_trx(
                                 state <= STA_AAI_DATA;
                                 aai_bytes_left <= 2;
                                 write_cmd <= 1;
+                                write_open <= 1;
                                 write_type <= 2'd2;
                                 write_addr <= wrap_burst_addr(addr[25:3]);
                                 write_len <= 0;
@@ -663,6 +686,7 @@ module spi_trx(
                         ADDR_KIND_ERASE: begin
                             state <= STA_ERASE;
                             write_cmd <= 1;
+                            write_open <= 1;
                             write_type <= 2'd1;
 
                             // Align address based on erase size
@@ -684,6 +708,7 @@ module spi_trx(
                                 state <= STA_AAI_DATA;
                                 aai_bytes_left <= 2;
                                 write_cmd <= 1;
+                                write_open <= 1;
                                 write_type <= 2'd2;
                                 write_addr <= wrap_burst_addr(addr_next[25:3]);
                                 write_len <= 0;
@@ -691,6 +716,7 @@ module spi_trx(
                             end else begin
                                 state <= STA_WRITE;
                                 write_cmd <= 1;
+                                write_open <= 1;
                                 write_type <= 2'd0;
 
                                 // Page-aligned address in 8-byte burst units

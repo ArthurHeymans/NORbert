@@ -232,6 +232,7 @@ module top(
     wire [1:0] spi_write_type;  // 00=page program, 01=erase, 10=AAI RMW
     wire [22:0] spi_write_addr;  // 23-bit
     wire [22:0] spi_write_len;
+    wire spi_write_partial;
     wire spi_write_done;
     
     wire spi_write_buf_strobe;
@@ -298,6 +299,7 @@ module top(
         .write_type(spi_write_type),
         .write_addr(spi_write_addr),
         .write_len(spi_write_len),
+        .write_partial(spi_write_partial),
         .write_done(spi_write_done),
         
         .write_buf_strobe(spi_write_buf_strobe),
@@ -599,6 +601,7 @@ module top(
         .spi_write_type(spi_write_type),
         .spi_write_addr(spi_write_addr),
         .spi_write_len(spi_write_len),
+        .spi_write_partial(spi_write_partial),
         .spi_write_done(spi_write_done),
         
         .spi_write_buf_strobe(spi_write_buf_strobe),
