@@ -29,6 +29,7 @@ module spi_prefetch(
 
     input wire fresh_read,           // spi_trx starts a new burst
     input wire in_read,              // spi_trx is in its data output phase
+    input wire sample_missing,       // Previous falling-edge output lacked its beat
 
     // First burst, from the address phase of array reads
     input wire first_inhibit,        // Row/bank about to be known
@@ -61,13 +62,17 @@ module spi_prefetch(
     input wire [63:0] ram_read_buffer_b,
     input wire ram_read_valid_a,
     input wire ram_read_valid_b,
+    input wire [3:0] ram_read_beats_a,
+    input wire [3:0] ram_read_beats_b,
 
     // Burst buffer currently shifted out. The controller only ever writes
     // the idle half, so this view is stable for the whole burst.
     output wire [63:0] live_buffer,
+    output wire [3:0] live_beats,
 
-    // Sticky diagnostics, cleared at the start of every transaction. See
-    // the burst_end handling below for their exact meaning.
+    // Sticky diagnostics, cleared at the start of every transaction.
+    // Underrun is checked on each master's data sampling edge, including
+    // short reads; thin still checks first-beat readiness at a burst boundary.
     output reg prefetch_underrun = 0,
     output reg prefetch_thin = 0
 );
@@ -93,6 +98,7 @@ module spi_prefetch(
     reg post_arm2 = 0;
 
     assign live_buffer = consume_sel ? ram_read_buffer_b : ram_read_buffer;
+    assign live_beats = consume_sel ? ram_read_beats_b : ram_read_beats_a;
 
     wire [22:0] next_burst = (ram_addr + 1'b1) & addr_mask;
 
@@ -113,6 +119,10 @@ module spi_prefetch(
                 prefetch_thin <= 0;
             end
             else begin
+                // The SPI output path samples beat validity alongside its
+                // data. Do not let a later fill erase an earlier missing byte.
+                if (in_read && sample_missing)
+                    prefetch_underrun <= 1;
                 // Lookahead post two clocks into every burst. With a
                 // dummy/mode-posted second burst there is nothing to post;
                 // just clear the flag (the burst-end drop already re-armed).
@@ -147,12 +157,10 @@ module spi_prefetch(
                 if (first_done) begin
                     ram_activate <= 0;
                     ram_read <= 0;
-                    // Keep refresh inhibited across the dummy phase for fast
-                    // reads: the second burst posts mid-dummy and a refresh
-                    // starting in the gap would delay it past its need.
-                    // (Slow 0x03 drops here, preserving the refresh-overlap
-                    // window its first burst relies on for trap timing
-                    // coverage.) Inhibit is released at the dummy end.
+                    // Keep refresh inhibited until lookahead is posted:
+                    // a refresh in this gap can starve an offset-7 initial
+                    // burst, even at modest SCK. Dummy reads release at
+                    // dummy end; slow reads release at byte 6/burst end.
                     if (!hold_inhibit)
                         ram_inhibit_refresh <= 0;
                 end
@@ -202,25 +210,16 @@ module spi_prefetch(
                     ram_read <= 1;
                     ram_addr <= next_burst;
                     posted_this_burst <= 1;
+                    ram_post_toggle <= ~ram_post_toggle;
                 end
 
                 if (burst_end) begin
                     consume_sel <= ~consume_sel;
-                    // Both flags sample the system-clock valids directly
-                    // (async). Benign: these are sticky diagnostics, never
-                    // data-path. A transitioning sample means its fill just
-                    // completed (data is fine either way); only a stable 0
-                    // flags.
-                    //
-                    // Underrun: the buffer just consumed (old consume_sel)
-                    // was filled at least a full burst ago, so a clear bit
-                    // means the fill never happened.
-                    if (consume_sel ? !ram_read_valid_b : !ram_read_valid_a)
-                        prefetch_underrun <= 1;
-                    // Thin margin: the upcoming buffer (~old consume_sel)
-                    // has not completed its fill yet. Data may still arrive
-                    // in time (beats land progressively), so this flags
-                    // thin margin, not corruption.
+                    // First-beat readiness is a margin diagnostic only.
+                    // The consumed-byte check above uses individual beats;
+                    // a fill after consumption cannot hide a stale output.
+                    // These bundled-data flags cross with their data and
+                    // require the same bundled-data timing contract.
                     if (consume_sel ? !ram_read_valid_a : !ram_read_valid_b)
                         prefetch_thin <= 1;
                     // Burst-end drop re-arms the handshake for the delayed

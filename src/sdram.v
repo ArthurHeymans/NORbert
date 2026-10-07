@@ -66,18 +66,23 @@ module sdram(
     input wire [24:0] access_addr,   // Access address (25-bit: chip + row + bank + col)
     input wire inhibit_refresh,
     output reg cmd_busy,
+    output reg access_accept,   // One cycle at actual serial-path dispatch
 
     output reg [63:0] read_buffer,
     output reg [63:0] read_buffer_b,
     output reg read_valid_a,
     output reg read_valid_b,
+    // One bit per published 16-bit beat. Cleared before reuse and set
+    // with its data, so high-offset/short reads can check their own bytes.
+    output reg [3:0] read_beats_a,
+    output reg [3:0] read_beats_b,
     output reg read_busy,
 
     input wire [63:0] write_buffer
 );
 
     parameter CLK_FREQ_MHZ = 132;
-    parameter BURST_LEN = 4;
+    parameter [4:0] BURST_LEN = 5'd4;
 
     // Internal DQ bus handling - tristate managed in this module
     // (Gowin requires inout and tristate to be in the same module for proper IOBUF inference)
@@ -90,28 +95,43 @@ module sdram(
     // Timing parameters (in clock cycles)
     // Based on W9825G6KH-6 datasheet (166MHz grade, tCK_min=6ns for CL=3)
     // At 120MHz: tCK = 8.33ns
+    //
+    // The values consumed by cmdtarget are sized to it (5 bits), so a
+    // timing constant that stops fitting is an elaboration error rather
+    // than a silent truncation. tINIT and tREFRESH stay plain integers:
+    // they size the counters; sized copies drive refresh arithmetic.
     localparam integer tINIT        = 100 * CLK_FREQ_MHZ;   // 100us init
     localparam integer tREFRESH     = (CLK_FREQ_MHZ * 32000) / 8192;  // ~468 cycles
-    localparam integer tRP          = 2;   // 16.7ns precharge (min 15ns for -6)
-    localparam integer tRC          = 8;   // 66.7ns row cycle (min 60ns for -6)
-    localparam integer tMRD         = 2;   // 2 cycles mode register set
-    localparam integer tRCD         = 2;   // 16.7ns RAS to CAS delay (min 15ns for -6)
-    localparam integer tDPL         = 2;   // Write recovery (min 2 tCK)
-    localparam integer tRAS         = 6;   // 50ns row active time (min 42ns for -6)
+    // Inhibit is a latency hint, not permission to lose memory retention.
+    // Allow one interval of deferral, then service refresh at a safe boundary.
+    localparam integer tREFRESH_MAX = 2 * tREFRESH;
+    // Keep service-latency headroom above the hard deadline so elapsed
+    // time is not lost while a row is closing or a burst is completing.
+    localparam integer REFRESH_BITS = $clog2(tREFRESH_MAX + 64);
+    localparam [REFRESH_BITS-1:0] REFRESH_PERIOD = tREFRESH[REFRESH_BITS-1:0];
+    localparam [REFRESH_BITS-1:0] REFRESH_SOFT_PRE = REFRESH_PERIOD - 1'b1;
+    localparam [REFRESH_BITS-1:0] REFRESH_HARD_PRE = (REFRESH_PERIOD << 1) - 1'b1;
+    localparam [REFRESH_BITS:0] REFRESH_BACKLOG_PRE = {1'b0, REFRESH_PERIOD} * 2'd3 - 1'b1;
+    localparam [4:0] tRP            = 5'd2;   // 16.7ns precharge (min 15ns for -6)
+    localparam [4:0] tRC            = 5'd8;   // 66.7ns row cycle (min 60ns for -6)
+    localparam [4:0] tMRD           = 5'd2;   // 2 cycles mode register set
+    localparam [4:0] tRCD           = 5'd2;   // 16.7ns RAS to CAS delay (min 15ns for -6)
+    localparam [4:0] tDPL           = 5'd2;   // Write recovery (min 2 tCK)
+    localparam [4:0] tRAS           = 5'd6;   // 50ns row active time (min 42ns for -6)
     // CAS latency 2: the W9825G6KH-6 is rated CL2 to 133MHz, so CL2 at
     // 120MHz is in spec and saves a full cycle of first-byte latency
     // versus CL3. This is load-bearing for dummy-less reads (0x03)
     // and tiny first bursts at fast SCLK. The MRS below programs the
     // same value into both chips, and tREAD/capture track it.
-    localparam integer tCAS         = 2;   // CAS latency = 2 for W9825G6KH
+    localparam [4:0] tCAS           = 5'd2;   // CAS latency = 2 for W9825G6KH
 
     // Read pipeline delay: compensates for SDRAM clock phase shift and capture pipeline.
     // With PE_COARSE=9 on SDRAM clock and aux_clk capture, RD_PIPELINE_DELAY=0 is correct.
-    localparam integer RD_PIPELINE_DELAY = 0;
+    localparam [4:0] RD_PIPELINE_DELAY = 5'd0;
 
     // Derived timing
-    localparam integer tREAD  = tCAS + RD_PIPELINE_DELAY + BURST_LEN + 1;
-    localparam integer tWRITE = BURST_LEN + tDPL + tRP;
+    localparam [4:0] tREAD  = tCAS + RD_PIPELINE_DELAY + BURST_LEN + 1;
+    localparam [4:0] tWRITE = BURST_LEN + tDPL + tRP;
 
     // State machine states
     localparam
@@ -145,7 +165,7 @@ module sdram(
     reg initrefreshcount;
     reg [4:0] cmdcount;
     reg [4:0] cmdtarget;
-    reg [$clog2(tREFRESH):0] refreshcount;
+    reg [REFRESH_BITS-1:0] refreshcount;
     
     // Track which chip we're refreshing (alternate between chips)
     reg refresh_chip;
@@ -169,6 +189,10 @@ module sdram(
     // serial-path reads are impossible while SPI is active (glue
     // serial_gate) and both sides restart at buffer A on every CS drop.
     reg fill_sel;
+    // Posts describe future buffers, not the fill currently in flight.
+    // Track their order separately so a post during progressive publish
+    // cannot invalidate already-published beats of the current burst.
+    reg post_fill_sel;
     reg fill_reset_armed;
     reg serial_read_active;
     // Edge-arming for the SPI fast path. A dispatch additionally requires
@@ -195,6 +219,11 @@ module sdram(
     reg spi_activate_done;
     
     wire do_inhibit_refresh = (spi_inhibit_refresh_buf[1] || inhibit_refresh);
+    // Registered deadline flags keep counter arithmetic/comparison out of
+    // the command/read-buffer dispatch path. Predict the increment so the
+    // flags describe the same elapsed time as refreshcount after each edge.
+    reg refresh_due, hard_refresh_due;
+    reg serial_row_open;
     
     // Address decoding for MT48LC16M16A2 (2 × 32MB = 64MB)
     // SPI path: 23-bit burst address
@@ -237,6 +266,7 @@ module sdram(
     integer i;
 
     always @(posedge clk) begin
+        access_accept <= 0;
         if (reset) begin
             state <= STA_INIT;
             cs_o <= 0;           // Select chip 0 for init (CS LOW = chip 0)
@@ -256,12 +286,17 @@ module sdram(
             cmdcount <= 0;
             cmdtarget <= 0;
             refreshcount <= 0;
+            refresh_due <= 0;
+            hard_refresh_due <= 0;
             refresh_chip <= 0;
+            serial_row_open <= 0;
             
             read_buffer <= 0;
             read_buffer_b <= 0;
             read_valid_a <= 0;
             read_valid_b <= 0;
+            read_beats_a <= 0;
+            read_beats_b <= 0;
             read_busy <= 0;
             readcount <= 0;
 
@@ -279,6 +314,7 @@ module sdram(
             spi_activate_done <= 0;
             spi_addr_latched <= 0;
             fill_sel <= 0;
+            post_fill_sel <= 1;
             fill_reset_armed <= 0;
             serial_read_active <= 0;
             spi_act_armed <= 1;
@@ -286,7 +322,12 @@ module sdram(
             spi_post_sync <= 0;
         end
         else begin
-            refreshcount <= refreshcount + 1;
+            // Saturate at capacity, not the dispatch deadline: elapsed
+            // service/deferral time remains owed until actually refreshed.
+            if (!(&refreshcount))
+                refreshcount <= refreshcount + 1'b1;
+            refresh_due <= refreshcount >= REFRESH_SOFT_PRE;
+            hard_refresh_due <= refreshcount >= REFRESH_HARD_PRE;
             
             // Synchronize SPI control signals. Gate requests with active CS so
             // a master that stops the clock while deasserting CS cannot leave
@@ -337,8 +378,9 @@ module sdram(
             // invalidating here can never clobber a completed fill.
             spi_post_sync <= {spi_post_sync[1:0], spi_cmd_post_toggle};
             if (spi_post_sync[1] ^ spi_post_sync[2]) begin
-                if (fill_sel) read_valid_b <= 0;
-                else read_valid_a <= 0;
+                if (post_fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
+                else begin read_valid_a <= 0; read_beats_a <= 0; end
+                post_fill_sel <= ~post_fill_sel;
             end
             
             if (spi_cmd_activate_ack && !spi_cmd_activate_buf[1]) begin
@@ -351,13 +393,19 @@ module sdram(
             // Busy when: any command is in progress (state != IDLE),
             // a new command has been posted (access_cmd != 0), or a
             // refresh is imminent and not inhibited.
+            //
+            // Explicit acceptance makes a one-cycle lookahead unnecessary:
+            // requests that race refresh remain posted until dispatched.
             cmd_busy <= (state != STA_IDLE) ||
                         (access_cmd != 2'b00) ||
-                        ((refreshcount >= tREFRESH-1) && !do_inhibit_refresh);
+                        (refresh_due && !do_inhibit_refresh) ||
+                        (hard_refresh_due && !serial_row_open);
 
             if (state == STA_INIT) begin
                 // Wait for SDRAM power-up (100us) - chip 0 selected (CS LOW)
+                /* verilator lint_off WIDTHEXPAND */
                 if (initcount >= tINIT) begin
+                /* verilator lint_on WIDTHEXPAND */
                     state <= STA_INIT_PRECHARGE;
                     cmdcount <= 1;
                     cmdtarget <= tRP;
@@ -393,9 +441,9 @@ module sdram(
                         // wrbuf_read_ptr counts 1..3 here (word 0 went out
                         // at dispatch above). Explicit lanes, see read path.
                         case (wrbuf_read_ptr)
-                            2'd1: dq_o <= write_buffer[31:16];
-                            2'd2: dq_o <= write_buffer[47:32];
-                            2'd3: dq_o <= write_buffer[63:48];
+                            3'd1: dq_o <= write_buffer[31:16];
+                            3'd2: dq_o <= write_buffer[47:32];
+                            3'd3: dq_o <= write_buffer[63:48];
                             default: dq_o <= write_buffer[15:0];
                         endcase
                         dqm_o <= 2'b00;
@@ -441,7 +489,7 @@ module sdram(
                         a_o <= 0;
                         a_o[9] <= 1'b0;         // Write burst: programmed length
                         a_o[8:7] <= 2'b00;      // Standard operation
-                        a_o[6:4] <= tCAS;       // CAS latency = 2 (tCAS)
+                        a_o[6:4] <= tCAS[2:0];  // CAS latency = 2 (tCAS)
                         a_o[3] <= 1'b0;         // Burst type: sequential
                         a_o[2:0] <= BURST_MODE; // Burst length = 4
                     end
@@ -498,7 +546,7 @@ module sdram(
                         a_o <= 0;
                         a_o[9] <= 1'b0;
                         a_o[8:7] <= 2'b00;
-                        a_o[6:4] <= tCAS;
+                        a_o[6:4] <= tCAS[2:0];
                         a_o[3] <= 1'b0;
                         a_o[2:0] <= BURST_MODE;
                     end
@@ -562,6 +610,7 @@ module sdram(
                     // bank opened for this SPI request.
                     state <= STA_SPI_ABORT_PRECHARGE;
                     cmdtarget <= tRP;
+                    spi_activate_done <= 0;
 
                     cs_o <= spi_chip_sel;
                     ras_o <= 0;
@@ -591,6 +640,32 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
+                else if (hard_refresh_due && !serial_row_open && access_cmd == 0 &&
+                         spi_activate_done && !spi_cmd_read_ack && !spi_cmd_read_buf[1]) begin
+                    // SCK may stop after ACTIVATE while CS remains low.
+                    // Close the row, refresh, then replay the held ACTIVATE.
+                    state <= STA_SPI_ABORT_WAIT;
+                    cmdtarget <= tRAS;
+                    spi_cmd_activate_ack <= 0;
+                    spi_act_armed <= 1;
+                    ras_o <= 1;
+                    cas_o <= 1;
+                    we_o <= 1;
+                    dqm_o <= 2'b11;
+                end
+                else if (hard_refresh_due && !serial_row_open && access_cmd == 0 &&
+                         (!spi_activate_done || spi_cmd_read_ack)) begin
+                    state <= STA_REFRESH;
+                    cmdtarget <= tRC;
+                    refreshcount <= refreshcount - REFRESH_PERIOD + 1'b1;
+                    refresh_due <= refreshcount >= REFRESH_HARD_PRE;
+                    hard_refresh_due <= {1'b0, refreshcount} >= REFRESH_BACKLOG_PRE;
+                    cs_o <= 0;
+                    ras_o <= 0;
+                    cas_o <= 0;
+                    we_o <= 1;
+                    dqm_o <= 2'b11;
+                end
                 else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed) begin
                     // SPI fast-path activate
                     state <= STA_ACTIVATE;
@@ -601,8 +676,11 @@ module sdram(
                     spi_act_armed <= 0;
                     if (fill_reset_armed) begin
                         fill_sel <= 0;
+                        post_fill_sel <= 1;
                         read_valid_a <= 0;
                         read_valid_b <= 0;
+                        read_beats_a <= 0;
+                        read_beats_b <= 0;
                         fill_reset_armed <= 0;
                     end
 
@@ -625,8 +703,8 @@ module sdram(
                     serial_read_active <= 0;
                     // Invalidate the fill target up front; set again below
                     // when the final beat publishes.
-                    if (fill_sel) read_valid_b <= 0;
-                    else read_valid_a <= 0;
+                    if (fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
+                    else begin read_valid_a <= 0; read_beats_a <= 0; end
 
                     // READ command with auto-precharge
                     cs_o <= spi_chip_sel;
@@ -642,6 +720,8 @@ module sdram(
                 end
                 else if (access_cmd == 2'b11) begin
                     // Serial path activate
+                    access_accept <= 1;
+                    serial_row_open <= 1;
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
 
@@ -656,11 +736,14 @@ module sdram(
                 end
                 else if (access_cmd == 2'b01) begin
                     // Serial path read
+                    access_accept <= 1;
+                    serial_row_open <= 0;
                     state <= STA_READ;
                     cmdtarget <= tREAD + 2;
                     read_busy <= 1;
                     serial_read_active <= 1;
                     read_valid_a <= 0;
+                    read_beats_a <= 0;
 
                     // READ command with auto-precharge
                     cs_o <= access_chip_sel;
@@ -676,6 +759,8 @@ module sdram(
                 end
                 else if (access_cmd == 2'b10) begin
                     // Serial path write
+                    access_accept <= 1;
+                    serial_row_open <= 0;
                     state <= STA_WRITE;
                     cmdtarget <= tWRITE;
                     wrbuf_read_ptr <= 1;
@@ -695,11 +780,15 @@ module sdram(
                     dq_o <= write_buffer[15:0];
                     dqm_o <= 2'b00;
                 end
-                else if ((refreshcount >= tREFRESH) && !do_inhibit_refresh) begin
+                else if (refresh_due && !do_inhibit_refresh) begin
                     // Auto refresh - alternate between chips
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;
-                    refreshcount <= 1;
+                    // Pay one period, retaining overdue time. Resetting
+                    // here halves the nominal rate under sustained inhibit.
+                    refreshcount <= refreshcount - REFRESH_PERIOD + 1'b1;
+                    refresh_due <= refreshcount >= REFRESH_HARD_PRE;
+                    hard_refresh_due <= {1'b0, refreshcount} >= REFRESH_BACKLOG_PRE;
 
                     // REFRESH command for current chip
                     cs_o <= refresh_chip;
@@ -735,12 +824,15 @@ module sdram(
                 // ping-pong fill target). Beats of one READ arrive
                 // back-to-back, so later bytes are always ready long before
                 // the SPI side shifts them out; only the first byte(s) of a
-                // burst are timing-critical. Validity (bytes 0-1 ready) is
-                // therefore set with beat 0; the underrun check only ever
-                // inspects a buffer whose full fill completed a whole burst
-                // earlier, so early-valid is conservative-safe.
+                // burst are timing-critical. read_valid marks beat 0 for
+                // the thin-margin check; read_beats marks each beat for
+                // actual output checks, including high-offset short reads.
                 // (Explicit lanes rather than variable part-selects: safest
                 // across Yosys, Verilator, and Gowin synthesis.)
+                if (serial_read_active || !fill_sel)
+                    read_beats_a[rdbuf_write_ptr] <= 1;
+                else
+                    read_beats_b[rdbuf_write_ptr] <= 1;
                 case (rdbuf_write_ptr)
                     2'd0: begin
                         if (serial_read_active) begin
@@ -771,6 +863,7 @@ module sdram(
                             read_buffer[63:48] <= dq_captured;
                             read_valid_a <= 1;
                             read_valid_b <= 0;
+                            read_beats_b <= 0;
                             fill_sel <= 0;
                             serial_read_active <= 0;
                         end

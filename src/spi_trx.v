@@ -40,10 +40,12 @@ module spi_trx(
     input wire [63:0] ram_read_buffer_b,
     input wire ram_read_valid_a,
     input wire ram_read_valid_b,
+    input wire [3:0] ram_read_beats_a,
+    input wire [3:0] ram_read_beats_b,
     input wire ram_read_busy,
-    // Sticky per-transaction diagnostics: the consumed burst never filled
-    // (underrun) or the upcoming burst was not yet complete at a burst end
-    // (thin margin, data may still be correct).
+    // Sticky per-transaction diagnostics: an output sample used an unready
+    // beat (underrun), or the upcoming first beat was not ready at a burst
+    // boundary (thin margin, data may still be correct).
     output wire prefetch_underrun,
     output wire prefetch_thin,
 
@@ -68,8 +70,6 @@ module spi_trx(
     output reg [6:0] sfdp_raddr,
     input wire [7:0] sfdp_rdata,
     
-    output reg log_strobe = 0,
-    output reg [7:0] log_val = 0,
     
     // Structured logging outputs (directly driven from SPI state machine).
     // All signals are in the SPI clock domain; the logger module synchronizes.
@@ -123,6 +123,8 @@ module spi_trx(
     reg [2:0] bit_count_in;
     reg [7:0] mosi_byte;
     reg [7:0] miso_byte;
+    reg miso_byte_valid;
+    reg sample_missing = 0;
     
     // JEDEC ID and 4-byte addressing are driven by cfg_jedec_id and cfg_4byte
     // from glue.v (configured at runtime via serial CHIPCONFIG command).
@@ -149,7 +151,8 @@ module spi_trx(
         STA_READID          = 4,
         STA_WRITE           = 6,
         STA_ERASE           = 8,
-        STA_LOG             = 9,
+        // 9 (STA_LOG) retired with the 0xF2 logging hook: unlisted opcodes
+        // are ignored by the decoder, so 9 stays unused rather than reused.
         STA_DUMMY           = 10,
         STA_MODE_MULTI      = 13,  // Mode+dummy phase for 0xBB/0xEB
         STA_WRITESTATUS     = 16,  // Receive status register write data
@@ -158,6 +161,20 @@ module spi_trx(
     
     reg [4:0] state;
     reg [2:0] dummy_count = 0;
+    // dummy_count is loaded with the last dummy clock and counts down to 0,
+    // so fast reads support 1..8 wait clocks. Verilog-2001 has no cast to
+    // narrow the parameter expression, so the truncation is waived here and
+    // the range is enforced by the generate guard below instead.
+    /* verilator lint_off WIDTHTRUNC */
+    localparam [2:0] FAST_READ_DUMMY_LAST = FAST_READ_DUMMY_CLKS - 1;
+    /* verilator lint_on WIDTHTRUNC */
+    generate
+        if (FAST_READ_DUMMY_CLKS < 1 || FAST_READ_DUMMY_CLKS > 8) begin : g_dummy_range
+            // Deliberately undefined: elaboration fails if dummy_count
+            // cannot hold the configured fast-read wait.
+            FAST_READ_DUMMY_CLKS_must_be_1_to_8 unsupported_dummy_clks();
+        end
+    endgenerate
     reg is_fast_read = 0;
     reg is_dual_read = 0;       // Set for both 0x3B and 0xBB
     reg is_quad_read = 0;       // Set for both 0x6B and 0xEB
@@ -194,12 +211,16 @@ module spi_trx(
                                         {addr[30:0], spi_io0_in};
     // Most significant address bit arriving on this clock.
     wire addr_lane_msb = addr_quad ? spi_io3_in : addr_dual ? spi_io1_in : spi_io0_in;
-    wire addr_last = addr_count == addr_lanes - 1'b1;
+    // addr_count is 5 bits and counts down by addr_lanes (1, 2 or 4) per
+    // address clock; the subtraction is done at addr_count's width.
+    wire addr_last = addr_count == ({2'b00, addr_lanes} - 5'd1);
     
     // Set on the clock that starts a new burst in STA_READ; the first byte
     // of the burst comes straight from live_buffer.
     reg fresh_read = 0;
     wire [63:0] live_buffer;
+    wire [3:0] live_beats;
+    wire [2:0] next_byte = addr[2:0] + 3'd1;
 
     // Status registers
     reg [7:0] status_reg = 8'b00000000;
@@ -226,6 +247,7 @@ module spi_trx(
         .addr_mask(cfg_chip_erase_bursts),
         .fresh_read(fresh_read),
         .in_read(in_read),
+        .sample_missing(sample_missing),
         .first_inhibit(addr_read && addr_count == 15),
         // Quad: IO3/IO2 carry byte-address bits 11/10 on this clock.
         .first_activate(addr_read && addr_count == (addr_quad ? 11 : 9)),
@@ -233,7 +255,9 @@ module spi_trx(
         .first_read(addr_read && addr_count == 3),
         .first_col({addr[5:0], addr_lane_msb}),
         .first_done(addr_read && addr_last && !addr_dual && !addr_quad),
-        .hold_inhibit(is_fast_read),
+        // No refresh gap before the initial lookahead: an offset-7
+        // dummy-less read has only one byte to hide that burst's latency.
+        .hold_inhibit(1'b1),
         .release_inhibit(state == STA_DUMMY && dummy_count == 0),
         .post_lookahead((state == STA_DUMMY && dummy_count == 5 && !is_sfdp_read) ||
                         (state == STA_MODE_MULTI && mode_count == 1)),
@@ -252,7 +276,10 @@ module spi_trx(
         .ram_read_buffer_b(ram_read_buffer_b),
         .ram_read_valid_a(ram_read_valid_a),
         .ram_read_valid_b(ram_read_valid_b),
+        .ram_read_beats_a(ram_read_beats_a),
+        .ram_read_beats_b(ram_read_beats_b),
         .live_buffer(live_buffer),
+        .live_beats(live_beats),
         .prefetch_underrun(prefetch_underrun),
         .prefetch_thin(prefetch_thin)
     );
@@ -261,16 +288,20 @@ module spi_trx(
     always @(posedge spi_clk) begin
         write_done_sync <= {write_done_sync[1:0], write_done};
 
+        // SCK can keep running for another slave while this CS is high.
+        // Consume completion independently of selection, before the
+        // selected state machine (which may start a new operation).
+        if (write_busy_clr)
+            status_reg[0] <= 0;
+
         if (is_selected) begin
             fresh_read <= 0;
-            
-            if (status_reg[0] && write_busy_clr)
-                status_reg[0] <= 0;
             
             if (reset_cs || reset_power) begin
                 bit_count_in <= 6;
                 mosi_byte <= {spi_io0_in, 7'b0};
                 miso_byte <= 0;
+                miso_byte_valid <= 0;
                 
                 spi_io0_oe_ff <= 0;
                 spi_io1_oe_ff <= 0;
@@ -296,8 +327,6 @@ module spi_trx(
                 status_read_sel2 <= 0;
                 mode_count <= 0;
                 
-                log_strobe <= 0;
-                log_val <= 0;
                 log_cmd_valid <= 0;
                 log_addr_valid <= 0;
                 log_byte_count <= 0;
@@ -312,13 +341,9 @@ module spi_trx(
                     addr_4byte <= 0;
                     aai_active <= 0;
                     addr <= 0;
-                    
-                    log_strobe <= 1;
-                    log_val <= 8'hE2;
                 end
             end
             else begin
-                log_strobe <= 0;
                 log_cmd_valid <= 0;
                 log_addr_valid <= 0;
                     
@@ -568,14 +593,8 @@ module spi_trx(
                         addr_count <= 1;
                     end
                     
-                    CMD_LOG: begin
-                        state <= STA_LOG;
-                    end
-                        
                     endcase
                     
-                    log_strobe <= 1;
-                    log_val <= {mosi_byte[7:1], spi_io0_in};
                     log_cmd_valid <= 1;
                     log_cmd_opcode <= {mosi_byte[7:1], spi_io0_in};
                     log_byte_count <= 0;
@@ -592,12 +611,7 @@ module spi_trx(
                     // SST AAI ignores transmitted A0: the two bytes occupy
                     // an aligned word within one SDRAM burst.
                     addr <= (is_aai && addr_last) ? {addr_next[31:1], 1'b0} : addr_next;
-                    addr_count <= addr_count - addr_lanes;
-
-                    if (!addr_dual && !addr_quad && bit_count_in == 0) begin
-                        log_strobe <= 1;
-                        log_val <= {mosi_byte[7:1], spi_io0_in};
-                    end
+                    addr_count <= addr_count - {2'b00, addr_lanes};
 
                     if (addr_last) begin
                         log_addr_valid <= 1;
@@ -616,7 +630,7 @@ module spi_trx(
                             else begin
                                 if (is_fast_read) begin
                                     state <= STA_DUMMY;
-                                    dummy_count <= FAST_READ_DUMMY_CLKS - 1;
+                                    dummy_count <= FAST_READ_DUMMY_LAST;
                                 end
                                 else begin
                                     state <= STA_READ;
@@ -633,9 +647,9 @@ module spi_trx(
 
                             // Align address based on erase size
                             // write_addr is 23-bit burst address = byte_addr[25:3]
-                            if (write_len == 20'h01FFF)
+                            if (write_len == 23'h01FFF)
                                 write_addr <= wrap_burst_addr({addr_next[25:16], 13'b0});  // 64KB aligned
-                            else if (write_len == 20'h00FFF)
+                            else if (write_len == 23'h00FFF)
                                 write_addr <= wrap_burst_addr({addr_next[25:15], 12'b0});  // 32KB aligned
                             else
                                 write_addr <= wrap_burst_addr({addr_next[25:12], 9'b0});   // 4KB aligned
@@ -713,13 +727,16 @@ module spi_trx(
                         fresh_read <= 1;
 
                     if (bit_count_in == 0) begin
-                        miso_byte <= live_buffer[(addr[2:0]+1)*8 +: 8];
+                        miso_byte <= live_buffer[next_byte*8 +: 8];
+                        miso_byte_valid <= live_beats[next_byte[2:1]];
                         addr <= addr + 1;
                         log_byte_count <= log_byte_count + 1;
                     end
 
-                    if (fresh_read)
+                    if (fresh_read) begin
                         miso_byte <= live_buffer[addr[2:0]*8 +: 8];
+                        miso_byte_valid <= live_beats[addr[2:1]];
+                    end
                 end
                 else if (state == STA_READID) begin
                     if (bit_count_in == 0) begin
@@ -754,12 +771,6 @@ module spi_trx(
                     write_buf_val <= {mosi_byte[7:1], spi_io0_in};
                     if (aai_bytes_left == 1)
                         addr <= addr + 2;
-                end
-                else if (state == STA_LOG) begin
-                    if (bit_count_in == 0) begin
-                        log_strobe <= 1;
-                        log_val <= {mosi_byte[7:1], spi_io0_in};
-                    end
                 end
                 // ---------------------------------------------------------
                 // Mode+dummy phase for multi-IO reads (0xBB and 0xEB)
@@ -841,6 +852,12 @@ module spi_trx(
     // flops double as registered lane selects. Decoding state here instead
     // would lengthen the half-cycle posedge-to-negedge output path.
     always @(negedge spi_clk) begin
+        // Record readiness on exactly the path used to drive the next
+        // sample: first bits use live SDRAM, later bits use the byte latch.
+        // The following posedge is the master's sampling edge. Checking
+        // only at burst end would miss short reads and late-arriving fills.
+        sample_missing <= is_selected && in_read &&
+            !(fresh_read ? live_beats[addr[2:1]] : miso_byte_valid);
         if (spi_io2_oe_ff) begin
             // Quad output: 4 bits per clock (2 clocks per byte)
             // IO3 = MSB of nibble, IO0 = LSB of nibble

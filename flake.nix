@@ -12,6 +12,18 @@
       url = "github:Blue-Berry/gowin-eda.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    yosys-src = {
+      url = "git+https://github.com/ArthurHeymans/yosys?ref=norbert-experimental&submodules=1";
+      flake = false;
+    };
+    nextpnr-src = {
+      url = "git+https://github.com/ArthurHeymans/nextpnr?ref=norbert-experimental&submodules=1";
+      flake = false;
+    };
+    apicula-src = {
+      url = "github:ArthurHeymans/apicula/norbert-experimental";
+      flake = false;
+    };
   };
 
   outputs =
@@ -21,6 +33,9 @@
       flake-utils,
       rust-overlay,
       gowin-eda,
+      yosys-src,
+      nextpnr-src,
+      apicula-src,
     }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (
       system:
@@ -40,6 +55,39 @@
           ];
           targets = [ "wasm32-unknown-unknown" ];
         };
+
+        experimentalApicula = pkgs.python3Packages.apycula.overrideAttrs (_: {
+          version = "0.33+norbert";
+          src = apicula-src;
+          SETUPTOOLS_SCM_PRETEND_VERSION = "0.33+norbert";
+        });
+        experimentalYosys = pkgs.yosys.overrideAttrs (old: {
+          version = "0.69+norbert";
+          src = yosys-src;
+          cmakeFlags = old.cmakeFlags ++ [
+            "-DYOSYS_CHECKOUT_INFO=${yosys-src.rev}"
+            "-DYOSYS_WITHOUT_SLANG=ON"
+          ];
+          doCheck = false;
+        });
+        experimentalNextpnr =
+          (pkgs.nextpnr.override {
+            architectures = [ "gowin" ];
+            python3Packages = pkgs.python3Packages // {
+              apycula = experimentalApicula;
+            };
+          }).overrideAttrs
+            (old: {
+              version = "0.11.1+norbert";
+              src = nextpnr-src;
+              cmakeFlags = old.cmakeFlags ++ [
+                "-DCURRENT_GIT_VERSION=${nextpnr-src.rev}"
+                "-DHIMBAECHEL_GOWIN_DEVICES=GW5A-25A"
+              ];
+              meta = old.meta // {
+                changelog = "https://github.com/ArthurHeymans/nextpnr/commits/${nextpnr-src.rev}";
+              };
+            });
 
         # Gowin EDA Education edition from gowin-eda.nix
         gowinEda = gowin-eda.packages.${system}.default;
@@ -76,23 +124,23 @@
           targetPkgs =
             pkgs: with pkgs; [
               stdenv.cc.cc.lib
-              xorg.libX11
-              xorg.libXext
-              xorg.libXrender
-              xorg.libXtst
-              xorg.libXi
-              xorg.libXrandr
-              xorg.libXcomposite
-              xorg.libXcursor
-              xorg.libXdamage
-              xorg.libXfixes
-              xorg.libXScrnSaver
-              xorg.libxcb
-              xorg.xcbutil
-              xorg.xcbutilimage
-              xorg.xcbutilkeysyms
-              xorg.xcbutilrenderutil
-              xorg.xcbutilwm
+              libx11
+              libxext
+              libxrender
+              libxtst
+              libxi
+              libxrandr
+              libxcomposite
+              libxcursor
+              libxdamage
+              libxfixes
+              libxscrnsaver
+              libxcb
+              libxcb-util
+              libxcb-image
+              libxcb-keysyms
+              libxcb-render-util
+              libxcb-wm
               libGL
               libGLU
               libdrm
@@ -150,37 +198,66 @@
 
           exec ${gowinFhs}/bin/gowin-fhs -c "cd '$(pwd)' && unset DISPLAY QT_QPA_PLATFORMTHEME QT_STYLE_OVERRIDE && QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH='$WORKSPACE_DIR/IDE/lib':\"$LD_LIBRARY_PATH\" '$WORKSPACE_DIR/IDE/bin/gw_sh' $*"
         '';
+        developmentInputs = with pkgs; [
+          experimentalYosys
+          experimentalNextpnr
+          experimentalApicula
+          openfpgaloader
+          verilator
+          gtkwave
+          gnumake
+          libftdi1
+          rustToolchain
+          trunk
+          wasmBindgenCli
+          pkg-config
+          udev
+        ];
       in
       {
+        packages = {
+          yosys = experimentalYosys;
+          nextpnr = experimentalNextpnr;
+          apicula = experimentalApicula;
+        };
+
+        checks.oss-toolchain =
+          pkgs.runCommand "norbert-oss-toolchain-tests"
+            {
+              nativeBuildInputs = [
+                experimentalYosys
+                (pkgs.python3.withPackages (_: [ experimentalApicula ]))
+                pkgs.iverilog
+              ];
+            }
+            ''
+              python3 -m unittest discover -s ${apicula-src}/tests
+              for script in opt/memory_map_const_wr opt/opt_dff_shared_mux \
+                            techmap/tribuf_nested techmap/tribuf_pad_read \
+                            verilog/dynamic_range_lhs_stride arch/gowin/buffers; do
+                yosys -Q -q -s ${yosys-src}/tests/$script.ys
+              done
+              mkdir -p tests/arch/gowin techlibs/gowin
+              cp ${yosys-src}/tests/arch/gowin/* tests/arch/gowin/
+              cp ${yosys-src}/techlibs/gowin/cells_sim.v techlibs/gowin/
+              chmod -R u+w tests techlibs
+              cd tests/arch/gowin
+              export YOSYS=yosys
+              bash bidir.sh
+              bash bram.sh
+              touch $out
+            '';
+
+        devShells.oss = pkgs.mkShell {
+          buildInputs = developmentInputs;
+        };
+
         devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
-            # Gowin IDE (CLI synthesis)
+          buildInputs = [
             gwSh
             gowinEda
-
-            # Open-source synthesis (linting only for GW5A)
-            yosys
-
-            # Programming tool
-            openfpgaloader
-
-            # Simulation & waveform
-            verilator
-            gtkwave
-
-            # Build tools
-            gnumake
-
-            # FTDI EEPROM programming (FT2232H async 245 setup)
-            libftdi1
-
-            # Rust and WebAssembly toolchain for spi-flash-tool and the Web UI
-            rustToolchain
-            trunk
-            wasmBindgenCli
-            pkg-config
-            udev
-          ];
+          ]
+          ++ developmentInputs;
 
           shellHook = ''
             echo "Tang Primer 25K SPI Flash Emulator Development Environment"
@@ -188,7 +265,8 @@
             echo "Available tools:"
             echo "  gw_sh            - Gowin CLI synthesis (Education Edition)"
             echo "  gw_ide           - Gowin IDE GUI"
-            echo "  yosys            - Verilog linting"
+            echo "  yosys            - Verilog linting and open-source synthesis"
+            echo "  nextpnr-himbaechel, gowin_pack - Open-source place and route"
             echo "  openFPGALoader   - FPGA programming"
             echo "  verilator        - Verilog simulation"
             echo "  gtkwave          - Waveform viewer"
@@ -199,6 +277,7 @@
             echo ""
             echo "Build commands:"
             echo "  make build       - Synthesize with gw_sh (CLI)"
+            echo "  make build-oss   - Experimental open-source build"
             echo "  make prog        - Program FPGA (volatile)"
             echo "  make flash       - Program to flash (persistent)"
             echo "  make lint        - Lint with yosys"

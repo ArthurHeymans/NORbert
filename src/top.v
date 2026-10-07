@@ -104,6 +104,7 @@ module top(
     wire [63:0] sdram_read_buffer_b;
     wire sdram_read_valid_a;
     wire sdram_read_valid_b;
+    wire [3:0] sdram_read_beats_a, sdram_read_beats_b;
     wire sdram_read_busy;
     wire [63:0] sdram_write_buffer;
     
@@ -167,9 +168,12 @@ module top(
     // IO3 (/HOLD pin): input normally, output during quad read data phase.
     // When hold_out is asserted, IO3 is driven LOW continuously to keep
     // the target flash in hold state (mutually exclusive with quad I/O).
+    //
+    // Keep the 1'bz in the outermost mux: Yosys only infers a tristate
+    // buffer there, and otherwise turns the pin into a plain output.
     wire hold_out;
-    assign spi_io3_pin = hold_out ? 1'b0 :
-                         (spi_io3_oe && spi_active_out) ? spi_io3_out : 1'bz;
+    wire spi_io3_drive = hold_out || (spi_io3_oe && spi_active_out);
+    assign spi_io3_pin = spi_io3_drive ? (spi_io3_out && !hold_out) : 1'bz;
     wire spi_io3_in = spi_io3_pin;
     
     assign spi_debug_pin = spi_debug_out;
@@ -213,6 +217,10 @@ module top(
     // -----------------------------------------------------------
     
     wire spi_active;
+    // Sticky-until-read by glue, so the fast read path's health is
+    // observable from the host instead of only inside simulation.
+    wire prefetch_underrun;
+    wire prefetch_thin;
     wire spi_ram_inhibit_refresh;
     wire spi_ram_activate;
     wire spi_ram_read;
@@ -229,9 +237,6 @@ module top(
     wire spi_write_buf_strobe;
     wire [7:0] spi_write_buf_offset;
     wire [7:0] spi_write_buf_val;
-    
-    wire log_strobe;
-    wire [7:0] log_val;
     
     // Structured logging signals (SPI clock domain)
     wire log_cmd_valid;
@@ -283,9 +288,11 @@ module top(
         .ram_read_buffer_b(sdram_read_buffer_b),
         .ram_read_valid_a(sdram_read_valid_a),
         .ram_read_valid_b(sdram_read_valid_b),
+        .ram_read_beats_a(sdram_read_beats_a),
+        .ram_read_beats_b(sdram_read_beats_b),
         .ram_read_busy(sdram_read_busy),
-        .prefetch_underrun(),
-        .prefetch_thin(),
+        .prefetch_underrun(prefetch_underrun),
+        .prefetch_thin(prefetch_thin),
         
         .write_cmd(spi_write_cmd),
         .write_type(spi_write_type),
@@ -303,9 +310,6 @@ module top(
         
         .sfdp_raddr(sfdp_raddr),
         .sfdp_rdata(sfdp_rdata),
-        
-        .log_strobe(log_strobe),
-        .log_val(log_val),
         
         .log_cmd_valid(log_cmd_valid),
         .log_cmd_opcode(log_cmd_opcode),
@@ -373,6 +377,7 @@ module top(
     wire [24:0] sdram_access_addr;   // 25-bit for serial path
     wire sdram_inhibit_refresh;
     wire sdram_cmd_busy;
+    wire sdram_access_accept;
     
     sdram #(
         .CLK_FREQ_MHZ(120),
@@ -405,11 +410,14 @@ module top(
         .access_addr(sdram_access_addr),
         .inhibit_refresh(sdram_inhibit_refresh),
         .cmd_busy(sdram_cmd_busy),
+        .access_accept(sdram_access_accept),
         
         .read_buffer(sdram_read_buffer),
         .read_buffer_b(sdram_read_buffer_b),
         .read_valid_a(sdram_read_valid_a),
         .read_valid_b(sdram_read_valid_b),
+        .read_beats_a(sdram_read_beats_a),
+        .read_beats_b(sdram_read_beats_b),
         .read_busy(sdram_read_busy),
         
         .write_buffer(sdram_write_buffer)
@@ -454,6 +462,7 @@ module top(
     wire ft_txd_strobe;
     wire ft_rxd_strobe_raw;
     wire [7:0] ft_rxd_raw;
+    wire ft_rxfifo_space;
 
     ft245 ft245_i(
         .clk(clk),
@@ -465,6 +474,7 @@ module top(
         .ft_wr_n(ft_wr_n),
         .rxd(ft_rxd_raw),
         .rxd_strobe(ft_rxd_strobe_raw),
+        .rxd_ready(ft_rxfifo_space),
         .txd(ft_txd),
         .txd_strobe(ft_txd_strobe),
         .txd_ready(ft_txd_ready)
@@ -535,7 +545,7 @@ module top(
         .reset(reset),
         .write_data(ft_rxd_raw),
         .write_strobe(ft_rxd_strobe_raw),
-        .space_available(),      // ft245 never overflows 16-deep FIFO
+        .space_available(ft_rxfifo_space), // Stop RD# before the ring fills
         .data_available(ft_rxfifo_data_available),
         .more_available(),
         .read_data(ft_rxfifo_data),
@@ -574,6 +584,7 @@ module top(
         .sdram_access_addr(sdram_access_addr),
         .sdram_inhibit_refresh(sdram_inhibit_refresh),
         .sdram_cmd_busy(sdram_cmd_busy),
+        .sdram_access_accept(sdram_access_accept),
         
         .sdram_read_buffer(sdram_read_buffer),
         .sdram_read_busy(sdram_read_busy),
@@ -592,9 +603,6 @@ module top(
         .spi_write_buf_strobe(spi_write_buf_strobe),
         .spi_write_buf_offset(spi_write_buf_offset),
         .spi_write_buf_val(spi_write_buf_val),
-        
-        .log_strobe(log_strobe),
-        .log_val(log_val),
         
         .cfg_jedec_id(cfg_jedec_id),
         .cfg_4byte(cfg_4byte),
@@ -617,6 +625,9 @@ module top(
         .log_addr_valid_sync(log_addr_valid_pulse_sys),
         .log_addr_sync(log_addr_out[23:0]),
         .spi_active_sync(spi_active_sys[1]),
+
+        .prefetch_underrun(prefetch_underrun),
+        .prefetch_thin(prefetch_thin),
 
         .redirect_active(redirect_active),
         .redirect_mask(redirect_mask),

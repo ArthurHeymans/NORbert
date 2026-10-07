@@ -9,7 +9,7 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 - **SPI NOR flash emulation** with full command support: read, fast read, page program, sector/block/chip erase, JEDEC ID, status registers, SFDP
 - **Configurable chip identity** at runtime -- load any chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database to set JEDEC ID, size, and SFDP parameters (defaults to Winbond W25Q64FV)
 - **Multi-I/O modes**: 1-1-1, 1-1-2, 1-2-2, 1-1-4, and 1-4-4 SPI read modes
-- **Fast SPI reads**: one-burst lookahead with ping-pong SDRAM buffers sustains 50 MHz single/dual/quad reads and 60-70 MHz quad reads (see limits below)
+- **Fast SPI reads**: one-burst lookahead with ping-pong SDRAM buffers supports 40 MHz dummy-less/quad-I/O reads and 50-70 MHz dummy-assisted reads in simulation (see limits below)
 - **64MB backing store** using two SDRAM chips with byte-serial burst layout for minimal first-byte latency
 - **Pipelined prefetch**: SDRAM reads are issued during SPI address/dummy phases so data is ready on the first clock edge
 - **2 Mbaud UART** interface for loading and dumping images from a host PC
@@ -56,6 +56,14 @@ openFPGALoader -b tangprimer25k spi_flash.fs
 openFPGALoader -b tangprimer25k -f spi_flash.fs
 ```
 
+Each release carries one bitstream, named `spi_flash.fs` so that the
+`releases/latest/download/...` link in the web UI keeps working across
+releases, plus a `SHA256SUMS` file to check it against:
+
+```sh
+sha256sum --check SHA256SUMS
+```
+
 Release tags exactly match the Rust package version (for example, tag `0.1.0`
 uses `version = "0.1.0"` in `tool/Cargo.toml`). The release workflow rejects a
 mismatch.
@@ -70,13 +78,14 @@ If you have [Nix](https://nixos.org/) with flakes enabled, just enter the dev sh
 nix develop    # or let direnv handle it
 ```
 
-This provides the Gowin IDE (Education Edition), yosys, openFPGALoader, verilator, the Rust toolchain with the WebAssembly target, `wasm-bindgen-cli`, and Trunk for building and serving the Web UI.
+This provides the Gowin IDE (Education Edition), yosys, nextpnr, Apicula, openFPGALoader, verilator, the Rust toolchain with the WebAssembly target, `wasm-bindgen-cli`, and Trunk for building and serving the Web UI.
 
 Without Nix, you'll need:
 
 - [Gowin IDE Education Edition](https://www.gowinsemi.com/en/support/home/) v1.9.11.03 (`gw_sh` on PATH)
 - [openFPGALoader](https://github.com/trabucayre/openFPGALoader)
 - [yosys](https://github.com/YosysHQ/yosys) (optional, for linting)
+- [nextpnr](https://github.com/YosysHQ/nextpnr) with the Gowin himbaechel target and [Apicula](https://github.com/YosysHQ/apicula) (optional, for the open-source build)
 - [Verilator](https://verilator.org/) and a C++ toolchain (for linting/simulation)
 - Rust toolchain (for the host tool)
 
@@ -88,15 +97,55 @@ make prog                   # program FPGA (volatile, lost on power cycle)
 make flash                  # program to flash (persistent)
 ```
 
+An experimental open-source flow builds the same RTL with Yosys,
+nextpnr-himbaechel and Apicula, without the Gowin IDE. The flake pins the
+`norbert-experimental` branches of the [Yosys](https://github.com/ArthurHeymans/yosys/tree/norbert-experimental),
+[nextpnr](https://github.com/ArthurHeymans/nextpnr/tree/norbert-experimental) and
+[Apicula](https://github.com/ArthurHeymans/apicula/tree/norbert-experimental)
+forks; stock upstream packages are not equivalent. These are local experimental
+patches, not upstream-endorsed support, and the packaged device is GW5A-25A only.
+See [the toolchain notes](docs/oss-toolchain.md) for topic branches, tests and
+remaining upstreaming work.
+
+```sh
+nix develop .#oss          # optional: shell without proprietary Gowin tools
+make build-oss              # impl/oss/spi_flash.fs
+make prog-oss               # program FPGA (volatile)
+```
+
+Earlier experimental builds had PLL fuses matching the Gowin build and loaded
+and verified 8 MiB images over UART on a Tang Primer 25K, across several nextpnr
+seeds. This is not hardware sign-off of every subsequent toolchain or RTL change.
+The SPI target interface is untested on hardware, and timing is not
+signed off: nextpnr's GW5A delays are largely borrowed from GW2A, and it
+does not analyse the PLL phase offsets, the SDRAM pin timing or the SPI
+pin timing that the design relies on. Releases stay on the Gowin flow.
+See [timing and CDC contracts](docs/rtl-timing.md) for the phase-aware Gowin
+constraints, required board I/O profile and remaining hardware sign-off.
+Per-change mapped LUT counts are in [RTL utilization](docs/rtl-utilization.md).
+
 ### RTL checks
 
 ```sh
 make lint                   # Yosys synthesis checks and Verilator lint
-make test                   # SPI, SDRAM coordination and TOCTOU simulations
+make test                   # SPI, SDRAM, TOCTOU, FIFO, logger, UART, FT245
+make test-gate              # the same benches on the Yosys GW5A netlist
 ```
 
+`test-gate` catches RTL that Yosys maps differently from Gowin synthesis,
+such as a tristate it does not recognise. It runs every bench except the
+UART and FT245 ones, which peek at state that synthesis renames.
+
 The tests cover SFDP startup/reconfiguration, page-program and AAI semantics,
-program latency/refresh, and accepted SDRAM addresses during redirected reads.
+program latency/refresh, accepted SDRAM addresses during redirected reads, and
+three- versus four-byte addressing: every four-byte read command at all start
+offsets, the 0xB7/0xE9 address-mode pair, the four-byte program and erase
+forms, and a chip that ignores the mode commands entirely.
+The transport and buffer blocks are covered by their own benches: the FIFO
+against a queue model (`tests/fifo_tb.sv`), the logger's byte stream against
+the format the host decoder expects (`tests/logger_tb.sv`), the UART over all
+256 byte values in both transmitter configurations (`tests/uart_tb.sv`), and
+the FT245 handshake against a time-accurate FT2232H model (`tests/ft245_tb.sv`).
 They use a burst-level memory model or a clock-only PLL stub; they do not replace
 Gowin timing analysis or hardware validation of SDRAM pin timing.
 
@@ -201,6 +250,9 @@ Load a firmware image into NORbert's SDRAM, then let your target SPI master read
 spi-flash-tool version
 spi-flash-tool status       # running | stopped
 
+# Check whether the SPI fast read path ever fell behind (clears the flags)
+spi-flash-tool prefetch
+
 # Load a firmware image (auto stops + starts emulation around the load)
 spi-flash-tool load firmware.bin
 
@@ -250,7 +302,18 @@ TXN#   COMMAND            ADDRESS    INFO
        end: 4097 bytes from 0x001000
 ```
 
-The monitor also tracks double-reads of the same (opcode, address) pair and flags them as TOCTOU candidates. Press Ctrl+C to stop. The underlying protocol is a poll-based ring-buffer drain (`CMD_LOGPOLL` = 0x3A); packet types are `0xA1` (command), `0xA2` (address), `0xA3` (end + byte count) and `0xA4` (TOCTOU trap fired), with `0xA0` as the per-poll terminator. Log bytes equal to `0xA0` or `0xA5` are sent as `0xA5 0x00` and `0xA5 0x05`.
+The monitor also tracks double-reads of the same (opcode, address) pair and flags them as TOCTOU candidates. Press Ctrl+C to stop. The underlying protocol is a poll-based ring-buffer drain (`CMD_LOGPOLL` = 0x3A); packet types are `0xA1` (command), `0xA2` (address), `0xA3` (end + byte count), `0xA4` (TOCTOU trap fired), and `0xA6` (dropped event count), with `0xA0` as the per-poll terminator. Log bytes equal to `0xA0` or `0xA5` are sent as `0xA5 0x00` and `0xA5 0x05`.
+
+The byte ring holds 503 bytes, backed by six queued capture frames and one
+frame being emitted. Each frame holds all events seen on one system edge;
+frames are served in capture order, with CMD, ADDR, TRAP, END order for ties.
+When the frame queue fills, new events are dropped without overwriting old
+payloads. A `0xA6` packet reports the gap with a two-byte big-endian count
+(saturated at 65535) before later accepted events. The monitor displays
+`LOG GAP` and discards the previous transaction association. A transaction
+can still lose some packets and keep others, but surviving packets stay
+whole and chronological. `tests/logger_tb.sv` checks cross-type ordering
+behind a full ring and accounts for every retained or dropped event.
 
 ### TOCTOU traps
 
@@ -327,26 +390,57 @@ not replace that.
 
 | Command | Mode | Simulated max (all offsets) | Notes |
 |---------|------|-----------------------------|-------|
-| 0x03 Read | 1-1-1 | 50 MHz | No dummy clocks; hardest first burst |
+| 0x03 Read | 1-1-1 | 40 MHz | No dummy clocks; hardest first burst |
 | 0x0B Fast Read | 1-1-1 | 70 MHz | 8 dummy clocks |
 | 0x3B Dual Output | 1-1-2 | 50 MHz (spot) | 8 dummy clocks |
 | 0xBB Dual I/O | 1-2-2 | 60 MHz | 4 mode clocks |
 | 0x6B Quad Output | 1-1-4 | 70 MHz | 8 dummy clocks |
-| 0xEB Quad I/O | 1-4-4 | 50 MHz | 6 mode clocks; offset 7 flags thin |
+| 0xEB Quad I/O | 1-4-4 | 40 MHz | 6 mode clocks; offset 7 is limiting |
 
-Known corners (all loudly flagged by `prefetch_underrun` / `prefetch_thin`,
-never silent):
+The matrix requires both correct data and ready beats at the output edges.
+Earlier 50 MHz claims for 0x03/0xEB relied on an eventual burst-valid flag
+and a linear pattern whose high bits could hide stale first bits. The new
+mixed-address pattern and per-beat checks expose those failures, including
+short reads. The same limits apply to the corresponding four-byte opcodes.
 
-- **Quad-I/O reads starting at offset 7 above 50 MHz** need the second burst
-  ~30 ns before a single SDRAM controller can physically produce it. Use
-  offset <= 6 or <= 50 MHz for 0xEB.
-- **Slow reads above ~60 MHz** run out of first-burst window (3.5 clocks, no
-  dummy). Real NOR flashes cap 0x03 the same way (f_R < f_C).
-- **70 MHz dual-I/O offset 7** passes with thin margin flagged.
+Known corners detected by the simulated prefetch fault checks:
+
+- **Quad-I/O offset 7 at 50 MHz and above** can need the second burst before
+  it is ready. Use <= 40 MHz for all offsets, or validate a narrower range.
+- **Slow reads above 40 MHz** can run out of their 3.5-clock first-burst
+  window, particularly at high offsets. Real NOR flashes likewise impose a
+  lower clock limit on 0x03 than on dummy-assisted reads.
+- **70 MHz dual-I/O reads** can underrun; 60 MHz is the all-offset limit.
 
 If you need more: the levers are open-row (skip re-ACTIVATE on same-row
 bursts, saves ~2 sysclks per burst) and master-configured extra dummy clocks
 for 0xEB/0xBB, not a faster SDRAM clock.
+
+### Checking the prefetch path
+
+The corners above are detected in the FPGA, not just in simulation. Run a
+target read, then ask the FPGA what happened:
+
+```sh
+spi-flash-tool prefetch
+```
+
+The flags are latched in the FPGA and cleared by the read that reports them,
+so the check covers everything since the previous one:
+
+- **underrun** (`0x01`) -- an output bit used a byte whose SDRAM beat was
+  not ready when the output path sampled it. The data is untrusted even if
+  stale bits happened to equal the intended data. Checked on each data
+  sampling edge, not only at burst end, so short reads are covered.
+- **thin margin** (`0x02`) -- the upcoming burst's first beat was not ready
+  at the burst boundary. Not necessarily corruption; individual beat
+  validity determines whether later output actually underruns.
+
+The command is safe to run while the target is reading, and the web UI has
+the same check as **Check prefetch** on the Device panel. An underrun means
+the frequency, start offset or SDRAM latency of that read is outside the
+supported envelope in the table above -- the data the target received cannot
+be trusted.
 
 ## Project structure
 
@@ -354,12 +448,15 @@ for 0xEB/0xBB, not a faster SDRAM clock.
 src/
   top.v        Top-level module, clock/reset, bus wiring, TOCTOU address mux
   spi_trx.v    SPI flash transceiver (command decoder + data path)
-  spi_prefetch.v  SDRAM burst requests and ping-pong buffer selection for SPI reads
+  spi_prefetch.v  SDRAM burst requests, ping-pong buffer selection and the prefetch fault flags
   sdram.v      Dual-chip SDRAM controller, byte-serial bursts, ping-pong prefetch
   spi_flash_cmds.vh  Emulated SPI flash opcodes and read wait states
   host_protocol.vh   Host serial protocol opcodes and log packet types
-  glue.v       Protocol handler, UART/FT245 I/O, SPI write engine, TOCTOU trap engine, LOGPOLL state machine, LED control
-  logger.v     SPI event capture into a 512-byte ring FIFO drained by CMD_LOGPOLL
+  glue.v       Composition of independent host and SPI program clients
+  host_protocol.v  UART/FT245 protocol, configuration, TOCTOU, LOGPOLL, fault latch and LEDs
+  spi_program.v    Page-buffer BSRAM, NOR program/erase/RMW and completion
+  sdram_client_mux.v  Stable client ownership and acceptance routing
+  logger.v     Ordered capture-frame queue, loss accounting and 512-byte output FIFO
   uart.v       UART TX/RX (2 Mbaud)
   ft245.v      FT2232H async 245 FIFO interface
   fifo.v       Synchronous FIFO (first-word-fall-through)
@@ -380,9 +477,14 @@ All opcodes reply with a single `0x01` ACK unless otherwise noted. The FPGA
 accepts command bytes from whichever port (UART or FT245) first delivers one
 while the parser is idle, and routes the response back to the same port.
 
+`VERSION` reports the protocol version, currently 7. The host tool talks to
+any version from 3 up to its own and enables commands by version, but it
+refuses a newer bitstream rather than guess at its protocol: a version 7
+bitstream needs a tool from the same release or later.
+
 | Opcode | Name       | Args                                                | Reply                            |
 |--------|------------|-----------------------------------------------------|----------------------------------|
-| `0x30` | VERSION    | none                                                | 1 byte (current: `0x05`)         |
+| `0x30` | VERSION    | none                                                | 1 byte (current: `0x07`)         |
 | `0x31` | RAMREAD    | 3-byte burst addr + 2-byte burst count              | `count*8` data bytes             |
 | `0x32` | RAMWRITE   | 3-byte burst addr + 2-byte burst count + data       | `0x01`                           |
 | `0x33` | CHIPCONFIG | JEDEC(3) + flags + erase_bursts(3) + sfdp_len + sfdp| `0x01`                           |
@@ -393,6 +495,15 @@ while the parser is idle, and routes the response back to the same port.
 | `0x38` | LOGCTL     | 1 byte: `0x01` start capture, `0x00` stop capture   | `0x01`                           |
 | `0x39` | TOCTOU     | sub-command + args (see below)                      | `0x01`                           |
 | `0x3A` | LOGPOLL    | none                                                | log bytes terminated by `0xA0`   |
+| `0x3B` | PREFETCH   | none                                                | 1 byte: `0x80` valid + `0x01` underrun + `0x02` thin |
+
+A clean PREFETCH reply is `0x80` (not `0x00`, which the host discards as
+transport noise); `0x81`, `0x82` and `0x83` report faults. PREFETCH is a
+single byte with no argument, like STATUS: over FT245 the FPGA only takes
+the always-safe opcodes while the target holds CS low, so a stray argument
+byte would block every command queued behind it. It is safe to issue in any
+emulation state, and reading it clears the flags it reports, so a fault is
+reported to exactly one reader.
 
 TOCTOU sub-commands (all prefixed with opcode `0x39`):
 

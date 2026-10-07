@@ -98,8 +98,11 @@ IO_LOC "ft_txe_n" E11;
 IO_PORT "ft_txe_n" IO_TYPE=LVCMOS33 PULL_MODE=UP;
 
 // FT245 RD# -- read strobe (active low, output from FPGA)
+// Weak drive: at 8mA or more, host-to-FPGA data with all eight bits
+// switching at once (0x00 then 0xff) drops bytes, as if the FT2232H saw
+// an extra RD# pulse.
 IO_LOC "ft_rd_n" K11;
-IO_PORT "ft_rd_n" IO_TYPE=LVCMOS33 DRIVE=8;
+IO_PORT "ft_rd_n" IO_TYPE=LVCMOS33 DRIVE=4;
 
 // FT245 WR# -- write strobe (active low, output from FPGA)
 IO_LOC "ft_wr_n" L5;

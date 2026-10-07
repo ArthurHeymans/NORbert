@@ -61,13 +61,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: YosysHQ/setup-oss-cad-suite@v4
-        with:
-          version: '2026-09-08'
-          github-token: ${{ github.token }}
+      # The GW5A mapping and RAM simulation models come from the pinned
+      # forks in flake.lock, not the stock OSS CAD Suite.
+      - uses: cachix/install-nix-action@v31
 
       - name: Run Yosys and Verilator checks
-        run: make lint
+        run: nix develop .#oss --command make lint
 
       - name: Simulate SPI, SDRAM and TOCTOU
-        run: make test
+        run: nix develop .#oss --command make test
+
+      - name: Simulate the Yosys GW5A netlist
+        run: nix develop .#oss --command make test-gate
+
+      - name: Open-source place, route and pack
+        run: nix develop .#oss --command make build-oss

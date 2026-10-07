@@ -3,7 +3,7 @@
 //! Shared by the CLI `monitor` command and the browser UI so both show the
 //! same opcode names, packet decoding and double-read (TOCTOU) detection.
 
-use crate::protocol::{LOG_ADDR, LOG_CMD, LOG_END, LOG_TRAP};
+use crate::protocol::{LOG_ADDR, LOG_CMD, LOG_END, LOG_LOST, LOG_TRAP};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -45,7 +45,6 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         0xE9 => "4BYTE_DISABLE",
         0xEB => "QUAD_IO_READ",
         0xEC => "QUAD_IO_READ_4B",
-        0xF2 => "LOG",
         _ => "UNKNOWN",
     }
 }
@@ -65,6 +64,7 @@ pub enum LogEvent {
     Address(u32),
     End { bytes: u32 },
     Trap { index: u8, address: u32 },
+    Lost { events: u16 },
 }
 
 /// Reassembles log packets from arbitrarily split poll responses.
@@ -101,6 +101,12 @@ impl LogDecoder {
                         address: u32::from_be_bytes([0, packet[2], packet[3], packet[4]]),
                     }),
                     6,
+                ),
+                LOG_LOST if packet.len() >= 3 => (
+                    Some(LogEvent::Lost {
+                        events: u16::from_be_bytes([packet[1], packet[2]]),
+                    }),
+                    3,
                 ),
                 // Known packet type but incomplete: wait for more data.
                 0xA1..=0xAF => break,
@@ -193,13 +199,19 @@ impl ActivityLog {
                 // Addressless commands get no LOG_ADDR packet, so terminate
                 // their row when the transaction ends.
                 self.close_line(out);
-                if bytes > 1 {
+                if bytes > 1 && self.opcode != 0 {
                     let _ = writeln!(
                         out,
                         "       end: {bytes} bytes from {}",
                         format_address(self.address)
                     );
                 }
+            }
+            LogEvent::Lost { events } => {
+                self.close_line(out);
+                self.opcode = 0;
+                self.address = 0;
+                let _ = writeln!(out, "  !! LOG GAP: {events} events dropped");
             }
             LogEvent::Trap { index, address } => {
                 self.close_line(out);
@@ -245,6 +257,20 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn log_loss_packet_is_split_safe_and_breaks_transaction_association() {
+        let mut decoder = LogDecoder::default();
+        assert_eq!(decoder.feed(&[LOG_LOST, 0x12]), []);
+        assert_eq!(decoder.feed(&[0x34]), [LogEvent::Lost { events: 0x1234 }]);
+        let mut log = ActivityLog::default();
+        log.feed(&[LOG_CMD, 0x03]);
+        assert_eq!(
+            log.feed(&[LOG_LOST, 0, 3]),
+            "\n  !! LOG GAP: 3 events dropped\n"
+        );
+        assert_eq!(log.feed(&[LOG_END, 0, 0, 8]), "");
     }
 
     #[test]

@@ -425,6 +425,31 @@ fn cmd_stop(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Prefetch command -- SDRAM fast read path health
+// ---------------------------------------------------------------------------
+
+fn cmd_prefetch(cli: &Cli) -> Result<()> {
+    let mut device = open_device(cli)?;
+    let faults = device.prefetch_faults()?;
+    if !faults.any() {
+        println!("SDRAM prefetch: no faults since the last check");
+        return Ok(());
+    }
+    if faults.underrun {
+        println!(
+            "SDRAM prefetch: UNDERRUN -- a burst was shifted out before it was filled; the target read stale data"
+        );
+    }
+    if faults.thin {
+        println!(
+            "SDRAM prefetch: thin margin -- a burst had not landed when its first byte was needed"
+        );
+    }
+    eprintln!("Flags are cleared by this read; the next check covers new faults only.");
+    Ok(())
+}
+
 fn cmd_status(cli: &Cli) -> Result<()> {
     let mut device = open_device(cli)?;
     let running = device.status()?;
@@ -465,6 +490,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         Commands::Start => cmd_start(cli),
         Commands::Stop => cmd_stop(cli),
         Commands::Status => cmd_status(cli),
+        Commands::Prefetch => cmd_prefetch(cli),
     }
 }
 

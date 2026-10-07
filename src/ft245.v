@@ -37,6 +37,9 @@ module ft245(
     // Byte-level interface (system clock domain, matches uart.v)
     output reg [7:0] rxd,
     output reg rxd_strobe,
+    // Ready reserves a slot for one read in flight. Once RD# falls the
+    // transfer completes even if ready drops; the FIFO keeps headroom.
+    input wire rxd_ready,
     input wire [7:0] txd,
     input wire txd_strobe,
     output wire txd_ready
@@ -48,7 +51,11 @@ module ft245(
     // -----------------------------------------------------------------
     localparam [3:0]
         DELAY_RD_DATA  = 4'd7,  // RD# active to data valid (~58ns, min 50ns)
-        DELAY_RD_RECOV = 4'd10, // RD# recovery + sync pipeline (~83ns, extra margin)
+        // RD# recovery + sync pipeline (~117ns). The FT2232H keeps RXF#
+        // high for at least 49ns after RD# rises; 10 cycles was too short
+        // on hardware: with the RXF# synchronizer in an IO register, host
+        // loads dropped bytes. 12 cycles held in testing, 14 leaves margin.
+        DELAY_RD_RECOV = 4'd14,
         DELAY_WR_PULSE = 4'd7,  // WR# active pulse width (~58ns, min 50ns)
         DELAY_WR_RECOV = 4'd5;  // WR# recovery + sync pipeline (~42ns)
 
@@ -124,7 +131,7 @@ module ft245(
                 // IDLE: arbitrate between read (priority) and write
                 // ---------------------------------------------------
                 ST_IDLE: begin
-                    if (rxf_low && !tx_pending) begin
+                    if (rxf_low && rxd_ready && !tx_pending) begin
                         // Start read: assert RD# (FT2232H drives bus)
                         ft_rd_n   <= 0;
                         data_oe   <= 0;
@@ -166,7 +173,7 @@ module ft245(
                     if (delay_cnt != 0)
                         delay_cnt <= delay_cnt - 1;
                     else begin
-                        if (rxf_low && !tx_pending) begin
+                        if (rxf_low && rxd_ready && !tx_pending) begin
                             // More data available: re-assert RD#
                             ft_rd_n   <= 0;
                             delay_cnt <= DELAY_RD_DATA - 1;
