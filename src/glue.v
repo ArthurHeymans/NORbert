@@ -41,7 +41,7 @@ module glue(
     input wire log_addr_valid_sync,
     input wire [23:0] log_addr_sync,
     input wire spi_active_sync, prefetch_underrun, prefetch_thin,
-    output wire redirect_active,
+    output wire redirect_active, trap_check_pending,
     output wire [22:0] redirect_mask, redirect_base,
     output wire trap_notify_strobe,
     output wire [1:0] trap_notify_index,
@@ -77,7 +77,8 @@ module glue(
         .log_fifo_read_strobe(log_fifo_read_strobe), .log_addr_valid_sync(log_addr_valid_sync),
         .log_addr_sync(log_addr_sync), .spi_active_sync(spi_active_sync),
         .prefetch_underrun(prefetch_underrun), .prefetch_thin(prefetch_thin),
-        .redirect_active(redirect_active), .redirect_mask(redirect_mask), .redirect_base(redirect_base),
+        .redirect_active(redirect_active), .trap_check_pending(trap_check_pending),
+        .redirect_mask(redirect_mask), .redirect_base(redirect_base),
         .trap_notify_strobe(trap_notify_strobe), .trap_notify_index(trap_notify_index),
         .trap_notify_addr(trap_notify_addr), .led(led));
     spi_program program_i(

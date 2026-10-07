@@ -61,6 +61,11 @@ module sdram(
     input wire [22:0] spi_addr,      // 23-bit burst address (64MB)
     input wire spi_cmd_post_toggle, // Toggles on every SPI prefetch post
     input wire spi_cmd_continuation, // Post is a lookahead (bundled with spi_addr)
+    // TOCTOU decision for this transaction's address not final yet. Holds
+    // SPI ACTIVATEs: lookahead addresses pass through the redirect mux.
+    // (The initial ACTIVATE is posted before the address ends, so it is
+    // not delayed in practice.)
+    input wire spi_redirect_pending,
 
     // Control signals from glue (serial path)
     input wire [1:0] access_cmd,     // 00=nop 01=read 10=write 11=activate
@@ -691,7 +696,7 @@ module sdram(
                     dqm_o <= 2'b11;
                 end
                 else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
-                         !serial_row_open) begin
+                         !serial_row_open && !spi_redirect_pending) begin
                     // SPI fast-path activate
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;

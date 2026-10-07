@@ -347,6 +347,10 @@ module top(
     // re-latching here on that same edge would give glue the PREVIOUS address.
 
     wire log_addr_valid_pulse_sys = log_addr_toggle_sys[2] != log_addr_toggle_sys[1];
+    // Trap decision not final: the event cycle plus glue's comparison
+    // cycle. Only system-domain flops, so it is a shallow dispatch input.
+    wire trap_check_pending;
+    wire redirect_pending = log_addr_valid_pulse_sys || trap_check_pending;
     
     // -----------------------------------------------------------
     // TOCTOU Address Redirect Mux
@@ -359,8 +363,12 @@ module top(
     //
     // The first SDRAM burst always uses the original address. The SPI
     // engine marks subsequent requests explicitly, so a trap completing
-    // between a refresh-delayed initial ACTIVATE and READ cannot mix an
-    // original row/bank with a replacement column.
+    // between a delayed initial ACTIVATE and READ cannot mix an original
+    // row/bank with a replacement column. Subsequent requests are held in
+    // the controller while the trap decision for the transaction's address
+    // is still pending (redirect_pending), so even the earliest lookahead
+    // (offset-7 reads post one SPI clock after the address) is redirected
+    // and its ACTIVATE and READ see the same decision.
     // -----------------------------------------------------------
     
     wire redirect_active;
@@ -407,6 +415,7 @@ module top(
         .spi_addr(spi_ram_addr_final),
         .spi_cmd_post_toggle(spi_ram_post_toggle),
         .spi_cmd_continuation(spi_ram_continuation),
+        .spi_redirect_pending(redirect_pending),
         
         // Serial path control
         .access_cmd(sdram_access_cmd),
@@ -634,6 +643,7 @@ module top(
         .prefetch_thin(prefetch_thin),
 
         .redirect_active(redirect_active),
+        .trap_check_pending(trap_check_pending),
         .redirect_mask(redirect_mask),
         .redirect_base(redirect_base),
 

@@ -82,7 +82,9 @@ module spi_trx(
     output reg log_cmd_valid = 0,       // Pulse: command byte decoded
     output reg [7:0] log_cmd_opcode = 0,// The opcode that was decoded
     output reg log_addr_valid = 0,      // Pulse: address phase complete
-    output reg log_addr_toggle = 0,     // Changes on the final address bit
+    // Changes on the final address bit of array reads only (not SFDP,
+    // program or erase): the TOCTOU traps count those accesses.
+    output reg log_addr_toggle = 0,
     // Held across CS/reset until the next address event, so the system
     // domain can capture this payload using the synchronized toggle.
     output reg [31:0] log_addr_out = 0, // Full flash byte address
@@ -658,7 +660,8 @@ module spi_trx(
 
                     if (addr_last) begin
                         log_addr_valid <= 1;
-                        log_addr_toggle <= !log_addr_toggle;
+                        if (addr_kind == ADDR_KIND_READ && !is_sfdp_read)
+                            log_addr_toggle <= !log_addr_toggle;
                         log_addr_out <= addr_next;
 
                         case (addr_kind)

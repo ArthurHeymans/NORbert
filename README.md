@@ -317,7 +317,7 @@ behind a full ring and accounts for every retained or dropped event.
 
 ### TOCTOU traps
 
-Four independent trap entries redirect matching reads to a different SDRAM location on the second (and subsequent) access. The first matching read is let through unchanged -- it arms the trap. The first SDRAM burst (up to 8 bytes, depending on starting alignment) always comes from the original address; subsequent bursts come from the replacement. All matching entries become triggered, and the highest-index already-triggered match selects the replacement when traps overlap.
+Four independent trap entries redirect matching reads to a different SDRAM location on the second (and subsequent) access. The first matching read is let through unchanged -- it arms the trap. The first SDRAM burst (up to 8 bytes, depending on starting alignment) always comes from the original address; subsequent bursts come from the replacement. All matching entries become triggered, and the highest-index already-triggered match selects the replacement when traps overlap. Only array reads count as accesses and are matched, by their start address: SFDP reads (a separate address space) and the addresses of program and erase commands neither trigger nor redirect.
 
 ```sh
 # Configure: any read in 0x001000-0x001FFF gets redirected to 0x101000-0x101FFF

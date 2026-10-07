@@ -115,6 +115,10 @@ module host_protocol(
 
     // TOCTOU redirect outputs (directly to address mux in top.v)
     output reg redirect_active,
+    // The trap comparison for the previous cycle's address event is still
+    // running. With that event cycle (in top.v) this covers the whole time
+    // the redirect decision is not final.
+    output reg trap_check_pending,
     output reg [22:0] redirect_mask,    // Burst address mask bits
     output reg [22:0] redirect_base,    // Burst address replacement base
 
@@ -329,7 +333,6 @@ module host_protocol(
     // adds one system clock, well inside the first (unredirected) SPI
     // burst; subsequent bursts still see the replacement address.
     reg [3:0] trap_match_pending;
-    reg trap_check_pending;
     
     // TOCTOU command parsing state
     reg [7:0]  toctou_sub_cmd;
@@ -339,6 +342,8 @@ module host_protocol(
     
     // TOCTOU address check: detect rising edge of log_addr_valid_sync
     reg log_addr_valid_prev;
+    // spi_trx only signals array reads: SFDP reads use a separate address
+    // space, and program/erase addresses are not reads a trap could serve.
     wire log_addr_event = log_addr_valid_sync && !log_addr_valid_prev;
     
     // Convert 23-bit burst address to 25-bit access_addr for SDRAM controller
