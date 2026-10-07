@@ -196,6 +196,16 @@ module spi_trx(
     reg aai_active = 0;         // In AAI word program mode
     reg is_aai = 0;             // Current transaction is AAI (per-CS flag)
     reg [1:0] aai_bytes_left;   // Ignore data beyond the two-byte AAI word
+
+    // Continuous read mode (Winbond "Continuous Read Mode", Micron XIP):
+    // mode bits M5-4 = 10 after a 0xBB/0xEB address make the next
+    // transaction start directly with the address, without an opcode.
+    // Any other M5-4 (e.g. the FFh/FFFFh mode reset) leaves the mode.
+    // Persists across CS like AAI; cleared at power reset.
+    reg cont_read = 0;
+    reg cont_quad = 0;          // ...for 1-4-4 (else 1-2-2)
+    reg cont_4b = 0;            // ...with a four-byte address
+    reg io_read_4b = 0;         // Current 1-2-2/1-4-4 read has a 4-byte address
     
     reg [31:0] addr;
     reg [4:0] addr_count;       // Index of the next address MSB to arrive
@@ -376,7 +386,31 @@ module spi_trx(
                     status_reg[6] <= 0;     // AAI bit
                     addr_4byte <= 0;
                     aai_active <= 0;
+                    cont_read <= 0;
                     addr <= 0;
+                end
+                else if (cont_read && !status_reg[0]) begin
+                    // Continuous read: this first clock already carries
+                    // the address MSBs of an implied 0xBB/0xEB (or 4B).
+                    state <= STA_ADDR;
+                    addr_kind <= ADDR_KIND_READ;
+                    log_cmd_valid <= 1;
+                    if (cont_quad) begin
+                        addr_lanes <= 4;
+                        is_quad_read <= 1;
+                        read_byte_top <= 1;
+                        addr <= {28'b0, spi_io3_in, spi_io2_in, spi_io1_in, spi_io0_in};
+                        addr_count <= cont_4b ? 5'd27 : 5'd19;
+                        log_cmd_opcode <= cont_4b ? CMD_QUADIOREAD_4B : CMD_QUADIOREAD;
+                    end
+                    else begin
+                        addr_lanes <= 2;
+                        is_dual_read <= 1;
+                        read_byte_top <= 3;
+                        addr <= {30'b0, spi_io1_in, spi_io0_in};
+                        addr_count <= cont_4b ? 5'd29 : 5'd21;
+                        log_cmd_opcode <= cont_4b ? CMD_DUALIOREAD_4B : CMD_DUALIOREAD;
+                    end
                 end
             end
             else begin
@@ -494,6 +528,7 @@ module spi_trx(
                         addr <= 0;
                         addr_lanes <= 2;
                         addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_DUALIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
+                        io_read_4b <= cmd_byte == CMD_DUALIOREAD_4B || addr_4byte;
                         is_dual_read <= 1;
                         read_byte_top <= 3;
                     end
@@ -519,6 +554,7 @@ module spi_trx(
                             addr <= 0;
                             addr_lanes <= 4;
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
+                            io_read_4b <= cmd_byte == CMD_QUADIOREAD_4B || addr_4byte;
                             is_quad_read <= 1;
                             read_byte_top <= 1;
                         end
@@ -828,6 +864,13 @@ module spi_trx(
                 // spi_prefetch posts the second burst during this phase.
                 // ---------------------------------------------------------
                 else if (state == STA_MODE_MULTI) begin
+                    // M5-4 arrive on IO1:IO0: in the first mode clock for
+                    // quad (M7-4 on IO3:IO0), the second for dual.
+                    if (mode_count == (is_quad_read ? 3'd5 : 3'd2)) begin
+                        cont_read <= {spi_io1_in, spi_io0_in} == 2'b10;
+                        cont_quad <= is_quad_read;
+                        cont_4b <= io_read_4b;
+                    end
                     if (mode_count == 0) begin
                         state <= STA_READ;
                         spi_io0_oe_ff <= 1;

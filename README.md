@@ -8,7 +8,7 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 
 - **SPI NOR flash emulation** with full command support: read, fast read, page program, sector/block/chip erase, JEDEC ID, status registers, SFDP. As on a real part, only status reads are accepted while a program/erase is in progress, and a program/erase is not executed if CS rises mid-byte
 - **Configurable chip identity** at runtime -- load any chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database to set JEDEC ID, size, and SFDP parameters (defaults to Winbond W25Q64FV)
-- **Multi-I/O modes**: 1-1-1, 1-1-2, 1-2-2, 1-1-4, and 1-4-4 SPI read modes
+- **Multi-I/O modes**: 1-1-1, 1-1-2, 1-2-2, 1-1-4, and 1-4-4 SPI read modes, including continuous read (XIP) mode for 1-2-2/1-4-4 (mode bits `Axh`; `FFh`/`FFFFh` mode reset)
 - **Fast SPI reads**: one-burst lookahead with ping-pong SDRAM buffers supports 40 MHz dummy-less/quad-I/O reads and 50-70 MHz dummy-assisted reads in simulation (see limits below)
 - **64MB backing store** using two SDRAM chips with byte-serial burst layout for minimal first-byte latency
 - **Pipelined prefetch**: SDRAM reads are issued during SPI address/dummy phases so data is ready on the first clock edge
