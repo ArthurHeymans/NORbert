@@ -52,9 +52,18 @@ module top_io_tb;
         spi_send(8'h9f);
         for (integer i = 0; i < 3; i++) spi_xfer(0, id[i]);
         #35; cs = 1; #1;
-        if (dut.spi_active_out) $fatal(1, "MISO still enabled after CS rose");
+        if (io1 !== 1'b1) $fatal(1, "MISO not released after CS rose");
         if (id[0] !== 8'hef || id[1] !== 8'h40 || id[2] !== 8'h17)
             $fatal(1, "JEDEC ID %h %h %h, expected ef 40 17", id[0], id[1], id[2]);
+        // The idle status register's MSB is zero. Deselect while that bit
+        // is driven so a stuck output enable cannot hide behind the pull-up.
+        #35; cs = 0; #35;
+        spi_send(8'h05);
+        #16.667; sck = 1; #1;
+        if (io1 !== 1'b0) $fatal(1, "MISO not low before deselection");
+        cs = 1; #1;
+        if (io1 !== 1'b1) $fatal(1, "MISO not released after CS rose");
+        sck = 0;
         $display("PASS TOP_IO: outputs driven with the power pin unconnected, released at CS high");
         $finish;
     end
