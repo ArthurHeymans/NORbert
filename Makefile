@@ -107,11 +107,11 @@ lint-verilator:
 # width bug in the RTL it is exercising.
 test:
 	@set -eu; build=$$(mktemp -d); trap 'rm -rf "$$build"' EXIT; \
-	for test in spi_flash sdram_controller refresh access_handshake write_completion prefetch_health toctou quad_fast fifo logger uart ft245; do \
+	for test in spi_flash host_protocol top_io sdram_controller refresh sdram_protocol access_handshake write_completion prefetch_health toctou quad_fast fifo logger uart ft245; do \
 		echo "Testing $$test"; \
 		verilator --binary --timing -j 2 --top-module $${test}_tb -Isrc \
 			-Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD \
-			--Mdir "$$build/$$test" tests/$${test}_tb.sv tests/pll_stub.v \
+			--Mdir "$$build/$$test" tests/$${test}_tb.sv tests/sdram_bank_checker.sv tests/pll_stub.v \
 			$(filter-out src/pll.v,$(VERILOG_FILES)) >"$$build/$$test.log" 2>&1 \
 			|| { cat "$$build/$$test.log"; exit 1; }; \
 		"$$build/$$test/V$${test}_tb"; \

@@ -4,8 +4,9 @@
 # build) instead of the RTL. This catches RTL that Yosys maps differently
 # from Gowin synthesis. Zero-delay: no place-and-route or timing.
 #
-# uart_tb (two parameterisations of one module) and ft245_tb (peeks FSM
-# state that synthesis re-encodes) stay RTL-only.
+# uart_tb (two parameterisations of one module), ft245_tb (peeks FSM
+# state that synthesis re-encodes) and host_protocol_tb (peeks the TOCTOU
+# tables, which synthesis splits into separate registers) stay RTL-only.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -49,7 +50,7 @@ sim() {
     echo "Gate-level testing $tb"
     verilator --binary --timing -j 2 --top-module "${tb}_tb" -Isrc -DGOWIN_GW5A \
         -Wno-fatal -Wno-lint -Wno-style -Wno-PINNOTFOUND -Wno-TIMESCALEMOD \
-        --Mdir "$build/$tb" "tests/${tb}_tb.sv" "$@" \
+        --Mdir "$build/$tb" "tests/${tb}_tb.sv" tests/sdram_bank_checker.sv "$@" \
         tests/gw5a_cells_sim.v "$CELLS_SIM" >"$build/$tb.log" 2>&1 \
         || { cat "$build/$tb.log"; exit 1; }
     "$build/$tb/V${tb}_tb"
@@ -73,6 +74,9 @@ synth refresh glue
 synth refresh sdram "" "-set CLK_FREQ_MHZ 120"
 sim refresh "$build/refresh.glue.v" "$build/refresh.sdram.v"
 
+synth sdram_protocol sdram "serial_read_active refreshcount spi_activate_done serial_row_open" "-set CLK_FREQ_MHZ 120"
+sim sdram_protocol "$build/sdram_protocol.sdram.v"
+
 synth access_handshake glue
 sim access_handshake "$build/access_handshake.glue.v"
 
@@ -87,5 +91,9 @@ synth quad_fast spi_trx
 sim quad_fast "$build/quad_fast.sdram.v" "$build/quad_fast.spi_trx.v"
 
 synth toctou top "spi_addr_latched refreshcount spi_cmd_read_ack trap_triggered
+                  spi_cmd_read_buf spi_activate_done
                   log_addr_sync log_addr_valid_sync reset spi_reset_effective"
 sim toctou "$build/toctou.top.v"
+
+synth top_io top "spi_io1_oe spi_active_out reset spi_reset_effective"
+sim top_io "$build/top_io.top.v"

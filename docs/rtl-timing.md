@@ -38,7 +38,7 @@ clock declarations must not be used as a phase-aware sign-off model.
 | Crossing | Contract |
 |---|---|
 | SPI requests/address to `sdram` | Synchronized control with a bundled, held address/post selector. A new post identifies a new descriptor; the in-flight fill and next posted fill have independent ownership. The source must retain its payload through destination capture. |
-| SPI bytes/command to `spi_program` | Two-stage control sampling; byte payload is captured after the first stage, then committed after the second. Offset/value remain stable between completed SPI bytes. Write command/type/address/length stay held until completion. The command cannot preempt an outstanding host SDRAM operation. |
+| SPI bytes/command to `spi_program` | Two-stage control sampling; no logic reads the first stage. A byte is committed from the held offset/value once the second stage shows its strobe; they stay stable until the next completed SPI byte. The write command level, type/address/length and the partial-byte flag are held until completion clears WIP, so the engine may start long after later (status-only) transactions began. It starts only after the last byte of its transaction is committed and cannot preempt an outstanding host SDRAM operation. |
 | `spi_program.done` to SPI WIP | Completion toggle synchronized into SCK and consumed even when deselected. With stopped SCK the toggle remains held until clocks resume; no pulse must survive an arbitrary stopped-clock interval. |
 | SDRAM buffers/readiness to SPI output | Deliberately low-latency progressive data, **not a conventional fully handshaked async FIFO**. Readiness is tracked per beat and checked for each consumed sample. Both data and qualifying metadata need bounded routing and worst-phase analysis; fault detection alone does not establish CDC safety. |
 | Logger CMD/ADDR/END to system | Three-stage event sampling with held payloads. Pulses must span a system sampling opportunity and events/payloads must not be overwritten before capture. Frames serialize in capture order; overflow drops new frames and reports a saturated event count. |
@@ -67,6 +67,18 @@ has service-latency headroom above the dispatch deadline. Registered,
 increment-predicted deadline flags remove arithmetic/comparison from the
 command/data dispatch critical path without postponing the deadline.
 The refresh bench checks both maximum gaps and sustained refresh rate.
+
+SPI reads inhibit refresh from the first clock of every transaction until
+the opcode turns out not to be an array read, so a refresh pair cannot
+start late enough to delay the first burst. Throughout an array read the
+controller only starts a refresh in a window: after it dispatched a
+lookahead (continuation) READ and until the SPI side re-arms that post. The
+next post is then at least the re-arm-to-post gap away, so a 17-clock
+refresh pair overlaps it by only part of that gap, well inside the burst's
+margin. A refresh in the gap before a post would instead delay the post by
+the whole pair. Stopped SCK outside a window falls back to the deadline
+(hard) refresh. `quad_fast_tb` sweeps the refresh due time across one full
+period for every documented read limit.
 
 ## Required external I/O profile
 

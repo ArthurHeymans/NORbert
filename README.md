@@ -6,9 +6,9 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 
 ## Features
 
-- **SPI NOR flash emulation** with full command support: read, fast read, page program, sector/block/chip erase, JEDEC ID, status registers, SFDP
+- **SPI NOR flash emulation** with full command support: read, fast read, page program, sector/block/chip erase, JEDEC ID, status registers, SFDP. As on a real part, only status reads are accepted while a program/erase is in progress, and a program/erase is not executed if CS rises mid-byte
 - **Configurable chip identity** at runtime -- load any chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database to set JEDEC ID, size, and SFDP parameters (defaults to Winbond W25Q64FV)
-- **Multi-I/O modes**: 1-1-1, 1-1-2, 1-2-2, 1-1-4, and 1-4-4 SPI read modes
+- **Multi-I/O modes**: 1-1-1, 1-1-2, 1-2-2, 1-1-4, and 1-4-4 SPI read modes, including continuous read (XIP) mode for 1-2-2/1-4-4 (mode bits `Axh`; `FFh`/`FFFFh` mode reset)
 - **Fast SPI reads**: one-burst lookahead with ping-pong SDRAM buffers supports 40 MHz dummy-less/quad-I/O reads and 50-70 MHz dummy-assisted reads in simulation (see limits below)
 - **64MB backing store** using two SDRAM chips with byte-serial burst layout for minimal first-byte latency
 - **Pipelined prefetch**: SDRAM reads are issued during SPI address/dummy phases so data is ready on the first clock edge
@@ -27,20 +27,24 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 
 ## SPI Flash Pin Mapping
 
-NORbert exposes the SPI flash interface on the **PMOD J5** connector of the Tang Primer 25K Dock. The table below maps the standard SPI flash signals to the corresponding FPGA I/O pins:
+NORbert exposes the SPI flash interface on the dock PMOD connector called
+**PMOD 1** in `tangprimer25k.cst` (the authoritative pin list). Positions
+count from the end of each row away from the GND/3V3 pins:
 
-| SPI Signal | FPGA Pin | PMOD J5 Pin | Notes                              |
-|------------|----------|-------------|------------------------------------|
-| `/CS#`     | `T9`     | 1           | Chip Select (active-low)           |
-| `SCK`      | `T8`     | 2           | SPI Clock                          |
-| `D0/DO`    | `R9`     | 3           | Data Out / IO0                     |
-| `D1/DI`    | `R8`     | 4           | Data In / IO1                      |
-| `D2`       | `L8`     | 5           | IO2 (used for Dual/Quad reads)     |
-| `D3`       | `L9`     | 6           | IO3 / `#HOLD#` (shared function)   |
-| `GND`      | —        | 10          | Ground                             |
-| `VCC`      | —        | 9           | 3.3V Power                         |
+| SPI Signal | FPGA Pin | PMOD 1 position | Notes                                   |
+|------------|----------|-----------------|-----------------------------------------|
+| `/CS#`     | `G11`    | top 1           | Chip Select (active-low, pulled up)     |
+| `SCK`      | `D11`    | top 2           | SPI Clock (pulled down)                 |
+| `D0/DI`    | `B11`    | top 3           | IO0: data in, output in dual/quad reads |
+| `D1/DO`    | `C11`    | top 4           | IO1: data out                           |
+| `D2`       | `G10`    | bottom 1        | IO2 / `/WP` (quad reads)                |
+| `D3`       | `D10`    | bottom 2        | IO3 / `/HOLD` (quad reads, hold control)|
+| Power det. | `B10`    | bottom 3        | Optional; ignored by default            |
+| Debug      | `C10`    | bottom 4        | Debug output                            |
+| `GND`      | —        | 5 (both rows)   | Ground                                  |
+| `VCC`      | —        | 6 (both rows)   | 3.3V                                    |
 
-*Note: D3 and `#HOLD#` share the physical IO3 pin. Asserting `#HOLD` drives it low to silence a real flash on a shared bus. Consult `tangprimer25k.cst` for exact pin assignments.*
+*Note: D3 and `#HOLD#` share the physical IO3 pin. Asserting `#HOLD` drives it low to silence a real flash on a shared bus.* The power-detect input has a pull-down and is bypassed by default (`BYPASS_POWER_DETECT` in `src/top.v`); clear that parameter to hold emulation in reset and keep the outputs disabled while the target is unpowered.
 
 ## Releases
 
@@ -128,7 +132,7 @@ Per-change mapped LUT counts are in [RTL utilization](docs/rtl-utilization.md).
 
 ```sh
 make lint                   # Yosys synthesis checks and Verilator lint
-make test                   # SPI, SDRAM, TOCTOU, FIFO, logger, UART, FT245
+make test                   # SPI, host protocol, SDRAM, TOCTOU, FIFO, logger, UART, FT245
 make test-gate              # the same benches on the Yosys GW5A netlist
 ```
 
@@ -317,7 +321,7 @@ behind a full ring and accounts for every retained or dropped event.
 
 ### TOCTOU traps
 
-Four independent trap entries redirect matching reads to a different SDRAM location on the second (and subsequent) access. The first matching read is let through unchanged -- it arms the trap. The first SDRAM burst (up to 8 bytes, depending on starting alignment) always comes from the original address; subsequent bursts come from the replacement. All matching entries become triggered, and the highest-index already-triggered match selects the replacement when traps overlap.
+Four independent trap entries redirect matching reads to a different SDRAM location on the second (and subsequent) access. The first matching read is let through unchanged -- it arms the trap. The first SDRAM burst (up to 8 bytes, depending on starting alignment) always comes from the original address; subsequent bursts come from the replacement. All matching entries become triggered, and the highest-index already-triggered match selects the replacement when traps overlap. Only array reads count as accesses and are matched, by their start address: SFDP reads (a separate address space) and the addresses of program and erase commands neither trigger nor redirect.
 
 ```sh
 # Configure: any read in 0x001000-0x001FFF gets redirected to 0x101000-0x101FFF
@@ -362,15 +366,16 @@ The FT2232H is used in asynchronous 245 FIFO mode. This requires a **one-time EE
 
 **Wiring:** Connect the FT2232H Channel A pins to the FPGA dock as follows:
 
-| FT2232H Pin | Signal   | FPGA Pin | Dock Location    |
-|-------------|----------|----------|------------------|
-| AD0-AD7     | D[0:7]   | H5, H8, G7, F5, H7, G8, G5, F3 | PMOD J7 |
-| RXF#        | ft_rxf_n | D10      | PMOD J6 top      |
-| TXE#        | ft_txe_n | G10      | PMOD J6 top      |
-| RD#         | ft_rd_n  | B10      | PMOD J6 top      |
-| WR#         | ft_wr_n  | H11      | Button S0 (core board) |
+| FT2232H Pin | Signal   | FPGA Pin | Dock Location (`tangprimer25k.cst`) |
+|-------------|----------|----------|-------------------------------------|
+| AD0-AD3     | D[0:3]   | H5, H8, G7, F5 | PMOD 3 top 4, 3, 2, 1         |
+| AD4-AD7     | D[4:7]   | H7, G8, G5, J5 | PMOD 3 bottom 3, 2, 1, 4      |
+| RXF#        | ft_rxf_n | A11      | PMOD 2 top 1                        |
+| TXE#        | ft_txe_n | E11      | PMOD 2 top 2                        |
+| RD#         | ft_rd_n  | K11      | PMOD 2 top 3                        |
+| WR#         | ft_wr_n  | L5       | PMOD 2 top 4                        |
 
-Note: H11 is a core board button pin, repurposed for FT245 (buttons are unused by NORbert). CLKOUT and OE# are not used in async mode. All signals are 3.3V LVCMOS.
+CLKOUT and OE# are not used in async mode. All signals are 3.3V LVCMOS.
 
 ## SPI read performance
 
@@ -383,7 +388,11 @@ latency. SDRAM runs at CAS latency 2 (in spec to 133 MHz for the W9825G6KH-6)
 with a byte-serial burst layout, so the first beat already completes bytes 0-1.
 
 Validated by simulation (`make test`, `tests/quad_fast_tb.sv`: all start
-offsets 0-7, row/bank crossings, refresh coexistence). 60-70 MHz operation
+offsets 0-7, row/bank crossings, and a refresh that becomes due at every
+system-clock offset into the transaction, with an SDRAM bank-protocol
+checker on the command bus). During an array read, refresh only starts
+right after a lookahead burst has been dispatched, so a refresh pair can
+no longer land in front of a burst the SPI side is about to need. 60-70 MHz operation
 also needs timing closure past the default 30 MHz `spi_clk` constraint plus
 signal-integrity validation on the PMOD leads -- simulated margins below do
 not replace that.
@@ -476,6 +485,10 @@ that `tool/src/protocol.rs` matches it.
 All opcodes reply with a single `0x01` ACK unless otherwise noted. The FPGA
 accepts command bytes from whichever port (UART or FT245) first delivers one
 while the parser is idle, and routes the response back to the same port.
+Each port has a receive FIFO; while a command is in progress, bytes from the
+other port wait there until it completes. A parser left mid-command returns
+to idle after ~546 us without a byte, or ~35 ms inside a RAMWRITE payload, so
+a USB stall within a data block is not mistaken for an abandoned command.
 
 `VERSION` reports the protocol version, currently 7. The host tool talks to
 any version from 3 up to its own and enables commands by version, but it
@@ -499,9 +512,7 @@ bitstream needs a tool from the same release or later.
 
 A clean PREFETCH reply is `0x80` (not `0x00`, which the host discards as
 transport noise); `0x81`, `0x82` and `0x83` report faults. PREFETCH is a
-single byte with no argument, like STATUS: over FT245 the FPGA only takes
-the always-safe opcodes while the target holds CS low, so a stray argument
-byte would block every command queued behind it. It is safe to issue in any
+single byte with no argument, like STATUS. It is safe to issue in any
 emulation state, and reading it clears the flags it reports, so a fault is
 reported to exactly one reader.
 
@@ -516,9 +527,11 @@ TOCTOU sub-commands (all prefixed with opcode `0x39`):
 | `0x05` | RESET_ALL | none -- disarm + clear all four                      |
 
 RAMREAD/RAMWRITE/CHIPCONFIG are only accepted while emulation is stopped, to
-avoid racing the SPI fast path on SDRAM. The other commands are always safe to
-issue and bypass the SPI-idle gate so the host can reach the tool even while a
-target is hammering the bus.
+avoid racing the SPI fast path on SDRAM, and their bytes wait (on either
+port) while the target holds CS low or an SPI program/erase owns SDRAM. All
+other commands, including HOLDCTL, LOGCTL and TOCTOU with their arguments,
+touch neither and are processed immediately, so the host can reach the tool
+even while a target is hammering the bus.
 
 ## Acknowledgments
 

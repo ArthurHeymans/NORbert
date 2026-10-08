@@ -8,6 +8,7 @@ module toctou_tb;
     reg host_strobe = 0, injected_addr_event = 0;
     reg [7:0] host_data = 0;
     reg quad_address = 0;
+    real half = 16.667;  // SCK half period (ns)
     reg [3:0] quad_input = 0;
     wire io0, io1, io2, io3;
     assign io0 = quad_address ? quad_input[0] : mosi;
@@ -66,6 +67,13 @@ module toctou_tb;
         repeat (3) @(negedge clk);
     endtask
 
+    task automatic delay_initial_read(input integer cycles);
+        @(posedge dut.sdram_i.spi_activate_done);
+        force dut.sdram_i.spi_cmd_read_buf = 2'b00;
+        repeat (cycles) @(negedge clk);
+        release dut.sdram_i.spi_cmd_read_buf;
+    endtask
+
     task host_address(input [23:0] a);
         host_byte(a[23:16]); host_byte(a[15:8]); host_byte(a[7:0]);
     endtask
@@ -77,10 +85,48 @@ module toctou_tb;
         host_byte(8'h39); host_byte(2); host_byte({6'b0, index});
     endtask
 
+    /* verilator lint_off ZERODLY */
     task spi_byte(input [7:0] b);
         for (integer i = 7; i >= 0; i--) begin
-            mosi = b[i]; #16.667; sck = 1; #16.667; sck = 0;
+            mosi = b[i]; #(half); sck = 1; #(half); sck = 0;
         end
+    endtask
+
+    task spi_xfer(input [7:0] b, output [7:0] r);
+        for (integer i = 7; i >= 0; i--) begin
+            mosi = b[i]; #(half); sck = 1; r[i] = io1; #(half); sck = 0;
+        end
+    endtask
+
+    task spi_command(input [7:0] opcode);
+        cs = 0; #35; spi_byte(opcode); #35; cs = 1; #70;
+    endtask
+
+    task automatic wait_not_busy;
+        reg [7:0] status;
+        status = 8'h01;
+        while (status[0]) begin
+            cs = 0; #35; spi_byte(8'h05); spi_xfer(0, status); #35; cs = 1; #70;
+        end
+    endtask
+
+    // Address phases that are not array reads must not count as accesses:
+    // an SFDP read (separate address space), a page program and an erase,
+    // all at addresses an armed trap matches.
+    task automatic non_read_accesses(input [23:0] a);
+        cs = 0; #35; spi_byte(8'h5a); spi_byte(a[23:16]); spi_byte(a[15:8]); spi_byte(a[7:0]);
+        repeat (3) spi_byte(0); #35; cs = 1; #70;
+        spi_command(8'h06);
+        cs = 0; #35; spi_byte(8'h02); spi_byte(a[23:16]); spi_byte(a[15:8]); spi_byte(a[7:0]);
+        spi_byte(8'h5a); #35; cs = 1; #70;
+        wait_not_busy;
+        spi_command(8'h06);
+        cs = 0; #35; spi_byte(8'h20); spi_byte(a[23:16]); spi_byte(a[15:8]); spi_byte(a[7:0]);
+        #35; cs = 1; #70;
+        wait_not_busy;
+        repeat (20) @(negedge clk);
+        if (dut.glue_i.trap_triggered !== 0)
+            $fatal(1, "SFDP/program/erase address counted as a trap access");
     endtask
 
     task read_header(input [23:0] a, input [7:0] opcode = 8'h6b);
@@ -90,7 +136,7 @@ module toctou_tb;
             quad_address = 1;
             for (integer bit_index = 20; bit_index >= 0; bit_index -= 4) begin
                 quad_input = a[bit_index +: 4];
-                #16.667; sck = 1; #16.667; sck = 0;
+                #(half); sck = 1; #(half); sck = 0;
             end
             quad_address = 0;
         end else begin
@@ -108,7 +154,7 @@ module toctou_tb;
         read_header(a, opcode);
         if (opcode == 8'h6b) spi_byte(0); // Eight dummy clocks
         if (opcode == 8'heb)
-            repeat (6) begin #16.667; sck = 1; #16.667; sck = 0; end
+            repeat (6) begin #(half); sck = 1; #(half); sck = 0; end
         repeat (10) spi_byte(0); // Forty quad or ten single data bytes
         if (dut.glue_i.trap_triggered !== triggered || dut.redirect_active !== redirect ||
             notifications != (redirect ? 1 : 0) || accepted_reads < 2)
@@ -133,6 +179,7 @@ module toctou_tb;
         set_trap(1, 24'h0010a5, 24'h00f000, 24'h002000);
         host_byte(8'h34);
         wait (!dut.spi_reset_effective);
+        non_read_accesses(24'h0015f0);
         read_flash(24'h002000, 4'b0000, 0, 0, 0, 0); // Non-match first
         read_flash(24'h0015f2, 4'b0011, 0, 0, 0, 0); // Must use THIS address
         read_flash(24'h0015f2, 4'b0011, 1, 1, 24'h00f000, 24'h002000);
@@ -146,6 +193,21 @@ module toctou_tb;
             repeat (phase + 1) #1;
             read_flash(24'h0015f7, 4'b0011, 1, 1, 24'h00f000, 24'h002000, 8'h13);
         end
+        // An offset-7 read posts its lookahead one SPI clock after the
+        // address. From about 60 MHz that is before the trap comparison
+        // has finished; the burst must still be redirected (held until the
+        // decision). Only the accepted SDRAM addresses are checked here, so
+        // the sweep may exceed the data-path limit of these opcodes.
+        for (integer speed = 0; speed < 3; speed++) begin
+            half = speed == 0 ? 12.5 : speed == 1 ? 10.0 : 7.143;
+            for (integer phase = 0; phase < 9; phase++) begin
+                repeat (phase + 1) #1;
+                read_flash(24'h0015f7, 4'b0011, 1, 1, 24'h00f000, 24'h002000, 8'h03);
+                repeat (phase + 1) #1;
+                read_flash(24'h0015f7, 4'b0011, 1, 1, 24'h00f000, 24'h002000, 8'h13);
+            end
+        end
+        half = 16.667;
 
         // End CS immediately after the last address bit, while the system
         // comparison is still pending. No extra SPI clock is needed for
@@ -165,20 +227,22 @@ module toctou_tb;
         read_flash(24'h001235, 4'b0000, 0, 0, 0, 0);
         read_flash(24'h001234, 4'b1000, 0, 0, 0, 0);
         read_flash(24'h001234, 4'b1000, 1, 3, 24'hffffff, 24'h006000);
-        // 0xEB posts its initial READ and address event together. Sweep
-        // refresh phases so the trap can finish between ACTIVATE and READ.
+        // 0xEB posts its initial READ and address event together. Delay
+        // the initial READ's synchronized request by a sweep of clocks so
+        // the trap can finish between ACTIVATE and READ (refresh can no
+        // longer open that gap: it is inhibited from the opcode on).
         // The first burst must stay original (both row AND column).
         host_byte(8'h39); host_byte(5);
         set_trap(0, 24'h001238, 24'hfffff8, 24'h007458);
         read_flash(24'h001238, 4'b0001, 0, 0, 0, 0, 8'heb);
         delayed_initial_reads = 0;
-        for (integer phase = 0; phase < 40; phase++) begin
-            // refreshcount is 10 bits wide; size the target to match.
-            while (dut.sdram_i.refreshcount != 10'(392+phase)) @(negedge clk);
+        for (integer phase = 0; phase < 10; phase++) begin
+            fork delay_initial_read(phase); join_none
             read_flash(24'h001238, 4'b0001, 1, 0, 24'hfffff8, 24'h007458, 8'heb);
         end
         if (delayed_initial_reads == 0) $fatal(1, "Missing initial-READ/redirect overlap coverage");
 
+        /* verilator lint_on ZERODLY */
         // Unit-check the trap pipeline's command priority at its input
         // interface: a pending comparison cannot undo a concurrent reset.
         force dut.glue_i.log_addr_sync = 24'h001238;

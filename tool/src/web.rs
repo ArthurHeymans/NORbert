@@ -1,7 +1,9 @@
 use crate::device::{
     ConnectionKind, FT2232H_PID, FTDI_VID, FlashDevice, Transport, UART_BAUD_RATE,
 };
-use crate::protocol::{CMD_VERSION, PrefetchFaults, is_supported_protocol_version};
+use crate::protocol::{
+    CMD_VERSION, PARSER_IDLE_RESET_MS, PrefetchFaults, is_supported_protocol_version,
+};
 use anyhow::{Result, anyhow, bail};
 use ftdi_nusb::{FtdiDevice, Interface};
 use futures_util::{future::Either, pin_mut};
@@ -127,7 +129,8 @@ impl WebSerialTransport {
         // Send exactly one VERSION request. Reading until its supported reply
         // arrives avoids the old retry race where a late reply from attempt N
         // was mistaken for attempt N+1 and left another reply queued.
-        TimeoutFuture::new(20).await;
+        // Waiting first lets the FPGA parser leave an unfinished command.
+        TimeoutFuture::new(PARSER_IDLE_RESET_MS).await;
         self.write_bytes(&[CMD_VERSION]).await?;
 
         let mut examined = 0usize;
@@ -419,7 +422,9 @@ impl WebUsbTransport {
         device.set_read_chunksize(65_536);
         device.set_write_chunksize(65_536);
 
-        TimeoutFuture::new(5).await;
+        // Let the FPGA parser time out of glitch bytes or an unfinished
+        // command from an earlier session before the first request.
+        TimeoutFuture::new(PARSER_IDLE_RESET_MS).await;
         timeout(device.flush_all(), IO_TIMEOUT_MS, "FT2232H flush")
             .await?
             .map_err(|error| anyhow!(error))?;

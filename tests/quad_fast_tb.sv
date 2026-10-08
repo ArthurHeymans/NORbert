@@ -4,9 +4,19 @@
 // with a functional (CAS=2, BL=4) DQ model behind it.
 //
 // Covers single/dual/quad reads at 30-70MHz SCLK, all start offsets 0-7,
-// multi-burst runs across row/bank/chip boundaries, refresh coexistence,
+// continuous read mode for 1-2-2/1-4-4 (entry, opcode-less reads, exit and
+// the mode reset), multi-burst runs across row/bank/chip boundaries,
+// refresh coexistence,
 // and the prefetch_underrun diagnostic (must stay clear: the check is
 // conservative, so a set flag means "no margin left").
+//
+// Every documented limit is also swept against the refresh scheduler: the
+// refresh becomes due at each system-clock offset into the transaction,
+// so a refresh pair landing in front of a critical burst is exercised
+// rather than left to the phase a fixed sequence happens to hit. A bank
+// checker on the command bus fails any SDRAM protocol violation, including
+// in the exploratory (beyond-limit) cells, where underruns are allowed but
+// memory corruption is not.
 //
 // Data pattern is a pure function of the 23-bit burst address, so the model
 // needs no backing store; the tb recomputes the same function per byte.
@@ -62,7 +72,7 @@ module quad_fast_tb;
         .dqm_o(dqm), .dq_io(dq),
         .spi_active(!cs), .spi_inhibit_refresh(ram_inh),
         .spi_cmd_activate(ram_act), .spi_cmd_read(ram_read), .spi_addr(ram_addr),
-        .spi_cmd_post_toggle(post_toggle),
+        .spi_cmd_post_toggle(post_toggle), .spi_cmd_continuation(ram_cont),
         .access_cmd(2'b00), .access_addr(25'b0), .inhibit_refresh(1'b0),
         .read_buffer(read_buffer_a), .read_buffer_b(read_buffer_b),
         .read_valid_a(read_valid_a), .read_valid_b(read_valid_b),
@@ -76,6 +86,9 @@ module quad_fast_tb;
     // posedge), drives read beats on negedge so they are stable for the
     // controller's aux_clk (== clk) posedge capture.
     // ---------------------------------------------------------------
+    sdram_bank_checker banks(.clk(clk), .enable(!reset), .cs(cs_n), .ras(ras),
+        .cas(cas), .we(we), .ba(ba), .a(a));
+
     reg [12:0] active_row [0:1][0:3];
     reg [15:0] beat_pipe [0:7];
     reg beat_valid [0:7];
@@ -295,6 +308,20 @@ module quad_fast_tb;
                             opcode, a, i, got, want, 1000.0/(2*sclk_half)));
     endtask
 
+    // Mode byte sent by the 1-2-2/1-4-4 reads, and whether the opcode is
+    // omitted (the device is in continuous read mode).
+    reg [7:0] io_mode = 8'hff;
+    reg skip_opcode = 0;
+
+    task send_dual_mode;
+        for (integer i = 6; i >= 0; i -= 2) send_dual_bits(io_mode[i+1 -: 2]);
+    endtask
+
+    task send_quad_mode;
+        send_quad_nibble(io_mode[7:4]); send_quad_nibble(io_mode[3:0]);
+        repeat (4) send_quad_nibble(4'hf);
+    endtask
+
     // opcode is 9 bits so the sweep can pass a four-byte form marker
     // without widening; only the low byte reaches the decoder.
     task read_check(input [8:0] opcode, input [31:0] a, input integer count);
@@ -302,7 +329,7 @@ module quad_fast_tb;
         // so one bad cell cannot cascade into the next
         reg [7:0] got, want;
         select_spi;
-        send_byte(opcode[7:0]);
+        if (!skip_opcode) send_byte(opcode[7:0]);
         begin : read_check_body
         case (opcode[7:0])
             8'h03: begin // slow read: single addr, no dummy
@@ -334,7 +361,7 @@ module quad_fast_tb;
             8'hbb: begin // dual-io: dual addr + 4 mode clocks, dual data
                 for (integer i = 22; i >= 0; i -= 2)
                     send_dual_bits(a[i+1 -: 2]);
-                repeat (4) send_dual_bits(2'b11);
+                send_dual_mode;
                 for (integer i = 0; i < count; i++) begin
                     recv_dual(got);
                     want = expected_byte(a, i);
@@ -367,7 +394,7 @@ module quad_fast_tb;
             8'heb: begin // quad-io: quad addr + 6 mode clocks, quad data
                 for (integer i = 20; i >= 0; i -= 4)
                     send_quad_nibble(a[i+3 -: 4]);
-                repeat (6) send_quad_nibble(4'hf);
+                send_quad_mode;
                 for (integer i = 0; i < count; i++) begin
                     recv_quad(got);
                     want = expected_byte(a, i);
@@ -422,7 +449,7 @@ module quad_fast_tb;
             8'hbc: begin // dual-io 4B: 16 dual addr bits, 4 mode clocks
                 for (integer i = 30; i >= 0; i -= 2)
                     send_dual_bits(a[i+1 -: 2]);
-                repeat (4) send_dual_bits(2'b11);
+                send_dual_mode;
                 for (integer i = 0; i < count; i++) begin
                     recv_dual(got);
                     want = expected_byte(a, i);
@@ -432,7 +459,7 @@ module quad_fast_tb;
             8'hec: begin // quad-io 4B: 8 quad addr nibbles, 6 mode clocks
                 for (integer i = 28; i >= 0; i -= 4)
                     send_quad_nibble(a[i+3 -: 4]);
-                repeat (6) send_quad_nibble(4'hf);
+                send_quad_mode;
                 for (integer i = 0; i < count; i++) begin
                     recv_quad(got);
                     want = expected_byte(a, i);
@@ -456,6 +483,73 @@ module quad_fast_tb;
         for (integer off = 0; off < 8; off++)
             read_check(opcode, base + 32'(off), count);
         explore_mode = 0;
+    endtask
+
+    // Make the next refresh due k system clocks after CS falls, for every k
+    // in one refresh period, with a sub-cycle SPI/system phase that also
+    // walks. Each transaction starts at a different offset in the burst.
+    localparam integer REFRESH_PERIOD = (120 * 32000) / 8192;
+    reg refresh_seen = 0;
+    always @(negedge clk) if (!reset && {ras, cas, we} == 3'b001 && !cs_n) refresh_seen = 1;
+    task refresh_sweep(input [8:0] opcode, input real half, input [31:0] base,
+                       input bit must_pass = 1);
+        integer fails_before, thin_before;
+        sclk_half = half;
+        explore_mode = !must_pass;
+        fails_before = explore_fails; thin_before = thin_hits;
+        for (integer k = 0; k < REFRESH_PERIOD; k += 1) begin
+            // Start k clocks short of the next refresh: wait for a chip-0
+            // REFRESH (idle, so no debt is pending), then one period less k.
+            refresh_seen = 0;
+            while (!refresh_seen) @(negedge clk);
+            repeat (REFRESH_PERIOD - 1 - k) @(negedge clk);
+            // Never zero: 0.25..8.5 ns, stepping 0.37 ns per transaction.
+            /* verilator lint_off ZERODLY */
+            #(0.25 + (k * 0.37) - $floor(k * 0.37 / 8.333) * 8.333);
+            /* verilator lint_on ZERODLY */
+            read_check(opcode, base + 32'(k % 8) + 32'((k / 8) * 64), 16);
+        end
+        explore_mode = 0;
+        $display("quad_fast: refresh sweep %h @%0.1fMHz: %0d reads, %0d explore fails, %0d thin",
+                 opcode[7:0], 1000.0/(2*half), REFRESH_PERIOD,
+                 explore_fails - fails_before, thin_hits - thin_before);
+    endtask
+
+    // Continuous read mode: mode bits Axh after a 1-2-2/1-4-4 address make
+    // the next transaction start with the address. Several such reads at
+    // different offsets, then mode FFh leaves the mode, after which a
+    // plain opcode must decode again.
+    task cont_read_sequence(input [8:0] opcode, input real half, input [31:0] base);
+        sclk_half = half;
+        io_mode = 8'ha0;
+        read_check(opcode, base, 24);              // enter
+        skip_opcode = 1;
+        for (integer off = 0; off < 8; off++)
+            read_check(opcode, base + 32'h100 + 32'(off * 9), 24);
+        io_mode = 8'hef;                           // M5-4 = 10 still: stay
+        read_check(opcode, base + 32'h207, 16);
+        io_mode = 8'hff;                           // leave
+        read_check(opcode, base + 32'h300, 16);
+        skip_opcode = 0;
+        read_check(opcode[7:0] == 8'hec || opcode[7:0] == 8'hbc ? 9'h0c : 9'h0b,
+                   base + 32'h400, 16);
+        $display("quad_fast: continuous read %h @%0.1fMHz OK", opcode[7:0], 1000.0/(2*half));
+    endtask
+
+    // The mode-reset sequence a driver sends without knowing the mode:
+    // FFh on IO0 for 8 clocks (quad) or FFFFh for 16 clocks (dual), with
+    // the other IOs high.
+    task cont_read_reset(input bit quad, input [31:0] base);
+        io_mode = 8'ha0;
+        read_check(quad ? 9'heb : 9'hbb, base, 8);
+        select_spi;
+        repeat (quad ? 8 : 16) begin
+            if (quad) send_quad_nibble(4'hf); else send_dual_bits(2'b11);
+        end
+        deselect_spi;
+        io_mode = 8'hff;
+        read_check(9'h0b, base + 32'h80, 16);
+        $display("quad_fast: continuous read reset (%s) OK", quad ? "quad FFh" : "dual FFFFh");
     endtask
 
     initial begin
@@ -570,6 +664,26 @@ module quad_fast_tb;
         $display("quad_fast: 2KB 0xEB @60MHz row/bank crossing OK (%0d refreshes)",
                  refreshes - ref_before);
 
+        cont_read_sequence(9'heb, 12.5,  32'h060000);
+        cont_read_sequence(9'hbb, 8.333, 32'h061000);
+        cont_read_reset(1, 32'h062000);
+        cont_read_reset(0, 32'h063000);
+        // cfg_4byte is still set from the four-byte section above.
+        cont_read_sequence(9'hec, 12.5,  32'h0123_6400);
+        cont_read_sequence(9'hbc, 8.333, 32'h0123_7400);
+
+        // Refresh-phase sweeps at each documented limit (must pass), then
+        // beyond them (underruns allowed, protocol violations are not).
+        refresh_sweep(9'h03, 12.5,  32'h010000);
+        refresh_sweep(9'h0b, 7.143, 32'h018000);
+        refresh_sweep(9'h3b, 10.0,  32'h020000);
+        refresh_sweep(9'hbb, 8.333, 32'h028000);
+        refresh_sweep(9'h6b, 7.143, 32'h030000);
+        refresh_sweep(9'heb, 12.5,  32'h038000);
+        refresh_sweep(9'heb, 10.0,  32'h040000, 0);
+        refresh_sweep(9'hbb, 7.143, 32'h048000, 0);
+        refresh_sweep(9'h03, 10.0,  32'h050000, 0);
+
         // The mode pair: 0xB7 widens the address phase of the plain 0x03
         // and 0xE9 narrows it again. Placed after the streaming runs
         // because it changes pipeline state that the 60 MHz corners above
@@ -586,7 +700,7 @@ module quad_fast_tb;
         $display("quad_fast: 0xB7 ignored when the chip has no 4-byte support OK");
         cfg_4byte = 1'b0;
 
-        $display("PASS QUAD_FAST: single/dual/quad 30-70MHz, 3- and 4-byte addressing incl. the 0xB7/0xE9 mode pair, offsets 0-7, crossings, refresh (thin flags: %0d, explore fails: %0d, explore thin: %0d)", thin_hits, explore_fails, explore_thin);
+        $display("PASS QUAD_FAST: single/dual/quad 30-70MHz, 3- and 4-byte addressing incl. the 0xB7/0xE9 mode pair, continuous read mode, offsets 0-7, crossings, refresh sweeps (thin flags: %0d, explore fails: %0d, explore thin: %0d)", thin_hits, explore_fails, explore_thin);
         $finish;
     end
 

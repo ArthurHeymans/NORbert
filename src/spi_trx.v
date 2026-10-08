@@ -49,8 +49,14 @@ module spi_trx(
     output wire prefetch_underrun,
     output wire prefetch_thin,
 
-    // For writing
-    output reg write_cmd,
+    // For writing. write_cmd rises when a program/erase is issued and is
+    // held until its completion clears WIP, so the system side cannot miss
+    // it however long it waits for CS high and SDRAM ownership. The other
+    // write_* outputs are held as long. write_partial is frozen at the end
+    // of the issuing transaction: set if CS rose mid-byte, in which case a
+    // real NOR flash does not execute the command.
+    output reg write_cmd = 0,
+    output reg write_partial = 0,
     output reg [1:0] write_type,  // 00=page program, 01=erase, 10=AAI RMW
     output reg [22:0] write_addr,     // 23-bit burst address
     output reg [22:0] write_len,
@@ -76,7 +82,9 @@ module spi_trx(
     output reg log_cmd_valid = 0,       // Pulse: command byte decoded
     output reg [7:0] log_cmd_opcode = 0,// The opcode that was decoded
     output reg log_addr_valid = 0,      // Pulse: address phase complete
-    output reg log_addr_toggle = 0,     // Changes on the final address bit
+    // Changes on the final address bit of array reads only (not SFDP,
+    // program or erase): the TOCTOU traps count those accesses.
+    output reg log_addr_toggle = 0,
     // Held across CS/reset until the next address event, so the system
     // domain can capture this payload using the synchronized toggle.
     output reg [31:0] log_addr_out = 0, // Full flash byte address
@@ -188,6 +196,16 @@ module spi_trx(
     reg aai_active = 0;         // In AAI word program mode
     reg is_aai = 0;             // Current transaction is AAI (per-CS flag)
     reg [1:0] aai_bytes_left;   // Ignore data beyond the two-byte AAI word
+
+    // Continuous read mode (Winbond "Continuous Read Mode", Micron XIP):
+    // mode bits M5-4 = 10 after a 0xBB/0xEB address make the next
+    // transaction start directly with the address, without an opcode.
+    // Any other M5-4 (e.g. the FFh/FFFFh mode reset) leaves the mode.
+    // Persists across CS like AAI; cleared at power reset.
+    reg cont_read = 0;
+    reg cont_quad = 0;          // ...for 1-4-4 (else 1-2-2)
+    reg cont_4b = 0;            // ...with a four-byte address
+    reg io_read_4b = 0;         // Current 1-2-2/1-4-4 read has a 4-byte address
     
     reg [31:0] addr;
     reg [4:0] addr_count;       // Index of the next address MSB to arrive
@@ -237,6 +255,35 @@ module spi_trx(
     // SDRAM prefetch. Each strobe marks the clock on which the SPI
     // transaction reaches the corresponding point; spi_prefetch documents
     // what it does with it.
+    // Opcode completing on this clock (valid when bit_count_in == 0), and
+    // the same with everything but status reads masked while WIP is set.
+    // 8'h00 is not a decoded opcode.
+    wire [7:0] cmd_byte = {mosi_byte[7:1], spi_io0_in};
+    wire [7:0] cmd_accepted = (status_reg[0] && cmd_byte != CMD_READSTATUS &&
+                               cmd_byte != CMD_READSTATUS2) ? 8'h00 : cmd_byte;
+    // The issuing transaction of a pending write command is still selected.
+    reg write_open = 0;
+
+    // Opcodes the decoder below turns into an array read, with the same
+    // enable conditions. Kept next to the decoder's case labels: a read it
+    // misses would only lose the early refresh inhibit, not data.
+    function array_read_opcode;
+        input [7:0] op;
+        begin
+            case (op)
+            CMD_READ, CMD_FASTREAD, CMD_DUALREAD, CMD_DUALREAD_4B,
+            CMD_DUALIOREAD, CMD_DUALIOREAD_4B:
+                array_read_opcode = 1'b1;
+            CMD_READ_4B, CMD_FASTREAD_4B:
+                array_read_opcode = cfg_4byte;
+            CMD_QUADREAD, CMD_QUADREAD_4B, CMD_QUADIOREAD, CMD_QUADIOREAD_4B:
+                array_read_opcode = status_reg2[1];
+            default:
+                array_read_opcode = 1'b0;
+            endcase
+        end
+    endfunction
+
     wire addr_read = state == STA_ADDR && addr_kind == ADDR_KIND_READ && !is_sfdp_read;
     wire in_read = state == STA_READ;
 
@@ -248,17 +295,14 @@ module spi_trx(
         .fresh_read(fresh_read),
         .in_read(in_read),
         .sample_missing(sample_missing),
-        .first_inhibit(addr_read && addr_count == 15),
+        .release_inhibit(state == STA_CMD && bit_count_in == 0 &&
+                         !array_read_opcode(cmd_accepted)),
         // Quad: IO3/IO2 carry byte-address bits 11/10 on this clock.
         .first_activate(addr_read && addr_count == (addr_quad ? 11 : 9)),
         .first_row(addr_quad ? {addr[13:0], spi_io3_in, spi_io2_in} : addr[15:0]),
         .first_read(addr_read && addr_count == 3),
         .first_col({addr[5:0], addr_lane_msb}),
         .first_done(addr_read && addr_last && !addr_dual && !addr_quad),
-        // No refresh gap before the initial lookahead: an offset-7
-        // dummy-less read has only one byte to hide that burst's latency.
-        .hold_inhibit(1'b1),
-        .release_inhibit(state == STA_DUMMY && dummy_count == 0),
         .post_lookahead((state == STA_DUMMY && dummy_count == 5 && !is_sfdp_read) ||
                         (state == STA_MODE_MULTI && mode_count == 1)),
         .drop((state == STA_MODE_MULTI && mode_count == 3) ||
@@ -291,8 +335,10 @@ module spi_trx(
         // SCK can keep running for another slave while this CS is high.
         // Consume completion independently of selection, before the
         // selected state machine (which may start a new operation).
-        if (write_busy_clr)
+        if (write_busy_clr) begin
             status_reg[0] <= 0;
+            write_cmd <= 0;
+        end
 
         if (is_selected) begin
             fresh_read <= 0;
@@ -331,16 +377,40 @@ module spi_trx(
                 log_addr_valid <= 0;
                 log_byte_count <= 0;
                 
-                write_cmd <= 0;
-                
+                write_open <= 0;
                 write_buf_strobe <= 0;
                 
                 if (reset_power) begin
+                    write_cmd <= 0;
                     status_reg[1:0] <= 2'b00;
                     status_reg[6] <= 0;     // AAI bit
                     addr_4byte <= 0;
                     aai_active <= 0;
+                    cont_read <= 0;
                     addr <= 0;
+                end
+                else if (cont_read && !status_reg[0]) begin
+                    // Continuous read: this first clock already carries
+                    // the address MSBs of an implied 0xBB/0xEB (or 4B).
+                    state <= STA_ADDR;
+                    addr_kind <= ADDR_KIND_READ;
+                    log_cmd_valid <= 1;
+                    if (cont_quad) begin
+                        addr_lanes <= 4;
+                        is_quad_read <= 1;
+                        read_byte_top <= 1;
+                        addr <= {28'b0, spi_io3_in, spi_io2_in, spi_io1_in, spi_io0_in};
+                        addr_count <= cont_4b ? 5'd27 : 5'd19;
+                        log_cmd_opcode <= cont_4b ? CMD_QUADIOREAD_4B : CMD_QUADIOREAD;
+                    end
+                    else begin
+                        addr_lanes <= 2;
+                        is_dual_read <= 1;
+                        read_byte_top <= 3;
+                        addr <= {30'b0, spi_io1_in, spi_io0_in};
+                        addr_count <= cont_4b ? 5'd29 : 5'd21;
+                        log_cmd_opcode <= cont_4b ? CMD_DUALIOREAD_4B : CMD_DUALIOREAD;
+                    end
                 end
             end
             else begin
@@ -348,13 +418,20 @@ module spi_trx(
                 log_addr_valid <= 0;
                     
                 write_buf_strobe <= 0;
+
+                // A completed byte leaves the transaction at a boundary.
+                if (write_open)
+                    write_partial <= bit_count_in != 0;
                 
                 mosi_byte[bit_count_in] <= spi_io0_in;
 
 
                 if ((state == STA_CMD) && (bit_count_in == 0)) begin
                     
-                    case ({mosi_byte[7:1], spi_io0_in})
+                    // While WIP is set only status reads are accepted, as
+                    // on a real part: no array reads, writes or WEL changes
+                    // can race the program engine or its page buffer.
+                    case (cmd_accepted)
                         
                     CMD_READSTATUS: begin
                         state <= STA_READSTATUS;
@@ -451,6 +528,7 @@ module spi_trx(
                         addr <= 0;
                         addr_lanes <= 2;
                         addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_DUALIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
+                        io_read_4b <= cmd_byte == CMD_DUALIOREAD_4B || addr_4byte;
                         is_dual_read <= 1;
                         read_byte_top <= 3;
                     end
@@ -476,6 +554,7 @@ module spi_trx(
                             addr <= 0;
                             addr_lanes <= 4;
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
+                            io_read_4b <= cmd_byte == CMD_QUADIOREAD_4B || addr_4byte;
                             is_quad_read <= 1;
                             read_byte_top <= 1;
                         end
@@ -519,6 +598,7 @@ module spi_trx(
                         if (status_reg[1]) begin
                             state <= STA_ERASE;
                             write_cmd <= 1;
+                            write_open <= 1;
                             write_type <= 2'd1;
                             write_addr <= 23'b0;
                             write_len <= cfg_chip_erase_bursts;
@@ -569,6 +649,7 @@ module spi_trx(
                                 state <= STA_AAI_DATA;
                                 aai_bytes_left <= 2;
                                 write_cmd <= 1;
+                                write_open <= 1;
                                 write_type <= 2'd2;
                                 write_addr <= wrap_burst_addr(addr[25:3]);
                                 write_len <= 0;
@@ -615,7 +696,8 @@ module spi_trx(
 
                     if (addr_last) begin
                         log_addr_valid <= 1;
-                        log_addr_toggle <= !log_addr_toggle;
+                        if (addr_kind == ADDR_KIND_READ && !is_sfdp_read)
+                            log_addr_toggle <= !log_addr_toggle;
                         log_addr_out <= addr_next;
 
                         case (addr_kind)
@@ -643,6 +725,7 @@ module spi_trx(
                         ADDR_KIND_ERASE: begin
                             state <= STA_ERASE;
                             write_cmd <= 1;
+                            write_open <= 1;
                             write_type <= 2'd1;
 
                             // Align address based on erase size
@@ -664,6 +747,7 @@ module spi_trx(
                                 state <= STA_AAI_DATA;
                                 aai_bytes_left <= 2;
                                 write_cmd <= 1;
+                                write_open <= 1;
                                 write_type <= 2'd2;
                                 write_addr <= wrap_burst_addr(addr_next[25:3]);
                                 write_len <= 0;
@@ -671,6 +755,7 @@ module spi_trx(
                             end else begin
                                 state <= STA_WRITE;
                                 write_cmd <= 1;
+                                write_open <= 1;
                                 write_type <= 2'd0;
 
                                 // Page-aligned address in 8-byte burst units
@@ -779,6 +864,13 @@ module spi_trx(
                 // spi_prefetch posts the second burst during this phase.
                 // ---------------------------------------------------------
                 else if (state == STA_MODE_MULTI) begin
+                    // M5-4 arrive on IO1:IO0: in the first mode clock for
+                    // quad (M7-4 on IO3:IO0), the second for dual.
+                    if (mode_count == (is_quad_read ? 3'd5 : 3'd2)) begin
+                        cont_read <= {spi_io1_in, spi_io0_in} == 2'b10;
+                        cont_quad <= is_quad_read;
+                        cont_4b <= io_read_4b;
+                    end
                     if (mode_count == 0) begin
                         state <= STA_READ;
                         spi_io0_oe_ff <= 1;
