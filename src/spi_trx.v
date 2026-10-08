@@ -70,6 +70,10 @@ module spi_trx(
     // These are stable during SPI transactions (config only applied when CS high).
     input wire [23:0] cfg_jedec_id,
     input wire cfg_4byte,
+    // Log-only mode: decode the bus for logging but never drive it, request
+    // SDRAM or emulate writes; the real flash's WEL/BUSY/QE/4-byte support
+    // apply, not ours. Changed only while emulation is stopped.
+    input wire log_only,
     input wire [22:0] cfg_chip_erase_bursts,
     
     // SFDP table read interface (memory in glue.v)
@@ -103,10 +107,10 @@ module spi_trx(
     reg spi_io1_oe_ff = 0;
     reg spi_io2_oe_ff = 0;
     reg spi_io3_oe_ff = 0;
-    assign spi_io0_oe = spi_io0_oe_ff && !reset_cs && !reset_power;
-    assign spi_io1_oe = spi_io1_oe_ff && !reset_cs && !reset_power;
-    assign spi_io2_oe = spi_io2_oe_ff && !reset_cs && !reset_power;
-    assign spi_io3_oe = spi_io3_oe_ff && !reset_cs && !reset_power;
+    assign spi_io0_oe = spi_io0_oe_ff && !reset_cs && !reset_power && !log_only;
+    assign spi_io1_oe = spi_io1_oe_ff && !reset_cs && !reset_power && !log_only;
+    assign spi_io2_oe = spi_io2_oe_ff && !reset_cs && !reset_power && !log_only;
+    assign spi_io3_oe = spi_io3_oe_ff && !reset_cs && !reset_power && !log_only;
     
     // Reset detection using async set flip-flops
     reg reset_cs = 1;
@@ -259,10 +263,16 @@ module spi_trx(
     // the same with everything but status reads masked while WIP is set.
     // 8'h00 is not a decoded opcode.
     wire [7:0] cmd_byte = {mosi_byte[7:1], spi_io0_in};
-    wire [7:0] cmd_accepted = (status_reg[0] && cmd_byte != CMD_READSTATUS &&
+    wire [7:0] cmd_accepted = (status_reg[0] && !log_only && cmd_byte != CMD_READSTATUS &&
                                cmd_byte != CMD_READSTATUS2) ? 8'h00 : cmd_byte;
     // The issuing transaction of a pending write command is still selected.
     reg write_open = 0;
+
+    // Command enables. In log-only mode the real flash decides whether a
+    // command executes, so the log decodes every command the master sends.
+    wire wel = status_reg[1] || log_only;
+    wire qe = status_reg2[1] || log_only;
+    wire four_byte_ok = cfg_4byte || log_only;
 
     // Opcodes the decoder below turns into an array read, with the same
     // enable conditions. Kept next to the decoder's case labels: a read it
@@ -275,9 +285,9 @@ module spi_trx(
             CMD_DUALIOREAD, CMD_DUALIOREAD_4B:
                 array_read_opcode = 1'b1;
             CMD_READ_4B, CMD_FASTREAD_4B:
-                array_read_opcode = cfg_4byte;
+                array_read_opcode = four_byte_ok;
             CMD_QUADREAD, CMD_QUADREAD_4B, CMD_QUADIOREAD, CMD_QUADIOREAD_4B:
-                array_read_opcode = status_reg2[1];
+                array_read_opcode = qe;
             default:
                 array_read_opcode = 1'b0;
             endcase
@@ -286,6 +296,9 @@ module spi_trx(
 
     wire addr_read = state == STA_ADDR && addr_kind == ADDR_KIND_READ && !is_sfdp_read;
     wire in_read = state == STA_READ;
+
+    wire prefetch_inhibit, prefetch_activate, prefetch_read;
+    wire prefetch_underrun_raw, prefetch_thin_raw;
 
     spi_prefetch prefetch(
         .spi_clk(spi_clk),
@@ -310,9 +323,9 @@ module spi_trx(
         .mode_end(state == STA_MODE_MULTI && mode_count == 0),
         .fallback(in_read && addr[2:0] == 7 && bit_count_in == read_byte_top),
         .burst_end(in_read && addr[2:0] == 7 && bit_count_in == 0),
-        .ram_inhibit_refresh(ram_inhibit_refresh),
-        .ram_activate(ram_activate),
-        .ram_read(ram_read),
+        .ram_inhibit_refresh(prefetch_inhibit),
+        .ram_activate(prefetch_activate),
+        .ram_read(prefetch_read),
         .ram_continuation(ram_continuation),
         .ram_post_toggle(ram_post_toggle),
         .ram_addr(ram_addr),
@@ -324,9 +337,16 @@ module spi_trx(
         .ram_read_beats_b(ram_read_beats_b),
         .live_buffer(live_buffer),
         .live_beats(live_beats),
-        .prefetch_underrun(prefetch_underrun),
-        .prefetch_thin(prefetch_thin)
+        .prefetch_underrun(prefetch_underrun_raw),
+        .prefetch_thin(prefetch_thin_raw)
     );
+
+    // Log-only mode serves no data: no SDRAM requests, no prefetch faults.
+    assign ram_inhibit_refresh = prefetch_inhibit && !log_only;
+    assign ram_activate = prefetch_activate && !log_only;
+    assign ram_read = prefetch_read && !log_only;
+    assign prefetch_underrun = prefetch_underrun_raw && !log_only;
+    assign prefetch_thin = prefetch_thin_raw && !log_only;
 
     // Main SPI state machine
     always @(posedge spi_clk) begin
@@ -448,7 +468,7 @@ module spi_trx(
                     end
                     
                     CMD_WRITESTATUS: begin
-                        if (status_reg[1]) begin
+                        if (wel) begin
                             state <= STA_WRITESTATUS;
                             addr_count <= 0;
                         end
@@ -473,11 +493,11 @@ module spi_trx(
                     end
                     
                     CMD_4BYTEENABLE: begin
-                        if (cfg_4byte) addr_4byte <= 1;
+                        if (four_byte_ok) addr_4byte <= 1;
                     end
                     
                     CMD_4BYTEDISABLE: begin
-                        if (cfg_4byte) addr_4byte <= 0;
+                        if (four_byte_ok) addr_4byte <= 0;
                     end
                         
                     CMD_READ: begin
@@ -487,7 +507,7 @@ module spi_trx(
                     end
                     
                     CMD_READ_4B: begin
-                        if (cfg_4byte) begin
+                        if (four_byte_ok) begin
                             state <= STA_ADDR;
                             addr <= 0;
                             addr_count <= 31;
@@ -502,7 +522,7 @@ module spi_trx(
                     end
                     
                     CMD_FASTREAD_4B: begin
-                        if (cfg_4byte) begin
+                        if (four_byte_ok) begin
                             state <= STA_ADDR;
                             addr <= 0;
                             addr_count <= 31;
@@ -536,7 +556,7 @@ module spi_trx(
                     // Quad Output Read (1-1-4): cmd(1), addr(1), 8 dummy, data(4)
                     CMD_QUADREAD,
                     CMD_QUADREAD_4B: begin
-                        if (status_reg2[1]) begin  // QE required
+                        if (qe) begin  // QE required
                             state <= STA_ADDR;
                             addr <= 0;
                             addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
@@ -549,7 +569,7 @@ module spi_trx(
                     // Quad I/O Read (1-4-4): cmd(1), addr(4), mode+dummy(4), data(4)
                     CMD_QUADIOREAD,
                     CMD_QUADIOREAD_4B: begin
-                        if (status_reg2[1]) begin  // QE required
+                        if (qe) begin  // QE required
                             state <= STA_ADDR;
                             addr <= 0;
                             addr_lanes <= 4;
@@ -562,7 +582,7 @@ module spi_trx(
 
                     CMD_SECTORERASE_4K,
                     CMD_SECTORERASE_4K_4B: begin
-                        if (status_reg[1]) begin
+                        if (wel) begin
                             state <= STA_ADDR;
                             addr <= 0;
                             addr_kind <= ADDR_KIND_ERASE;
@@ -573,7 +593,7 @@ module spi_trx(
                     
                     CMD_BLOCKERASE_32K,
                     CMD_BLOCKERASE_32K_4B: begin
-                        if (status_reg[1]) begin
+                        if (wel) begin
                             state <= STA_ADDR;
                             addr <= 0;
                             addr_kind <= ADDR_KIND_ERASE;
@@ -584,7 +604,7 @@ module spi_trx(
                     
                     CMD_BLOCKERASE_64K,
                     CMD_BLOCKERASE_64K_4B: begin
-                        if (status_reg[1]) begin
+                        if (wel) begin
                             state <= STA_ADDR;
                             addr <= 0;
                             addr_kind <= ADDR_KIND_ERASE;
@@ -595,7 +615,7 @@ module spi_trx(
                     
                     CMD_CHIPERASE1,
                     CMD_CHIPERASE2: begin
-                        if (status_reg[1]) begin
+                        if (wel) begin
                             state <= STA_ERASE;
                             write_cmd <= 1;
                             write_open <= 1;
@@ -609,7 +629,7 @@ module spi_trx(
                     
                     CMD_PAGEPROGRAM,
                     CMD_PAGEPROGRAM_4B: begin
-                        if (status_reg[1]) begin
+                        if (wel) begin
                             state <= STA_ADDR;
                             addr <= 0;
                             addr_kind <= ADDR_KIND_WRITE;
@@ -633,7 +653,7 @@ module spi_trx(
                     // flashprog's spi_prettyprint_status_register_sst25
                     // reports.
                     CMD_AAI_WORD: begin
-                        if (status_reg[1] || aai_active) begin
+                        if (wel || aai_active) begin
                             if (!aai_active) begin
                                 // First AAI: need address phase
                                 state <= STA_ADDR;
@@ -933,6 +953,14 @@ module spi_trx(
                     bit_count_in <= read_byte_top;
                 else
                     bit_count_in <= bit_count_in - 1;
+            end
+
+            // Log-only mode emulates no program/erase: nothing reaches the
+            // program engine and WIP never sets (the real flash has it).
+            if (log_only) begin
+                write_cmd <= 0;
+                write_buf_strobe <= 0;
+                status_reg[0] <= 0;
             end
         end
     end

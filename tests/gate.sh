@@ -97,3 +97,7 @@ sim toctou "$build/toctou.top.v"
 
 synth top_io top "spi_io1_oe spi_active_out reset spi_reset_effective"
 sim top_io "$build/top_io.top.v"
+
+synth log_only top "spi_io0_oe spi_io1_oe spi_io2_oe spi_io3_oe hold_drive hold_out log_only
+                    spi_writing uart_txd uart_txd_strobe reset spi_reset_effective"
+sim log_only "$build/log_only.top.v"

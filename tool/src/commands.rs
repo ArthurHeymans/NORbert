@@ -5,7 +5,8 @@ use diagnostics::{cmd_ft_list, cmd_probe};
 use monitor::cmd_monitor;
 
 use crate::chip::{self, FlashChipExt};
-use crate::cli::{Cli, HoldState, ToctouAction};
+use crate::cli::{Cli, Switch, ToctouAction};
+use crate::device::EmulationMode;
 use crate::device::FlashDevice;
 #[cfg(feature = "ftdi")]
 use crate::device::{FT2232H_PID, FTDI_VID};
@@ -330,14 +331,26 @@ fn cmd_configure(cli: &Cli, chip_db_path: Option<&Path>, chip_name: &str) -> Res
     Ok(())
 }
 
-fn cmd_hold(cli: &Cli, state: HoldState) -> Result<()> {
-    let enable = matches!(state, HoldState::On);
+fn cmd_hold(cli: &Cli, state: Switch) -> Result<()> {
+    let enable = matches!(state, Switch::On);
     let mut device = open_device(cli)?;
     device.set_hold(enable)?;
     if enable {
         eprintln!("HOLD asserted: target flash silenced");
     } else {
         eprintln!("HOLD released: target flash active");
+    }
+    Ok(())
+}
+
+fn cmd_sniff(cli: &Cli, state: Switch) -> Result<()> {
+    let enable = matches!(state, Switch::On);
+    let mut device = open_device(cli)?;
+    device.set_log_only(enable)?;
+    if enable {
+        eprintln!("Log-only mode: NORbert observes the bus; run `monitor` to see the traffic");
+    } else {
+        eprintln!("Log-only mode off; emulation stopped (run `start` to serve data)");
     }
     Ok(())
 }
@@ -452,11 +465,12 @@ fn cmd_prefetch(cli: &Cli) -> Result<()> {
 
 fn cmd_status(cli: &Cli) -> Result<()> {
     let mut device = open_device(cli)?;
-    let running = device.status()?;
-    println!(
-        "SPI emulation: {}",
-        if running { "running" } else { "stopped" }
-    );
+    let mode = match device.emulation_mode()? {
+        EmulationMode::Stopped => "stopped",
+        EmulationMode::Serving => "running",
+        EmulationMode::LogOnly => "running in log-only mode (not serving data)",
+    };
+    println!("SPI emulation: {mode}");
     Ok(())
 }
 
@@ -482,6 +496,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         } => cmd_dump(cli, file, *address, *length),
         Commands::Configure { chip_db, chip } => cmd_configure(cli, chip_db.as_deref(), chip),
         Commands::Hold { state } => cmd_hold(cli, *state),
+        Commands::Sniff { state } => cmd_sniff(cli, *state),
         Commands::Monitor => cmd_monitor(cli),
         Commands::Toctou { action } => cmd_toctou(cli, action),
         Commands::Ports => cmd_ports(),

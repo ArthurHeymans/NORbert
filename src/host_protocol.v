@@ -89,6 +89,12 @@ module host_protocol(
     // Target flash HOLD control (active high: 1 = assert #HOLD on target)
     output reg hold_out,
 
+    // Log-only (sniff) mode: spi_trx decodes and logs the bus but never
+    // drives it, touches SDRAM or emulates writes, so a real flash on the
+    // same bus can answer. Mutually exclusive with hold_out, and only
+    // changed while emulation is stopped (quasi-static for spi_trx).
+    output reg log_only,
+
     // Logging control: 1 = logger captures SPI events into the ring
     // FIFO; 0 = logger ignores events.  The host drains the FIFO via
     // CMD_LOGPOLL regardless of this flag (so residual bytes remain
@@ -234,7 +240,7 @@ module host_protocol(
         begin
             case (op)
             CMD_VERSION, CMD_START, CMD_STOP, CMD_STATUS, CMD_PREFETCH,
-            CMD_LOGPOLL, CMD_HOLDCTL, CMD_LOGCTL, CMD_TOCTOU:
+            CMD_LOGPOLL, CMD_HOLDCTL, CMD_LOGCTL, CMD_TOCTOU, CMD_SNIFFCTL:
                 ungated_opcode = 1'b1;
             default:
                 ungated_opcode = 1'b0;
@@ -264,7 +270,8 @@ module host_protocol(
     // strobes, so rx_hold spaces pops two cycles apart (well within the
     // FT245's ~22-cycle byte delivery).
     reg rx_hold;
-    wire cmd_ungated = cmd == CMD_HOLDCTL || cmd == CMD_LOGCTL || cmd == CMD_TOCTOU;
+    wire cmd_ungated = cmd == CMD_HOLDCTL || cmd == CMD_LOGCTL || cmd == CMD_TOCTOU ||
+                       cmd == CMD_SNIFFCTL;
     wire rx_parser_ready = !rx_hold && (cmd_idle || (in_count != 0 && read_state == 0));
     wire ft_rx_take = rx_parser_ready && ft_rx_data_available &&
                       (cmd_idle || active_port) &&
@@ -408,6 +415,7 @@ module host_protocol(
             write_buffer <= 0;
             
             hold_out <= 0;
+            log_only <= 0;
             log_active <= 0;
             
             redirect_active <= 0;
@@ -550,10 +558,11 @@ module host_protocol(
             // - Armed && Triggered:  activate redirect (serve replacement)
             // -------------------------------------------------------
             log_addr_valid_prev <= log_addr_valid_sync;
-            trap_check_pending <= log_addr_event;
+            // Traps redirect served data, so they do nothing in log-only mode.
+            trap_check_pending <= log_addr_event && !log_only;
             trap_notify_strobe <= 0;
 
-            if (log_addr_event) begin
+            if (log_addr_event && !log_only) begin
                 // Address payload and match bits advance together. The
                 // logger consumes the payload only with the later strobe.
                 trap_notify_addr <= log_addr_sync;
@@ -646,11 +655,13 @@ module host_protocol(
                 end
                 CMD_STATUS: begin
                     txd_strobe_buf <= 1;
-                    // 0x01 = running, 0x02 = stopped.  Using two non-zero
-                    // codes (rather than 0x00 for stopped) lets the host
-                    // tool's transparent 0x00 skipping still work around
-                    // the FT2232H's occasional leaked modem-status bytes.
-                    txd_data_buf <= spi_running ? 8'h01 : 8'h02;
+                    // 0x01 = running, 0x02 = stopped, 0x03 = running in
+                    // log-only mode.  Non-zero codes (rather than 0x00 for
+                    // stopped) let the host tool's transparent 0x00
+                    // skipping still work around the FT2232H's occasional
+                    // leaked modem-status bytes.
+                    txd_data_buf <= !spi_running ? 8'h02 :
+                                    log_only ? STATUS_LOG_ONLY : 8'h01;
                 end
                 CMD_PREFETCH: begin
                     // Reports and clears the latched flags, so a host can
@@ -763,6 +774,10 @@ module host_protocol(
                             cmd <= CMD_TOCTOU;
                             in_count <= 1;
                         end
+                        else if (rxd_data_buf == CMD_SNIFFCTL) begin
+                            cmd <= CMD_SNIFFCTL;
+                            in_count <= 1;
+                        end
                         else if (!spi_run_requested) begin
                             if (rxd_data_buf == CMD_RAMREAD ||
                                 rxd_data_buf == CMD_RAMWRITE) begin
@@ -858,11 +873,36 @@ module host_protocol(
                         //
                         // Mutually exclusive with quad I/O: when hold is
                         // asserted, IO3 is driven low continuously to keep
-                        // the target flash in hold state.
+                        // the target flash in hold state. Also mutually
+                        // exclusive with log-only mode, which needs the
+                        // target flash to answer: asserting hold there is
+                        // refused (REPLY_REFUSED).
                         // -----------------------------------------------
-                        hold_out <= rxd_data_buf[0];
                         txd_strobe_buf <= 1;
-                        txd_data_buf <= 8'h01;
+                        if (rxd_data_buf[0] && log_only)
+                            txd_data_buf <= REPLY_REFUSED;
+                        else begin
+                            hold_out <= rxd_data_buf[0];
+                            txd_data_buf <= 8'h01;
+                        end
+                        in_count <= 0;
+                        cmd <= CMD_NOP;
+                    end
+                    else if (cmd == CMD_SNIFFCTL) begin
+                        // -----------------------------------------------
+                        // SNIFFCTL protocol:
+                        //   Byte 1: 0x01 = enter log-only mode, 0x00 = leave
+                        // Response: 0x01, or REPLY_REFUSED while emulation
+                        // runs (spi_trx must see a stable mode) or when
+                        // entering with #HOLD asserted.
+                        // -----------------------------------------------
+                        txd_strobe_buf <= 1;
+                        if (spi_run_requested || (rxd_data_buf[0] && hold_out))
+                            txd_data_buf <= REPLY_REFUSED;
+                        else begin
+                            log_only <= rxd_data_buf[0];
+                            txd_data_buf <= 8'h01;
+                        end
                         in_count <= 0;
                         cmd <= CMD_NOP;
                     end
