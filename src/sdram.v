@@ -171,6 +171,9 @@ module sdram(
     reg initrefreshcount;
     reg [4:0] cmdcount;
     reg [4:0] cmdtarget;
+    // Predict the wait predicate when count/target change. The registered
+    // flag keeps the variable comparison out of the DQ output-register CE.
+    reg cmd_wait;
     reg [REFRESH_BITS-1:0] refreshcount;
     
     // Track which chip we're refreshing (alternate between chips)
@@ -306,6 +309,7 @@ module sdram(
             initrefreshcount <= 0;
             cmdcount <= 0;
             cmdtarget <= 0;
+            cmd_wait <= 0;
             refreshcount <= 0;
             refresh_due <= 0;
             hard_refresh_due <= 0;
@@ -438,6 +442,7 @@ module sdram(
                     state <= STA_INIT_PRECHARGE;
                     cmdcount <= 1;
                     cmdtarget <= tRP;
+                    cmd_wait <= tRP > 1;
 
                     cs_o <= 0;       // Chip 0 (CS LOW)
                     ras_o <= 0;
@@ -454,7 +459,7 @@ module sdram(
                     we_o <= 1;
                 end
             end
-            else if ((state != STA_IDLE) && (cmdcount < cmdtarget)) begin
+            else if ((state != STA_IDLE) && cmd_wait) begin
                 // Waiting for command to complete
                 // Issue NOP
                 ras_o <= 1;
@@ -486,14 +491,18 @@ module sdram(
                 end
 
                 cmdcount <= cmdcount + 1;
+                cmd_wait <= (cmdcount + 5'd1) < cmdtarget;
             end
             else begin
-                // No command running, determine next command
+                // No command running, determine next command. Repeated init
+                // refreshes reuse the target; new commands override below.
                 cmdcount <= 1;
+                cmd_wait <= cmdtarget > 1;
 
                 if (state == STA_INIT_PRECHARGE) begin
                     state <= STA_INIT_REFRESH;
                     cmdtarget <= tRC;
+                    cmd_wait <= tRC > 1;
                     initrefreshcount <= 0;
 
                     // REFRESH command (chip 0)
@@ -506,6 +515,7 @@ module sdram(
                     if (initrefreshcount == 1) begin
                         state <= STA_SETMODE;
                         cmdtarget <= tMRD;
+                        cmd_wait <= tMRD > 1;
                         refreshcount <= 1;
 
                         // MODE REGISTER SET (chip 0)
@@ -538,6 +548,7 @@ module sdram(
                     state <= STA_INIT_CHIP2;
                     cmdcount <= 1;
                     cmdtarget <= tRP;
+                    cmd_wait <= tRP > 1;
 
                     // PRECHARGE all banks on chip 1
                     cs_o <= 1;       // Chip 1 (CS HIGH)
@@ -552,6 +563,7 @@ module sdram(
                     // Precharge done for chip 1, do refresh
                     state <= STA_INIT_REFRESH2;
                     cmdtarget <= tRC;
+                    cmd_wait <= tRC > 1;
                     initrefreshcount <= 0;
 
                     // REFRESH command (chip 1)
@@ -564,6 +576,7 @@ module sdram(
                     if (initrefreshcount == 1) begin
                         state <= STA_SETMODE2;
                         cmdtarget <= tMRD;
+                        cmd_wait <= tMRD > 1;
 
                         // MODE REGISTER SET (chip 1)
                         cs_o <= 1;
@@ -615,6 +628,7 @@ module sdram(
                     // Chip 0 refreshed, now refresh chip 1.
                     state <= STA_REFRESH2;
                     cmdtarget <= tRC;
+                    cmd_wait <= tRC > 1;
 
                     cs_o <= 1;       // Chip 1
                     ras_o <= 0;
@@ -629,6 +643,7 @@ module sdram(
                     refresh_chip <= 0;
                     state <= STA_IDLE;
                     cmdtarget <= 1;
+                    cmd_wait <= 0;
                     ras_o <= 1;
                     cas_o <= 1;
                     we_o <= 1;
@@ -639,6 +654,7 @@ module sdram(
                     // bank opened for this SPI request.
                     state <= STA_SPI_ABORT_PRECHARGE;
                     cmdtarget <= tRP;
+                    cmd_wait <= tRP > 1;
                     spi_activate_done <= 0;
 
                     cs_o <= spi_chip_sel;
@@ -653,6 +669,7 @@ module sdram(
                 else if (state == STA_SPI_ABORT_PRECHARGE) begin
                     state <= STA_IDLE;
                     cmdtarget <= 1;
+                    cmd_wait <= 0;
                     ras_o <= 1;
                     cas_o <= 1;
                     we_o <= 1;
@@ -664,6 +681,7 @@ module sdram(
                     spi_abort_pending <= 0;
                     state <= STA_SPI_ABORT_WAIT;
                     cmdtarget <= tRAS;
+                    cmd_wait <= tRAS > 1;
                     ras_o <= 1;
                     cas_o <= 1;
                     we_o <= 1;
@@ -675,6 +693,7 @@ module sdram(
                     // Close the row, refresh, then replay the held ACTIVATE.
                     state <= STA_SPI_ABORT_WAIT;
                     cmdtarget <= tRAS;
+                    cmd_wait <= tRAS > 1;
                     spi_cmd_activate_ack <= 0;
                     spi_act_armed <= 1;
                     ras_o <= 1;
@@ -686,6 +705,7 @@ module sdram(
                          (!spi_activate_done || spi_cmd_read_ack)) begin
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;
+                    cmd_wait <= tRC > 1;
                     refreshcount <= refreshcount - REFRESH_PERIOD + 1'b1;
                     refresh_due <= refreshcount >= REFRESH_HARD_PRE;
                     hard_refresh_due <= {1'b0, refreshcount} >= REFRESH_BACKLOG_PRE;
@@ -700,6 +720,7 @@ module sdram(
                     // SPI fast-path activate
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
+                    cmd_wait <= tRCD > 1;
                     spi_cmd_activate_ack <= 1;
                     spi_activate_done <= 1;
                     spi_addr_latched <= spi_addr;
@@ -728,6 +749,7 @@ module sdram(
                     // SPI fast-path read
                     state <= STA_READ;
                     cmdtarget <= tREAD;
+                    cmd_wait <= tREAD > 1;
                     read_busy <= 1;
                     spi_cmd_read_ack <= 1;
                     spi_read_armed <= 0;
@@ -756,6 +778,7 @@ module sdram(
                     serial_row_open <= 1;
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
+                    cmd_wait <= tRCD > 1;
 
                     // ACTIVATE command
                     cs_o <= access_chip_sel;
@@ -772,6 +795,7 @@ module sdram(
                     serial_row_open <= 0;
                     state <= STA_READ;
                     cmdtarget <= tREAD + 2;
+                    cmd_wait <= (tREAD + 5'd2) > 1;
                     read_busy <= 1;
                     serial_read_active <= 1;
                     read_valid_a <= 0;
@@ -795,6 +819,7 @@ module sdram(
                     serial_row_open <= 0;
                     state <= STA_WRITE;
                     cmdtarget <= tWRITE;
+                    cmd_wait <= tWRITE > 1;
                     wrbuf_read_ptr <= 1;
 
                     // WRITE command with auto-precharge
@@ -816,6 +841,7 @@ module sdram(
                     // Auto refresh - alternate between chips
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;
+                    cmd_wait <= tRC > 1;
                     // Pay one period, retaining overdue time. Resetting
                     // here halves the nominal rate under sustained inhibit.
                     refreshcount <= refreshcount - REFRESH_PERIOD + 1'b1;
@@ -832,6 +858,7 @@ module sdram(
                 else begin
                     state <= STA_IDLE;
                     cmdtarget <= 1;  // Dispatch runs every cycle when idle
+                    cmd_wait <= 0;
                     ras_o <= 1;
                     cas_o <= 1;
                     we_o <= 1;

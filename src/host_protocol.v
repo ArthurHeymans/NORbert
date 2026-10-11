@@ -74,6 +74,12 @@ module host_protocol(
     output reg [23:0] cfg_jedec_id,
     output reg cfg_4byte,
     output reg [22:0] cfg_chip_erase_bursts,
+    output wire [459:0] cfg_profile,
+    output wire cfg_erase_wren,
+    output wire [4:0] cfg_erase_waddr,
+    output wire [49:0] cfg_erase_wdata,
+    output reg cfg_profile_valid,
+    output reg [31:0] cfg_profile_epoch,
     
     // SFDP table read interface (for spi_trx)
     input wire spi_clk,              // SPI clock: read-port clock for the SFDP BSRAM
@@ -216,15 +222,15 @@ module host_protocol(
     // Latched when a command byte arrives while idle.
     reg active_port;
 
-    wire cmd_idle = (cmd == CMD_NOP) && (in_count == 0) &&
+    reg stop_ack_pending;
+    wire cmd_idle = !stop_ack_pending && (cmd == CMD_NOP) && (in_count == 0) &&
                     (read_state == 3'd0) && (write_state == 3'd0) &&
                     (log_poll_state == 0);
     wire mux_txd_ready = active_port ? ft_txd_ready : txd_ready;
 
-    // SDRAM gate: SDRAM/configuration commands only proceed while the SPI
-    // bus is idle and the program engine does not own SDRAM. When
-    // spi_running=0, top.v forces this module's spi_reset input high so
-    // this gate collapses to just !spi_writing.
+    // SDRAM/configuration commands wait while SPI or accepted program work
+    // owns RAM. With SPI stopped the gate reduces to !spi_writing; STOP may
+    // still be draining accepted work while cancelling uncommitted commands.
     wire serial_gate = (spi_reset || spi_csel_buf[1]) && !spi_writing;
 
     // Commands that never touch SDRAM, chip configuration or spi_trx state.
@@ -322,6 +328,95 @@ module host_protocol(
     // CHIPCONFIG state
     reg [6:0] sfdp_wr_pos;
     reg [7:0] cfg_sfdp_remaining;
+    reg profile_incomplete;
+    reg profile_check_active;
+    reg [2:0] profile_check_index = 0;
+    reg profile_header_good;
+    reg profile_start, profile_byte_valid;
+    reg [7:0] profile_byte_data;
+    wire profile_done, profile_bad;
+    wire [26:0] profile_capacity = {1'b0, cfg_chip_erase_bursts, 3'b000} + 27'd8;
+    chip_profile_store profile_store(
+        .clk(clk), .reset(reset), .start(profile_start),
+        .byte_valid(profile_byte_valid), .byte_data(profile_byte_data),
+        .capacity(profile_capacity), .profile(cfg_profile),
+        .done(profile_done), .bad(profile_bad), .erase_wren(cfg_erase_wren),
+        .erase_waddr(cfg_erase_waddr), .erase_wdata(cfg_erase_wdata)
+    );
+
+    // Fixed commands must never be reinterpreted as addressed erasers.
+    function profile_reserved_opcode;
+        input [7:0] opcode;
+        begin
+            case (opcode)
+                8'h00,8'hff,8'h01,8'h02,8'h03,8'h04,8'h05,8'h06,
+                8'h0b,8'h0c,8'h12,8'h13,8'h15,8'h16,8'h17,8'h31,
+                8'h35,8'h36,8'h39,8'h3b,8'h3c,8'h42,8'h4b,8'h5a,
+                8'h60,8'h62,8'h66,8'h6b,8'h6c,8'h72,8'h98,8'h99,
+                8'h9e,8'h9f,8'had,8'hb7,8'hbb,8'hbc,8'hc5,8'hc7,
+                8'hc8,8'he9,8'heb,8'hec,8'h11,8'h32,8'h34,8'h38: profile_reserved_opcode = 1;
+                default: profile_reserved_opcode = 0;
+            endcase
+        end
+    endfunction
+    function profile_header_valid;
+        input [459:0] p;
+        begin
+            profile_header_valid = p[7:0] == 2 && p[15:8] <= 5 && p[15:8] != 1 && p[231:224] <= 8 &&
+                p[255:232] == 0 && p[127:120] == 0 && p[55:48] == 0 && p[223:200] == 0 &&
+                (p[103:96] & (p[23:16] | p[63:56] | 8'h83)) == 0 &&
+                ((p[23:16] | p[63:56]) & 8'h03) == 0 &&
+                (cfg_jedec_id[7:0] == 8'hc2 || (p[111:104] & 8'h41) == 0) &&
+                !p[79] && p[87:85] == 0 && p[199:195] == 0 && profile_capacity >= 27'd256 &&
+                (profile_capacity & (profile_capacity - 1'b1)) == 0;
+        end
+    endfunction
+    // Select fixed slices explicitly. Multiplying a variable descriptor
+    // index by three for the count slice inferred a DSP on the ACK path.
+    reg [18:0] profile_check_descriptor;
+    reg [2:0] profile_previous_mask;
+    always @* begin
+        profile_check_descriptor = 0;
+        profile_previous_mask = 0;
+        case (profile_check_index)
+            1: profile_check_descriptor = {cfg_profile[322:320],cfg_profile[271:256]};
+            2: begin
+                profile_check_descriptor = {cfg_profile[325:323],cfg_profile[287:272]};
+                profile_previous_mask = 3'b001;
+            end
+            3: begin
+                profile_check_descriptor = {cfg_profile[328:326],cfg_profile[303:288]};
+                profile_previous_mask = 3'b011;
+            end
+            4: begin
+                profile_check_descriptor = {cfg_profile[331:329],cfg_profile[319:304]};
+                profile_previous_mask = 3'b111;
+            end
+        endcase
+    end
+    // Validate one descriptor per clock; all previous-opcode slices are
+    // constant at elaboration, including cross regular/native collisions.
+    function profile_descriptor_valid;
+        input [18:0] descriptor_data;
+        input [63:0] opcodes;
+        input [2:0] previous_mask;
+        integer previous;
+        reg [7:0] op, native_op;
+        begin
+            op = descriptor_data[7:0]; native_op = descriptor_data[15:8];
+            profile_descriptor_valid = 1;
+            if (descriptor_data[18:16] == 0) begin
+                if (op != 0 || native_op != 0) profile_descriptor_valid = 0;
+            end else begin
+                if (profile_reserved_opcode(op) || (native_op != 0 && profile_reserved_opcode(native_op)) ||
+                    op == native_op) profile_descriptor_valid = 0;
+                for (previous=0; previous<3; previous=previous+1)
+                    if (previous_mask[previous] && (op == opcodes[previous*16 +:8] || op == opcodes[previous*16+8 +:8] ||
+                        (native_op != 0 && (native_op == opcodes[previous*16 +:8] || native_op == opcodes[previous*16+8 +:8]))))
+                        profile_descriptor_valid = 0;
+            end
+        end
+    endfunction
     
     // TOCTOU trap table (4 entries)
     reg [23:0] trap_start [0:3];     // Byte address match value, pre-masked at SET
@@ -426,6 +521,11 @@ module host_protocol(
             
             cfg_jedec_id <= {8'h17, 8'h40, 8'hEF};  // Default: W25Q64FV (EF 40 17)
             cfg_4byte <= 0;
+            profile_start <= 0; profile_byte_valid <= 0; profile_byte_data <= 0;
+            cfg_profile_valid <= 0;
+            cfg_profile_epoch <= 0;
+            profile_incomplete <= 0;
+            profile_check_active <= 0;
             cfg_chip_erase_bursts <= 23'h0FFFFF;     // 8MB = 1M bursts - 1
             sfdp_wr_pos <= 0;
             cfg_sfdp_remaining <= 0;
@@ -434,6 +534,7 @@ module host_protocol(
             // reach the FPGA regardless of target-board state; the host
             // tool sends START explicitly after loading firmware.
             spi_run_requested <= 0;
+            stop_ack_pending <= 0;
 
             for (i = 0; i < 4; i = i + 1) begin
                 trap_start[i] <= 0;
@@ -452,6 +553,7 @@ module host_protocol(
             txd_strobe_buf <= 0;
             log_fifo_read_strobe <= 0;
             sfdp_wren <= 0;
+            profile_start <= 0; profile_byte_valid <= 0;
 
             // TX pipeline cooldown
             if (txd_strobe_buf)
@@ -484,10 +586,37 @@ module host_protocol(
                 if (cmd_idle) active_port <= 0;
             end
 
+            // STOP is a drain barrier, not merely a pin-disable ACK. Do not
+            // let the host load RAM while accepted SPI work still owns it.
+            if (stop_ack_pending && spi_reset && !spi_writing && pp_init_done && can_send) begin
+                stop_ack_pending <= 0; txd_strobe_buf <= 1; txd_data_buf <= 8'h01;
+            end
+
             // Boot-time START is acknowledged at the final committed scrub.
             if (!pp_init_done && pp_init_finishing && spi_run_requested) begin
                 txd_strobe_buf <= 1;
                 txd_data_buf <= 8'h01;
+            end
+
+            // The streaming compiler waits for the final RAM write before
+            // completing. Publish only after geometry and header validation.
+            if (!profile_check_active) profile_check_index <= 0;
+            else if (profile_done) begin
+                if (profile_check_index == 0) begin
+                    profile_header_good <= profile_header_valid(cfg_profile);
+                    profile_check_index <= 1;
+                end else if (profile_check_index < 5) begin
+                    profile_header_good <= profile_header_good &&
+                        profile_descriptor_valid(profile_check_descriptor,cfg_profile[319:256],profile_previous_mask);
+                    profile_check_index <= profile_check_index + 1'b1;
+                end else if (can_send) begin
+                    cfg_profile_valid <= !profile_bad && profile_header_good;
+                    profile_incomplete <= profile_bad || !profile_header_good;
+                    if (!profile_bad && profile_header_good) cfg_profile_epoch <= cfg_profile_epoch + 1'b1;
+                    txd_strobe_buf <= 1;
+                    txd_data_buf <= (profile_bad || !profile_header_good) ? 8'h02 : 8'h01;
+                    profile_check_active <= 0; cmd <= CMD_NOP; in_count <= 0;
+                end
             end
 
             // CHIPCONFIG owns the SFDP write port.
@@ -605,6 +734,10 @@ module host_protocol(
                 if (serial_idle_expired) begin
                     in_count <= 0;
                     cmd <= CMD_NOP;
+                    if (cmd == CMD_CHIPPROFILE) begin
+                        profile_check_active <= 0; cfg_profile_valid <= 0;
+                        profile_incomplete <= 1;
+                    end
                 end
             end
             else begin
@@ -630,19 +763,18 @@ module host_protocol(
                     txd_data_buf <= VERSION;
                 end
                 CMD_START: begin
-                    spi_run_requested <= 1;
+                    spi_run_requested <= !profile_incomplete;
                     // The init completion path replies to an earlier START.
                     // Include this edge's final write to avoid losing an
                     // ACK when START coincides with initialization completion.
-                    if (pp_init_done || pp_init_finishing) begin
+                    if (profile_incomplete || pp_init_done || pp_init_finishing) begin
                         txd_strobe_buf <= 1;
-                        txd_data_buf <= 8'h01;
+                        txd_data_buf <= profile_incomplete ? 8'h02 : 8'h01;
                     end
                 end
                 CMD_STOP: begin
                     spi_run_requested <= 0;
-                    txd_strobe_buf <= 1;
-                    txd_data_buf <= 8'h01;
+                    stop_ack_pending <= 1;
                 end
                 CMD_STATUS: begin
                     txd_strobe_buf <= 1;
@@ -778,8 +910,26 @@ module host_protocol(
                             else if (rxd_data_buf == CMD_CHIPCONFIG) begin
                                 cmd <= CMD_CHIPCONFIG;
                                 in_count <= 1;
+                                cfg_profile_valid <= 0;
+                                profile_incomplete <= 1;
+                            end
+                            else if (rxd_data_buf == CMD_CHIPPROFILE) begin
+                                cmd <= CMD_CHIPPROFILE;
+                                in_count <= 1;
+                                profile_start <= 1;
+                                cfg_profile_valid <= 0;
+                                profile_incomplete <= 1;
                             end
                         end
+                    end
+                    else if (cmd == CMD_CHIPPROFILE && !profile_check_active) begin
+                        // Configuration is inaccessible to SPI until the full
+                        // fixed-size payload has arrived. A timeout keeps START
+                        // blocked instead of enabling a partially loaded chip.
+                        profile_byte_valid <= 1;
+                        profile_byte_data <= rxd_data_buf;
+                        if (in_count == 8'd128) profile_check_active <= 1;
+                        else in_count <= in_count + 1'b1;
                     end
                     else if (cmd == CMD_CHIPCONFIG) begin
                         // -----------------------------------------------
@@ -833,6 +983,7 @@ module host_protocol(
                         // Advance or finish
                         if (in_count == 8'd8 && rxd_data_buf == 0) begin
                             // No SFDP data, done immediately
+                            profile_incomplete <= 0;
                             txd_strobe_buf <= 1;
                             txd_data_buf <= 8'h01;
                             in_count <= 0;
@@ -840,6 +991,7 @@ module host_protocol(
                         end
                         else if (in_count > 8'd8 && cfg_sfdp_remaining == 8'd1) begin
                             // Last SFDP byte received, done
+                            profile_incomplete <= 0;
                             txd_strobe_buf <= 1;
                             txd_data_buf <= 8'h01;
                             in_count <= 0;

@@ -1,0 +1,13 @@
+[package]
+name = "norbert-rflasher-integration"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+rflasher-core = { git = "https://github.com/ArthurHeymans/rflasher", rev = "54c4a43981f68bd0ec498bb2471b107b3eb47266", features = ["std"] }
+rflasher-chips = { git = "https://github.com/ArthurHeymans/rflasher", rev = "54c4a43981f68bd0ec498bb2471b107b3eb47266", features = ["static-chips"] }
+futures-lite = "2"

@@ -455,6 +455,41 @@ impl FlashDevice {
         Ok(())
     }
 
+    /// Controller-compatible configuration validates all metadata before any transport I/O.
+    /// Configuration failures intentionally leave emulation stopped.
+    pub(crate) async fn configure_chip(
+        &mut self,
+        chip: &crate::chip::FlashChip,
+        state: crate::profile::ChipState,
+    ) -> Result<()> {
+        let profile = crate::profile::ChipProfile::build(chip, state)?;
+        let sfdp = crate::sfdp::generate_sfdp(chip)?;
+        self.require_capability("chip profiles (requires protocol 9)", |c| {
+            supports_chip_profile(c.version)
+        })
+        .await?;
+        let was_running = self.prepare_stopped().await?;
+        use crate::chip::FlashChipExt;
+        let mut jedec = chip.jedec_id_bytes();
+        // Opcode 15 returns manufacturer + the legacy one-byte device ID.
+        if profile.as_bytes()[11] & 64 != 0 {
+            jedec[1] = chip.jedec_device as u8;
+            jedec[2] = 0;
+        }
+        self.configure_raw(jedec, chip.total_size, chip.supports_4byte(), &sfdp)
+            .await?;
+        let mut request = Vec::with_capacity(129);
+        request.push(CMD_CHIPPROFILE);
+        request.extend_from_slice(profile.as_bytes());
+        self.transport.write_all(&request).await?;
+        self.expect_ack("chip profile").await?;
+        if was_running {
+            self.start_emulation().await?;
+        }
+        Ok(())
+    }
+
+    /// Explicit legacy/generic configuration, without chip-specific guarantees.
     pub(crate) async fn configure(
         &mut self,
         jedec_id: [u8; 3],
@@ -910,5 +945,188 @@ mod tests {
 
         assert!(error.contains("cancelled by test"));
         assert_eq!(writes.borrow().last(), Some(&vec![CMD_START]));
+    }
+    fn catalog_chip() -> crate::chip::FlashChip {
+        crate::chip::find_chip_by_name(&crate::chip::ChipDatabase::new(), "W25Q128.V")
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn bad_profiles_are_rejected_before_even_version_or_status_io() {
+        for mutation in 0..7 {
+            let mut chip = catalog_chip();
+            match mutation {
+                0 => chip.total_size = 384,
+                1 => chip.total_size = 128 * 1024 * 1024,
+                2 => chip.page_size = 512,
+                3 => chip.erase_blocks[0].regions[0].count -= 1,
+                4 => chip.page_size = 0,
+                5 => {
+                    chip.erase_blocks = (0xd0..=0xd4)
+                        .map(|op| crate::chip::EraseBlock::with_count(op, 4096, 4096))
+                        .collect()
+                }
+                _ => {
+                    chip.unlock = rflasher_chips::Unlock::None;
+                    chip.features = crate::chip::Features::empty();
+                    chip.total_size = 4 * 1024 * 1024;
+                    chip.erase_blocks = vec![crate::chip::EraseBlock::with_regions(
+                        0xd0,
+                        &[
+                            rflasher_chips::EraseRegion::new(4096, 1),
+                            rflasher_chips::EraseRegion::new(65536, 63),
+                            rflasher_chips::EraseRegion::new(4096, 15),
+                        ],
+                    )];
+                }
+            }
+            let (transport, writes) = MockTransport::new([]);
+            let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, None).unwrap();
+            assert!(
+                device
+                    .configure_chip(&chip, crate::profile::ChipState::default())
+                    .is_err()
+            );
+            assert!(writes.borrow().is_empty(), "mutation {mutation}");
+        }
+        let (transport, writes) = MockTransport::new([]);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, None).unwrap();
+        assert!(
+            device
+                .configure_chip(
+                    &catalog_chip(),
+                    crate::profile::ChipState {
+                        sr1: Some(3),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        assert!(writes.borrow().is_empty());
+        let (transport, writes) = MockTransport::new([]);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, None).unwrap();
+        let error = device
+            .configure_chip(
+                &catalog_chip(),
+                crate::profile::ChipState {
+                    protected: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never enforces protection"));
+        assert!(writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn profile_requires_v9_before_stop_and_leaves_failed_configuration_stopped() {
+        let chip = catalog_chip();
+        let (transport, writes) = MockTransport::new([]);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, Some(8)).unwrap();
+        assert!(
+            device
+                .configure_chip(&chip, crate::profile::ChipState::default())
+                .is_err()
+        );
+        assert!(writes.borrow().is_empty());
+        let (transport, writes) = MockTransport::new([8]);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, None).unwrap();
+        assert!(
+            device
+                .configure_chip(&chip, crate::profile::ChipState::default())
+                .is_err()
+        );
+        assert_eq!(*writes.borrow(), vec![vec![CMD_VERSION]]);
+        // Initially running, STOP succeeds, CHIPCONFIG succeeds, profile NAK.
+        let (transport, writes) = MockTransport::new([1, 1, 1, 2]);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, Some(9)).unwrap();
+        assert!(
+            device
+                .configure_chip(&chip, crate::profile::ChipState::default())
+                .unwrap_err()
+                .to_string()
+                .contains("chip profile")
+        );
+        let sent = writes.borrow();
+        assert_eq!(
+            sent.iter().map(|packet| packet[0]).collect::<Vec<_>>(),
+            [CMD_STATUS, CMD_STOP, CMD_CHIPCONFIG, CMD_CHIPPROFILE]
+        );
+        assert_eq!(sent[3].len(), 129);
+        // CHIPCONFIG NAK also must not resume generic emulation.
+        let (transport, writes) = MockTransport::new([1, 1, 2]);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, Some(9)).unwrap();
+        assert!(
+            device
+                .configure_chip(&chip, crate::profile::ChipState::default())
+                .is_err()
+        );
+        assert_eq!(writes.borrow().last().unwrap()[0], CMD_CHIPCONFIG);
+    }
+
+    #[test]
+    fn successful_profile_configures_in_order_then_resumes_only_if_running() {
+        for (status, expected_commands) in [
+            (
+                1,
+                vec![
+                    CMD_STATUS,
+                    CMD_STOP,
+                    CMD_CHIPCONFIG,
+                    CMD_CHIPPROFILE,
+                    CMD_START,
+                ],
+            ),
+            (2, vec![CMD_STATUS, CMD_CHIPCONFIG, CMD_CHIPPROFILE]),
+        ] {
+            let (transport, writes) = MockTransport::new([status, 1, 1, 1, 1]);
+            let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, Some(9)).unwrap();
+            device
+                .configure_chip(&catalog_chip(), crate::profile::ChipState::default())
+                .unwrap();
+            let sent = writes.borrow();
+            assert_eq!(
+                sent.iter().map(|packet| packet[0]).collect::<Vec<_>>(),
+                expected_commands
+            );
+            let payload = sent.iter().find(|p| p[0] == CMD_CHIPPROFILE).unwrap();
+            assert_eq!(
+                &payload[1..],
+                include_bytes!("../tests/fixtures/w25q128-v.profile")
+            );
+        }
+    }
+
+    #[test]
+    fn generic_configuration_stays_available_and_legacy_id_uses_type_byte() {
+        let (transport, writes) = MockTransport::new([2, 1]);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, Some(7)).unwrap();
+        device
+            .configure([0xef, 0x40, 0x18], 16 * 1024 * 1024, false, &[])
+            .unwrap();
+        assert_eq!(writes.borrow().len(), 2);
+        assert_eq!(writes.borrow()[1][0], CMD_CHIPCONFIG);
+        let at = crate::chip::find_chip_by_name(&crate::chip::ChipDatabase::new(), "AT25F512")
+            .unwrap()
+            .clone();
+        let (transport, writes) = MockTransport::new([2, 1, 1]);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, Some(9)).unwrap();
+        device
+            .configure_chip(&at, crate::profile::ChipState::default())
+            .unwrap();
+        assert_eq!(&writes.borrow()[1][1..4], &[0x1f, 0x60, 0]);
+    }
+    #[test]
+    fn incomplete_profile_ack_never_restarts_emulation() {
+        let (transport, writes) = MockTransport::new([1, 1, 1]);
+        let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, Some(9)).unwrap();
+        assert!(
+            device
+                .configure_chip(&catalog_chip(), crate::profile::ChipState::default())
+                .is_err()
+        );
+        assert_eq!(writes.borrow().last().unwrap()[0], CMD_CHIPPROFILE);
     }
 }

@@ -252,6 +252,12 @@ module top(
     wire [23:0] cfg_jedec_id;
     wire cfg_4byte;
     wire [22:0] cfg_chip_erase_bursts;
+    wire [459:0] cfg_profile;
+    wire cfg_erase_wren;
+    wire [4:0] cfg_erase_waddr;
+    wire [49:0] cfg_erase_wdata;
+    wire cfg_profile_valid;
+    wire [31:0] cfg_profile_epoch;
     
     // SFDP table read interface (spi_trx -> glue -> spi_trx)
     wire [6:0] sfdp_raddr;
@@ -306,10 +312,14 @@ module top(
         .write_buf_strobe(spi_write_buf_strobe),
         .write_buf_offset(spi_write_buf_offset),
         .write_buf_val(spi_write_buf_val),
+        .cfg_erase_wren(cfg_erase_wren), .cfg_erase_waddr(cfg_erase_waddr),
+        .cfg_erase_wdata(cfg_erase_wdata),
         
         .cfg_jedec_id(cfg_jedec_id),
         .cfg_4byte(cfg_4byte),
         .cfg_chip_erase_bursts(cfg_chip_erase_bursts),
+        .cfg_profile(cfg_profile), .cfg_profile_valid(cfg_profile_valid),
+        .cfg_profile_epoch(cfg_profile_epoch),
         
         .sfdp_raddr(sfdp_raddr),
         .sfdp_rdata(sfdp_rdata),
@@ -617,10 +627,14 @@ module top(
         .spi_write_buf_strobe(spi_write_buf_strobe),
         .spi_write_buf_offset(spi_write_buf_offset),
         .spi_write_buf_val(spi_write_buf_val),
+        .cfg_erase_wren(cfg_erase_wren), .cfg_erase_waddr(cfg_erase_waddr),
+        .cfg_erase_wdata(cfg_erase_wdata),
         
         .cfg_jedec_id(cfg_jedec_id),
         .cfg_4byte(cfg_4byte),
         .cfg_chip_erase_bursts(cfg_chip_erase_bursts),
+        .cfg_profile(cfg_profile), .cfg_profile_valid(cfg_profile_valid),
+        .cfg_profile_epoch(cfg_profile_epoch),
         
         .sfdp_raddr(sfdp_raddr),
         .sfdp_rdata(sfdp_rdata),

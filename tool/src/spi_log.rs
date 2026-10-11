@@ -23,12 +23,30 @@ pub fn opcode_name(opcode: u8) -> &'static str {
         0x0C => "FAST_READ_4B",
         0x12 => "PAGE_PROGRAM_4B",
         0x13 => "READ_4B",
+        0x15 => "READ_SR3/ATMEL_ID",
+        0x16 => "READ_BANK",
+        0x17 => "WRITE_BANK",
+        0x31 => "WRITE_STATUS2",
+        0x36 => "SECTOR_PROTECT",
+        0x39 => "SECTOR_UNPROTECT",
+        0x42 => "WRITE_BPR",
+        0x4B => "READ_UID",
+        0x62 => "CHIP_ERASE_AT25F",
+        0x66 => "RESET_ENABLE",
+        0x72 => "READ_BPR",
+        0x81 => "ERASE_256B",
+        0x98 => "UNLOCK_BPR",
+        0x99 => "RESET",
+        0xC5 => "WRITE_EAR",
+        0xC8 => "READ_EAR",
+        0xD7 => "ERASE_D7",
+        0xDB => "ERASE_DB",
         0x20 => "SECTOR_ERASE_4K",
         0x21 => "SECTOR_ERASE_4K_4B",
         0x35 => "READ_STATUS2",
         0x3B => "DUAL_READ",
-        0x3C => "DUAL_READ_4B",
-        0x50 => "EWSR",
+        0x3C => "DUAL4B/ATMEL_SPR",
+        0x50 => "EWSR/ERASE_2K",
         0x52 => "BLOCK_ERASE_32K",
         0x5A => "READ_SFDP",
         0x5C => "BLOCK_ERASE_32K_4B",
@@ -49,7 +67,8 @@ pub fn opcode_name(opcode: u8) -> &'static str {
     }
 }
 
-/// Opcodes that read the flash array or SFDP table.
+/// Opcodes that read the flash array or SFDP table in the generic command map.
+/// 3C is ambiguous on At2x profiles; raw activity logs carry no profile metadata.
 pub fn is_read_opcode(opcode: u8) -> bool {
     matches!(
         opcode,

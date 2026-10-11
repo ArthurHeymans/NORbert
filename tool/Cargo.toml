@@ -47,7 +47,7 @@ eframe = { version = "0.29", optional = true, default-features = false, features
 egui = { version = "0.29", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 tracing-wasm = { version = "0.2", optional = true }
-rflasher-chips = { git = "https://github.com/ArthurHeymans/rflasher.git", rev = "1879f3819cb4f3d9fde76447198346cae3e2b40d", features = ["static-chips"], optional = true }
+rflasher-chips = { git = "https://github.com/ArthurHeymans/rflasher.git", rev = "54c4a43981f68bd0ec498bb2471b107b3eb47266", features = ["static-chips"], optional = true }
 maybe-async = "0.2"
 web-time = "1.1"
 web-sys = { version = "0.3.104", optional = true, features = [
