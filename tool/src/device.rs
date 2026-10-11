@@ -1040,7 +1040,7 @@ mod tests {
         );
         assert_eq!(*writes.borrow(), vec![vec![CMD_VERSION]]);
         // Initially running, STOP succeeds, CHIPCONFIG succeeds, profile NAK.
-        let (transport, writes) = MockTransport::new([1, 1, 1, 2]);
+        let (transport, writes) = MockTransport::new([1, 1, 1, 2, 2]);
         let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, Some(9)).unwrap();
         assert!(
             device
@@ -1049,10 +1049,18 @@ mod tests {
                 .to_string()
                 .contains("chip profile")
         );
+        // The browser refreshes status even after configuration fails.
+        assert!(!device.status().unwrap());
         let sent = writes.borrow();
         assert_eq!(
             sent.iter().map(|packet| packet[0]).collect::<Vec<_>>(),
-            [CMD_STATUS, CMD_STOP, CMD_CHIPCONFIG, CMD_CHIPPROFILE]
+            [
+                CMD_STATUS,
+                CMD_STOP,
+                CMD_CHIPCONFIG,
+                CMD_CHIPPROFILE,
+                CMD_STATUS
+            ]
         );
         assert_eq!(sent[3].len(), 129);
         // CHIPCONFIG NAK also must not resume generic emulation.
@@ -1095,6 +1103,32 @@ mod tests {
             assert_eq!(
                 &payload[1..],
                 include_bytes!("../tests/fixtures/w25q128-v.profile")
+            );
+        }
+    }
+
+    #[test]
+    fn selected_catalog_entry_preserves_duplicate_name_identity() {
+        use crate::chip::FlashChipExt;
+        let db = crate::chip::ChipDatabase::new();
+        let chips: Vec<_> = db.iter().filter(|chip| chip.name == "XM25QU64A").collect();
+        assert_eq!(chips.len(), 2);
+        assert_ne!(chips[0].jedec_id_bytes(), chips[1].jedec_id_bytes());
+        for chip in chips {
+            let (transport, writes) = MockTransport::new([2, 1, 1]);
+            let mut device = FlashDevice::new(transport, ConnectionKind::Ft245, Some(9)).unwrap();
+            device
+                .configure_chip(chip, crate::profile::ChipState::default())
+                .unwrap();
+            let sent = writes.borrow();
+            assert_eq!(sent[1][0], CMD_CHIPCONFIG);
+            assert_eq!(&sent[1][1..4], &chip.jedec_id_bytes());
+            assert_eq!(sent[2][0], CMD_CHIPPROFILE);
+            assert_eq!(
+                &sent[2][1..],
+                crate::profile::ChipProfile::build(chip, crate::profile::ChipState::default())
+                    .unwrap()
+                    .as_bytes()
             );
         }
     }

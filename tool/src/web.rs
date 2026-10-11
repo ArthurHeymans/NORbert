@@ -711,22 +711,7 @@ impl WebFlashDevice {
     ) -> Result<(), JsValue> {
         let db = crate::chip::ChipDatabase::new();
         let chip = crate::chip::find_chip_by_name(&db, &chip_name).map_err(js_error)?;
-        let uid = uid
-            .as_deref()
-            .map(crate::profile::parse_uid)
-            .transpose()
-            .map_err(js_error)?;
-        self.inner
-            .configure_chip(
-                chip,
-                crate::profile::ChipState {
-                    protected,
-                    uid,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(js_error)
+        self.configure_selected_chip(chip, protected, uid).await
     }
 
     /// Explicit generic compatibility path; does not require protocol 9.
@@ -795,6 +780,31 @@ impl WebFlashDevice {
 // Rust-only methods for the egui front end: their types are not exported
 // to JavaScript, so they stay out of the #[wasm_bindgen] block.
 impl WebFlashDevice {
+    /// Configure the exact selected catalog entry, including duplicate names.
+    pub async fn configure_selected_chip(
+        &mut self,
+        chip: &crate::chip::FlashChip,
+        protected: Option<bool>,
+        uid: Option<String>,
+    ) -> Result<(), JsValue> {
+        let uid = uid
+            .as_deref()
+            .map(crate::profile::parse_uid)
+            .transpose()
+            .map_err(js_error)?;
+        self.inner
+            .configure_chip(
+                chip,
+                crate::profile::ChipState {
+                    protected,
+                    uid,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(js_error)
+    }
+
     /// Read and clear the sticky SDRAM prefetch fault flags.
     pub async fn prefetch_faults(&mut self) -> Result<PrefetchFaults, JsValue> {
         self.inner.prefetch_faults().await.map_err(js_error)
