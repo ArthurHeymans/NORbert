@@ -504,7 +504,7 @@ a USB stall within a data block is not mistaken for an abandoned command.
 `VERSION` reports protocol 9. The host tool talks to versions 3 through its
 own version and enables commands by capability, but refuses newer bitstreams
 rather than guessing their protocol. Catalog chip compatibility needs both a
-protocol9 bitstream and a matching tool; raw legacy configuration remains
+protocol 9 bitstream and a matching tool; raw legacy configuration remains
 available on older supported versions.
 
 | Opcode | Name       | Args                                                | Reply                            |
@@ -521,7 +521,7 @@ available on older supported versions.
 | `0x39` | TOCTOU     | sub-command + args (see below)                      | `0x01`                           |
 | `0x3A` | LOGPOLL    | none                                                | log bytes terminated by `0xA0`   |
 | `0x3B` | PREFETCH   | none                                                | 1 byte: `0x80` valid + `0x01` underrun + `0x02` thin |
-| `0x3C` | CHIPPROFILE | 128-byte format2 compatibility packet, while stopped | `0x01` accepted / `0x02` invalid |
+| `0x3C` | CHIPPROFILE | 128-byte format 2 compatibility packet, while stopped | `0x01` accepted / `0x02` invalid |
 
 A clean PREFETCH reply is `0x80` (not `0x00`, which the host discards as
 transport noise); `0x81`, `0x82` and `0x83` report faults. PREFETCH is a

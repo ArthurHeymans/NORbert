@@ -48,7 +48,7 @@ Core read/program/status opcode collisions are still rejected.
 
 Configured read latency changes framing, unlike protection bits. Micron VCR
 zero/F selects defaults: fast/output 8 clocks, dual-I/O 8, quad-I/O 10; other
-nibbles select their count. NVCR bits15:12 seed VCR and active-low bit0 seeds
+nibbles select their count. NVCR bits 15:12 seed VCR and active-low bit0 seeds
 four-byte mode on soft reset. Macronix Config[7:6] selects standard 4/6/8-clock
 waits. Spansion CR2 changes address length and supported latency, including
 code B/24 clocks. Multi-IO countdowns accommodate these longer phases.
@@ -81,7 +81,7 @@ CHIPCONFIG remains an explicit legacy/synthetic interface.
 ## Wire format and implementation
 
 CHIPCONFIG `33` is unchanged. CHIPPROFILE `3C` accepts exactly 128 bytes while
-stopped, now with **format 2** and **protocol 9**. Old format1 is rejected. ACK
+stopped, now with **format 2** and **protocol 9**. Old format 1 is rejected. ACK
 is `01` for success, `02` for invalid configuration; partial/timed-out/invalid
 configuration blocks START. The host validates before I/O, and FPGA independently
 validates structure/geometry before publishing, incrementing epoch or ACKing.

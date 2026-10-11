@@ -5,9 +5,8 @@ use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Function, Uint8Array};
 use spi_flash_tool::chip::{FlashChip, FlashChipExt};
 use spi_flash_tool::gowin::{self, FlashOptions, ProgramProgress};
-
 use spi_flash_tool::spi_log::{ActivityLog, HEADER};
-use spi_flash_tool::{PrefetchFaults, WebFlashDevice};
+use spi_flash_tool::{PrefetchFaults, WebFlashDevice, supports_chip_profile};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -369,24 +368,24 @@ impl NorbertWebApp {
         spawn_local(async move {
             let mut device = state.borrow_mut().device.take();
             let result = match device.as_mut() {
-                Some(device) => device.configure_chip(chip.name.clone(), None, uid).await,
+                Some(device) => {
+                    device
+                        .configure_selected_chip(chip.as_ref(), None, uid)
+                        .await
+                }
                 None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
             };
-            let running = if result.is_ok() {
-                match device.as_mut() {
-                    Some(device) => device.status().await.ok(),
-                    None => None,
-                }
-            } else {
-                None
+            let running = match device.as_mut() {
+                Some(device) => device.status().await.ok(),
+                None => None,
             };
             let mut shared = state.borrow_mut();
             shared.device = device;
             shared.busy = false;
+            shared.running = running;
             match result {
                 Ok(()) => {
                     shared.configured_chip = Some(chip.clone());
-                    shared.running = running;
                     shared.status = format!(
                         "Configured {} {} ({} MiB, JEDEC {:02X} {:04X})",
                         chip.vendor,
@@ -1049,6 +1048,10 @@ impl NorbertWebApp {
             ui.separator();
             ui.heading("Flash Chip");
             ui.label("Conventional SDR SPI NOR compatibility (requires protocol 9). Geometry limits are validated.");
+            let chip_profiles = version.is_some_and(supports_chip_profile);
+            if !chip_profiles {
+                ui.label("Chip selection unavailable on this bitstream; protocol 9 is required.");
+            }
             ui.label("Always unprotected; status/lock writes do not restrict array operations.");
             ui.horizontal(|ui| {
                 ui.label("UID (optional):");
@@ -1072,7 +1075,7 @@ impl NorbertWebApp {
                 },
             );
             let response = ui.add_enabled(
-                !busy && version.is_some_and(|v| v >= 8),
+                !busy && chip_profiles,
                 egui::Button::new(format!("{selected_text} ▼")).min_size(egui::vec2(500.0, 0.0)),
             );
             if response.clicked() {
