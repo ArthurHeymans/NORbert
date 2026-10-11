@@ -9,7 +9,7 @@
 
 use zerocopy::{Immutable, IntoBytes};
 
-pub const PROTOCOL_VERSION: u8 = 7;
+pub const PROTOCOL_VERSION: u8 = 9;
 
 /// Upper bound on how long the FPGA parser can stay inside an abandoned
 /// command before its idle timeout returns it to idle: about 35 ms inside a
@@ -73,6 +73,11 @@ pub const CMD_LOGCTL: u8 = 0x38;
 pub const CMD_TOCTOU: u8 = 0x39;
 pub const CMD_LOGPOLL: u8 = 0x3A;
 pub const CMD_PREFETCH: u8 = 0x3B;
+pub const CMD_CHIPPROFILE: u8 = 0x3C;
+
+pub const fn supports_chip_profile(version: u8) -> bool {
+    version >= 9
+}
 
 pub const PREFETCH_UNDERRUN: u8 = 0x01;
 pub const PREFETCH_THIN: u8 = 0x02;
@@ -344,6 +349,9 @@ mod tests {
         assert!(supports_toctou(5));
         assert!(!supports_prefetch_diagnostics(5));
         assert!(supports_prefetch_diagnostics(6));
+        assert!(!supports_chip_profile(7));
+        assert!(!supports_chip_profile(8));
+        assert!(supports_chip_profile(9));
     }
 
     #[test]

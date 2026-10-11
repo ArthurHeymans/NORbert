@@ -1,0 +1,7 @@
+{
+  "chip": "W25Q128.V",
+  "jedec": [239, 64, 24],
+  "capacity_bytes": 16777216,
+  "profile_hex": "w25q128-v.profile.hex",
+  "initial_state": "unprotected compatibility default"
+}

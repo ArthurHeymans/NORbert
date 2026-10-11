@@ -28,7 +28,7 @@ module sdram_controller_tb;
         .sdram_read_busy(read_busy), .sdram_inhibit_refresh(inhibit),
         .sdram_read_buffer(read_buffer), .sdram_write_buffer(write_buffer),
         .spi_reset(1'b0), .spi_csel(cs), .spi_cmd_write(command), .spi_write_type(kind),
-        .spi_write_addr(address), .spi_write_len(length), .spi_write_done(done),
+        .spi_write_addr(address), .spi_write_len(length), .spi_write_partial(1'b0), .spi_write_done(done),
         .spi_write_buf_strobe(strobe), .spi_write_buf_offset(offset), .spi_write_buf_val(value),
         .spi_clk(clk), .sfdp_raddr(7'b0),
         .log_fifo_data_available(1'b0), .log_fifo_read_data(8'b0),

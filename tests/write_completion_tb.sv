@@ -10,6 +10,8 @@ module write_completion_tb;
         .spi_io0_in(mosi), .spi_io1_in(1'b0), .spi_io2_in(1'b0), .spi_io3_in(1'b0),
         .spi_io1_out(miso), .spi_io1_oe(oe), .write_done(done),
         .cfg_jedec_id(24'h1740ef), .cfg_4byte(1'b0), .cfg_chip_erase_bursts(23'h0fffff),
+        .cfg_profile(460'b0), .cfg_profile_valid(1'b0), .cfg_profile_epoch(32'b0),
+        .cfg_erase_wren(1'b0), .cfg_erase_waddr(5'b0), .cfg_erase_wdata(50'b0),
         .sfdp_rdata(8'hff), .ram_read_buffer(64'b0), .ram_read_buffer_b(64'b0),
         .ram_read_valid_a(1'b0), .ram_read_valid_b(1'b0), .ram_read_busy(1'b0));
     task transfer(input [7:0] b, output [7:0] r);

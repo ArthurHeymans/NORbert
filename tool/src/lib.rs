@@ -10,6 +10,9 @@ pub mod chip;
 pub mod sfdp;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub mod profile;
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod gowin;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
@@ -30,7 +33,7 @@ mod protocol;
 mod web;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-pub use protocol::PrefetchFaults;
+pub use protocol::{PrefetchFaults, supports_chip_profile};
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub use web::WebFlashDevice;

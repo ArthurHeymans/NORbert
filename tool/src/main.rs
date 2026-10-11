@@ -2,6 +2,7 @@ mod chip;
 mod cli;
 mod commands;
 mod device;
+mod profile;
 mod protocol;
 #[cfg(test)]
 mod rtl_sync;

@@ -16,6 +16,7 @@ VERILOG_FILES = \
 	src/glue.v \
 	src/spi_program.v \
 	src/host_protocol.v \
+	src/chip_profile_store.v \
 	src/sdram_client_mux.v \
 	src/uart.v \
 	src/ft245.v \
@@ -27,6 +28,7 @@ VERILOG_FILES = \
 # Included by the sources above
 VERILOG_HEADERS = \
 	src/spi_flash_cmds.vh \
+	src/spi_chip_profile.vh \
 	src/host_protocol.vh
 
 # Constraints
@@ -107,7 +109,7 @@ lint-verilator:
 # width bug in the RTL it is exercising.
 test:
 	@set -eu; build=$$(mktemp -d); trap 'rm -rf "$$build"' EXIT; \
-	for test in spi_flash host_protocol top_io sdram_controller refresh sdram_protocol access_handshake write_completion prefetch_health toctou quad_fast fifo logger uart ft245; do \
+	for test in chip_profile spi_flash host_protocol top_io sdram_controller refresh sdram_protocol access_handshake write_completion prefetch_health toctou quad_fast fifo logger uart ft245; do \
 		echo "Testing $$test"; \
 		verilator --binary --timing -j 2 --top-module $${test}_tb -Isrc \
 			-Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD \
@@ -118,6 +120,10 @@ test:
 	done
 
 # The same testbenches against the Yosys GW5A netlist.
+.PHONY: test-rflasher
+test-rflasher:
+	$(MAKE) -C tests/rflasher test-rflasher
+
 test-gate:
 	tests/gate.sh
 

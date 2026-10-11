@@ -31,6 +31,12 @@ module glue(
     output wire [23:0] cfg_jedec_id,
     output wire cfg_4byte,
     output wire [22:0] cfg_chip_erase_bursts,
+    output wire [459:0] cfg_profile,
+    output wire cfg_erase_wren,
+    output wire [4:0] cfg_erase_waddr,
+    output wire [49:0] cfg_erase_wdata,
+    output wire cfg_profile_valid,
+    output wire [31:0] cfg_profile_epoch,
     input wire spi_clk,
     input wire [6:0] sfdp_raddr,
     output wire [7:0] sfdp_rdata,
@@ -49,6 +55,26 @@ module glue(
     output wire [7:0] led
 );
     wire spi_writing, pp_init_done, pp_init_finishing, program_allowed;
+    // STOP cancels commands that have not crossed CS. Already accepted
+    // array work drains first; serial_gate excludes it from host ownership.
+    // Re-arm only after observing the producer's command low, so a stale
+    // SPI-domain level cannot be replayed when START releases reset.
+    reg stop_seen, cancel_pending, program_armed;
+    reg [1:0] program_command_sync;
+    wire cancel_program = ((spi_reset && !stop_seen) || cancel_pending) && !spi_writing;
+    always @(posedge clk) begin
+        if (reset) begin
+            stop_seen <= 1; cancel_pending <= 0; program_armed <= 0;
+            program_command_sync <= 0;
+        end else begin
+            stop_seen <= spi_reset;
+            program_command_sync <= {program_command_sync[0], spi_cmd_write};
+            if (spi_reset && !stop_seen) cancel_pending <= 1;
+            if (cancel_program) cancel_pending <= 0;
+            if (spi_reset || cancel_pending || cancel_program) program_armed <= 0;
+            else if (!program_command_sync[1] && !spi_cmd_write) program_armed <= 1;
+        end
+    end
     wire [3:0] trap_triggered; // Observable TOCTOU state for integration benches
     wire [1:0] host_cmd, program_cmd;
     wire [24:0] host_addr, program_addr;
@@ -71,6 +97,10 @@ module glue(
         .program_allowed(program_allowed), .trap_triggered(trap_triggered),
         .cfg_jedec_id(cfg_jedec_id), .cfg_4byte(cfg_4byte),
         .cfg_chip_erase_bursts(cfg_chip_erase_bursts), .spi_clk(spi_clk),
+        .cfg_profile(cfg_profile), .cfg_profile_valid(cfg_profile_valid),
+        .cfg_profile_epoch(cfg_profile_epoch),
+        .cfg_erase_wren(cfg_erase_wren), .cfg_erase_waddr(cfg_erase_waddr),
+        .cfg_erase_wdata(cfg_erase_wdata),
         .sfdp_raddr(sfdp_raddr), .sfdp_rdata(sfdp_rdata), .spi_running(spi_running),
         .hold_out(hold_out), .log_active(log_active),
         .log_fifo_data_available(log_fifo_data_available), .log_fifo_read_data(log_fifo_read_data),
@@ -82,11 +112,11 @@ module glue(
         .trap_notify_strobe(trap_notify_strobe), .trap_notify_index(trap_notify_index),
         .trap_notify_addr(trap_notify_addr), .led(led));
     spi_program program_i(
-        .clk(clk), .reset(reset), .deselected(program_allowed),
-        .command(spi_cmd_write), .command_type(spi_write_type),
+        .clk(clk), .reset(reset || cancel_program), .deselected(program_allowed),
+        .command(spi_cmd_write && program_armed && !spi_reset && !cancel_pending), .command_type(spi_write_type),
         .command_addr(spi_write_addr), .command_len(spi_write_len),
         .command_partial(spi_write_partial),
-        .byte_strobe(spi_write_buf_strobe), .byte_offset(spi_write_buf_offset),
+        .byte_strobe(spi_write_buf_strobe && program_armed && !spi_reset && !cancel_pending), .byte_offset(spi_write_buf_offset),
         .byte_value(spi_write_buf_val), .busy(busy), .accept(program_accept),
         .read_data(sdram_read_buffer), .writing(spi_writing), .done(spi_write_done),
         .init_done(pp_init_done), .init_finishing(pp_init_finishing),
