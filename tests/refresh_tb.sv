@@ -26,7 +26,7 @@ module refresh_tb;
         .sdram_read_busy(read_busy), .sdram_inhibit_refresh(inhibit),
         .sdram_read_buffer(read_buffer), .sdram_write_buffer(write_buffer),
         .spi_reset(1'b1), .spi_csel(1'b1), .spi_cmd_write(1'b0), .spi_write_type(2'b0),
-        .spi_write_addr(23'b0), .spi_write_len(23'b0), .spi_write_buf_strobe(1'b0),
+        .spi_write_addr(23'b0), .spi_write_len(23'b0), .spi_write_partial(1'b0), .spi_write_buf_strobe(1'b0),
         .spi_write_buf_offset(8'b0), .spi_write_buf_val(8'b0),
         .spi_clk(clk), .sfdp_raddr(7'b0), .log_fifo_data_available(1'b0),
         .log_fifo_read_data(8'b0), .log_addr_valid_sync(1'b0), .log_addr_sync(24'b0),

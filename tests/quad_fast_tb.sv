@@ -27,6 +27,11 @@ module quad_fast_tb;
     reg sck = 0, cs = 1;
     // Whether the emulated chip supports 4-byte addressing at all.
     reg cfg_4byte = 1'b0;
+    reg [23:0] cfg_jedec_id = 24'h4125bf;
+    reg [459:0] cfg_profile = 0;
+    reg cfg_profile_valid = 0;
+    reg [31:0] cfg_profile_epoch = 0;
+    integer dual_wait = 4, quad_wait = 6, fast_wait = 8;
     reg io0_in = 1, io1_in = 1, io2_in = 1, io3_in = 1;
 
     wire io0_out, io1_out, io2_out, io3_out;
@@ -55,7 +60,9 @@ module quad_fast_tb;
         .ram_read_valid_a(read_valid_a), .ram_read_valid_b(read_valid_b),
         .ram_read_beats_a(read_beats_a), .ram_read_beats_b(read_beats_b),
         .ram_read_busy(read_busy), .ram_post_toggle(post_toggle), .prefetch_thin(thin),
-        .write_done(1'b0), .cfg_jedec_id(24'h4125bf), .cfg_4byte(cfg_4byte),
+        .write_done(1'b0), .cfg_jedec_id(cfg_jedec_id), .cfg_4byte(cfg_4byte),
+        .cfg_profile(cfg_profile), .cfg_profile_valid(cfg_profile_valid), .cfg_profile_epoch(cfg_profile_epoch),
+        .cfg_erase_wren(1'b0), .cfg_erase_waddr(5'b0), .cfg_erase_wdata(50'b0),
         .cfg_chip_erase_bursts(23'h7fffff),
         .sfdp_rdata(8'h0), .prefetch_underrun(underrun)
     );
@@ -315,11 +322,12 @@ module quad_fast_tb;
 
     task send_dual_mode;
         for (integer i = 6; i >= 0; i -= 2) send_dual_bits(io_mode[i+1 -: 2]);
+        repeat (dual_wait - 4) send_dual_bits(2'b11);
     endtask
 
     task send_quad_mode;
         send_quad_nibble(io_mode[7:4]); send_quad_nibble(io_mode[3:0]);
-        repeat (4) send_quad_nibble(4'hf);
+        repeat (quad_wait - 2) send_quad_nibble(4'hf);
     endtask
 
     // opcode is 9 bits so the sweep can pass a four-byte form marker
@@ -340,9 +348,9 @@ module quad_fast_tb;
                     if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
                 end
             end
-            8'h0b: begin // fast read: single addr + 8 dummy
+            8'h0b: begin // fast read: single addr + configured dummy
                 send_byte(a[23:16]); send_byte(a[15:8]); send_byte(a[7:0]);
-                send_byte(0);
+                repeat (fast_wait) sclk_tick;
                 for (integer i = 0; i < count; i++) begin
                     recv_single(got);
                     want = expected_byte(a, i);
@@ -416,10 +424,10 @@ module quad_fast_tb;
                     if (got !== want) begin cell_mismatch(opcode, a, i, got, want); disable read_check_body; end
                 end
             end
-            8'h0c: begin // fast read 4B: single addr + 8 dummy
+            8'h0c: begin // fast read 4B: single addr + configured dummy
                 send_byte(a[31:24]); send_byte(a[23:16]);
                 send_byte(a[15:8]); send_byte(a[7:0]);
-                send_byte(0);
+                repeat (fast_wait) sclk_tick;
                 for (integer i = 0; i < count; i++) begin
                     recv_single(got);
                     want = expected_byte(a, i);
@@ -699,6 +707,35 @@ module quad_fast_tb;
         read_after_mode(8'hb7, 1'b0, 32'h0123_4500);
         $display("quad_fast: 0xB7 ignored when the chip has no 4-byte support OK");
         cfg_4byte = 1'b0;
+
+        // Profile reads admit native addressing and quad data even with
+        // cfg_4byte/QE off. Configured waits must not shift mode parsing or
+        // disappear on the next opcode-less transaction.
+        cfg_profile_valid = 1;
+        cfg_profile[227:224] = 8;
+        cfg_jedec_id = 24'h1920c2;
+        cfg_profile[111:104] = 8'h40; // Macronix: dual 6, quad 4 clocks.
+        cfg_profile_epoch++;
+        dual_wait = 6; quad_wait = 4; fast_wait = 6;
+        cont_read_sequence(9'heb, 16.667, 32'h064000);
+        cont_read_sequence(9'hbc, 16.667, 32'h0123_7400);
+        cont_read_sequence(9'hec, 16.667, 32'h0123_8400);
+
+        // Reseed while the prior profile is in continuous mode. Micron's
+        // BB/EB are dummy-only: deliberately put the entry pattern 10 in
+        // those dummy clocks, then require a new opcode on every read.
+        io_mode = 8'ha0;
+        read_check(9'heb, 32'h065000, 16);
+        cfg_jedec_id = 24'h18ba20;
+        cfg_profile[111:104] = 0;
+        cfg_profile_epoch++;
+        dual_wait = 8; quad_wait = 10; fast_wait = 8;
+        sclk_half = 12.5;
+        read_check(9'hbb, 32'h066000, 16);
+        read_check(9'hbb, 32'h066007, 16);
+        read_check(9'heb, 32'h067000, 16);
+        read_check(9'heb, 32'h067007, 16);
+        read_check(9'h0b, 32'h067100, 16);
 
         $display("PASS QUAD_FAST: single/dual/quad 30-70MHz, 3- and 4-byte addressing incl. the 0xB7/0xE9 mode pair, continuous read mode, offsets 0-7, crossings, refresh sweeps (thin flags: %0d, explore fails: %0d, explore thin: %0d)", thin_hits, explore_fails, explore_thin);
         $finish;

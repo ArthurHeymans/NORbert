@@ -4,7 +4,7 @@
 //! for the wire protocol and the emulated SPI commands; these tests fail when
 //! `protocol.rs`, `spi_log.rs` or the generated SFDP table drift from them.
 
-use crate::chip::{ChipDatabase, Features, FlashChipExt};
+use crate::chip::{ChipDatabase, find_chip_by_name};
 use crate::protocol::*;
 use crate::sfdp::generate_sfdp;
 use crate::spi_log::{is_read_opcode, opcode_name};
@@ -63,6 +63,7 @@ fn host_protocol_matches_rtl() {
         ("CMD_TOCTOU", CMD_TOCTOU),
         ("CMD_LOGPOLL", CMD_LOGPOLL),
         ("CMD_PREFETCH", CMD_PREFETCH),
+        ("CMD_CHIPPROFILE", CMD_CHIPPROFILE),
         ("PREFETCH_UNDERRUN", PREFETCH_UNDERRUN),
         ("PREFETCH_THIN", PREFETCH_THIN),
         ("PREFETCH_VALID", PREFETCH_VALID),
@@ -111,7 +112,7 @@ fn every_spi_opcode_has_a_log_name() {
 }
 
 #[test]
-fn read_opcodes_match_rtl() {
+fn array_read_opcodes_match_rtl() {
     for (name, opcode) in spi_opcodes() {
         let array_read = name.contains("READ") && !name.contains("STATUS") && !name.contains("ID");
         assert_eq!(is_read_opcode(opcode), array_read, "{name}");
@@ -122,13 +123,8 @@ fn read_opcodes_match_rtl() {
 fn sfdp_wait_states_match_rtl() {
     let rtl = localparams(SPI_FLASH_CMDS_VH);
     let db = ChipDatabase::new();
-    let mut chip = db
-        .iter()
-        .find(|chip| chip.supports_dual() && chip.supports_quad())
-        .expect("a dual/quad chip in the chip database")
-        .clone();
-    chip.features |= Features::SFDP;
-    let table = generate_sfdp(&chip).unwrap();
+    let chip = find_chip_by_name(&db, "W25Q128.V").unwrap();
+    let table = generate_sfdp(chip).unwrap();
     let dword = |index: usize| {
         let offset = 0x10 + 4 * index;
         u32::from_le_bytes(table[offset..offset + 4].try_into().unwrap())
@@ -153,13 +149,13 @@ fn sfdp_wait_states_match_rtl() {
     );
     assert_eq!(
         fields(dw4),
-        (0, rtl["DUAL_IO_MODE_CLKS"], rtl["CMD_DUALIOREAD"]),
-        "1-2-2"
+        (rtl["FAST_READ_DUMMY_CLKS"], 0, rtl["CMD_DUALREAD"]),
+        "1-1-2"
     );
     assert_eq!(
         fields(dw4 >> 16),
-        (rtl["FAST_READ_DUMMY_CLKS"], 0, rtl["CMD_DUALREAD"]),
-        "1-1-2"
+        (0, rtl["DUAL_IO_MODE_CLKS"], rtl["CMD_DUALIOREAD"]),
+        "1-2-2"
     );
 }
 

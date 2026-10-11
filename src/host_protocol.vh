@@ -5,7 +5,7 @@
 // tool/src/rtl_sync.rs parses this file and checks tool/src/protocol.rs
 // against it, so `cargo test` fails if the two drift apart.
 
-localparam VERSION = 8'h07;  // Version 7: ordered logging and loss-count packets
+localparam VERSION = 8'h09;  // Version 9: permissive controller compatibility
 
 localparam
     CMD_NOP          = 8'h00,
@@ -20,7 +20,8 @@ localparam
     CMD_LOGCTL       = 8'h38,  // Enable/disable SPI bus logging capture
     CMD_TOCTOU       = 8'h39,  // TOCTOU trap management
     CMD_LOGPOLL      = 8'h3A,  // Drain logger ring FIFO
-    CMD_PREFETCH     = 8'h3B;  // Read and clear the SDRAM prefetch fault flags
+    CMD_PREFETCH     = 8'h3B,  // Read and clear the SDRAM prefetch fault flags
+    CMD_CHIPPROFILE  = 8'h3C;  // 128-byte behavior profile; only while stopped
 
 // CMD_PREFETCH reply byte. The FPGA keeps both flags set until a host read
 // reports and clears them, so a fault hit during a long read is still
