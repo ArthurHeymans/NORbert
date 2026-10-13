@@ -38,6 +38,10 @@ module spi_prefetch(
     input wire fresh_read,           // spi_trx starts a new burst
     input wire in_read,              // spi_trx is in its data output phase
     input wire sample_missing,       // Previous falling-edge output lacked its beat
+    // Byte offset of the burst being started; only sampled while
+    // fresh_read is set (the first byte after STA_READ entry has the
+    // transaction start offset, later bursts always start at 0).
+    input wire [2:0] burst_offset,
 
     input wire release_inhibit,      // Opcode decoded: not an array read
 
@@ -76,6 +80,13 @@ module spi_prefetch(
     // the idle half, so this view is stable for the whole burst.
     output wire [63:0] live_buffer,
     output wire [3:0] live_beats,
+    // First byte of the burst being started, selected from live_buffer by
+    // burst_offset. The fresh-byte paths in spi_trx (falling-edge output
+    // and the miso_byte load) close in half/one SCK period against beats
+    // that may publish in the same half period, so they consume this one
+    // shared byte mux instead of variable part-selects over 64 bits at
+    // each use site. Only meaningful while fresh_read is set.
+    output wire [7:0] live_first_byte,
 
     // Sticky diagnostics, cleared at the start of every transaction.
     // Underrun is checked on each master's data sampling edge, including
@@ -106,6 +117,23 @@ module spi_prefetch(
 
     assign live_buffer = consume_sel ? ram_read_buffer_b : ram_read_buffer;
     assign live_beats = consume_sel ? ram_read_beats_b : ram_read_beats_a;
+
+    // Explicit lanes rather than a variable part-select: safest across
+    // Yosys, Verilator, and Gowin synthesis (as in sdram.v's read path).
+    reg [7:0] first_byte_mux;
+    always @* begin
+        case (burst_offset)
+            3'd0: first_byte_mux = live_buffer[7:0];
+            3'd1: first_byte_mux = live_buffer[15:8];
+            3'd2: first_byte_mux = live_buffer[23:16];
+            3'd3: first_byte_mux = live_buffer[31:24];
+            3'd4: first_byte_mux = live_buffer[39:32];
+            3'd5: first_byte_mux = live_buffer[47:40];
+            3'd6: first_byte_mux = live_buffer[55:48];
+            3'd7: first_byte_mux = live_buffer[63:56];
+        endcase
+    end
+    assign live_first_byte = first_byte_mux;
 
     wire [22:0] next_burst = (ram_addr + 1'b1) & addr_mask;
 
