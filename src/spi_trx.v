@@ -143,14 +143,32 @@ module spi_trx(
     // JEDEC ID and 4-byte addressing are driven by cfg_jedec_id and cfg_4byte
     // from glue.v (configured at runtime via serial CHIPCONFIG command).
     //
-    // cfg_chip_erase_bursts is both the chip-erase length and the burst-address
+    // The cfg_* inputs are held system-domain registers, stable during a
+    // transaction. Runtime logic never reads them directly: the first SCK
+    // clock of every transaction snapshots the fields it needs into the
+    // SCK-domain shadow registers below (see spi_chip_profile.vh), so
+    // command decode and the output paths are same-domain paths and the
+    // only crossing is that one bounded capture. Status reseed values are
+    // read from cfg_profile at the capture edge itself.
+    reg sh_valid = 0;
+    reg [23:0] sh_jedec = 0;
+    reg sh_4byte = 0;
+    reg [22:0] sh_erase_bursts = 0;
+    reg [7:0] sh_cmd_flags = 0, sh_addr_flags = 0, sh_p2 = 0, sh_p7 = 0;
+    reg sh_is_atmel = 0;
+    reg [63:0] sh_uid = 0;
+    reg [7:0] sh_page_mask = 8'hff;
+    reg [63:0] sh_erase_ops = 0;    // cfg_profile[319:256]
+    reg [11:0] sh_erase_cnts = 0;   // cfg_profile[331:320]
+    //
+    // sh_erase_bursts is both the chip-erase length and the burst-address
     // mask. SPI NOR capacities are powers of two, and the configured value is
     // (capacity_bytes / 8) - 1. Mask every SDRAM-facing address so unimplemented
     // high address bits alias into the configured flash array like real chips.
     function [22:0] wrap_burst_addr;
         input [22:0] burst_addr;
         begin
-            wrap_burst_addr = burst_addr & cfg_chip_erase_bursts;
+            wrap_burst_addr = burst_addr & sh_erase_bursts;
         end
     endfunction
     
@@ -279,10 +297,10 @@ module spi_trx(
 
     // Share descriptor admission with OP_READ, including completion on this
     // edge, profile erase priority and the Atmel 3C register-read alias.
-    wire read_enabled = (!command_native || cfg_profile_valid || cfg_4byte) &&
+    wire read_enabled = (!command_native || sh_valid || sh_4byte) &&
                         (command_data_lanes != 2 || quad_enabled);
     wire array_read_accepted = can_mutate && operation == OP_READ && read_enabled &&
-                              !(cfg_profile_valid && profile_erase_match) &&
+                              !(sh_valid && profile_erase_match) &&
                               !(is_atmel && received_byte == 8'h3c);
 
     wire addr_read = state == STA_ADDR && addr_kind == ADDR_KIND_READ && !is_sfdp_read;
@@ -292,7 +310,7 @@ module spi_trx(
         .spi_clk(spi_clk),
         .active(is_selected),
         .restart(reset_cs || reset_power),
-        .addr_mask(cfg_chip_erase_bursts),
+        .addr_mask(sh_erase_bursts),
         .fresh_read(fresh_read),
         .burst_offset(addr[2:0]),
         .in_read(in_read),
@@ -393,7 +411,9 @@ module spi_trx(
                 if (reset_power) begin
                     write_cmd <= 0;
                     status_reg[1:0] <= 2'b00;
-                    if (!cfg_profile_valid || command_flags[3]) status_reg[6] <= 0;
+                    // Byte 11 bit 3 of the incoming profile: the shadow
+                    // flags still hold the previous profile at this edge.
+                    if (!cfg_profile_valid || cfg_profile[91]) status_reg[6] <= 0;
                     addr_4byte <= 0;
                     extended_address <= 0;
                     reset_enabled <= 0;
@@ -465,7 +485,7 @@ module spi_trx(
                     
                     transaction_opcode <= received_byte;
                     state <= STA_IGNORE; // extra bytes cannot become new commands within CS
-                    if (cfg_profile_valid && profile_erase_match) begin
+                    if (sh_valid && profile_erase_match) begin
                         if (status_reg[1] && can_mutate && !aai_active) begin
                             state <= STA_ADDR;
                             addr <= {extended_address, 24'd0};
@@ -478,8 +498,8 @@ module spi_trx(
                                  operation == OP_SR3 || operation == OP_FLAG || operation == OP_CONFIGREAD) case (operation)
                         
                     OP_SR1, OP_SR2, OP_SR3, OP_BANKREAD, OP_FLAG: begin
-                        if (operation == OP_SR3 && cfg_profile_valid && command_flags[6]) begin
-                            state <= STA_READID; miso_byte <= cfg_jedec_id[7:0]; addr_count <= 1;
+                        if (operation == OP_SR3 && sh_valid && command_flags[6]) begin
+                            state <= STA_READID; miso_byte <= sh_jedec[7:0]; addr_count <= 1;
                         end else begin
                             state <= STA_READSTATUS;
                             status_read_index <= operation == OP_SR2 || (operation == OP_SR3 && is_macronix) ? 1 : operation == OP_SR3 ? 2 : 0;
@@ -490,7 +510,7 @@ module spi_trx(
                         spi_io1_oe_ff <= 1;
                     end
                     OP_WRSR, OP_WRSR2, OP_WRSR3: begin
-                        if ((cfg_profile_valid || status_reg[1]) && !aai_active) begin
+                        if ((sh_valid || status_reg[1]) && !aai_active) begin
                             status_write_index <= operation == OP_WRSR2 ? 1 : operation == OP_WRSR3 ? 2 : 0;
                             state <= STA_WRITESTATUS; addr_count <= 0;
                         end
@@ -498,7 +518,7 @@ module spi_trx(
                     
                     OP_WRDI: begin
                         status_reg[1] <= 0;
-                        if (!cfg_profile_valid || command_flags[3]) status_reg[6] <= 0;
+                        if (!sh_valid || command_flags[3]) status_reg[6] <= 0;
                         aai_active <= 0;
                     end
                     
@@ -507,7 +527,7 @@ module spi_trx(
                     end
                     
                     OP_ENTER4, OP_EXIT4: begin
-                        if (cfg_profile_valid || cfg_4byte) addr_4byte <= operation == OP_ENTER4;
+                        if (sh_valid || sh_4byte) addr_4byte <= operation == OP_ENTER4;
                     end
                         
                     OP_READ: begin
@@ -533,7 +553,7 @@ module spi_trx(
                             if (received_byte == 8'hc7 || received_byte == 8'h60 || received_byte == 8'h62) begin
                                 state <= STA_ERASE; write_cmd <= 1; write_type <= 2'd1;
                                 write_open <= 1; write_partial <= 0;
-                                write_addr <= 0; write_len <= cfg_chip_erase_bursts;
+                                write_addr <= 0; write_len <= sh_erase_bursts;
                                 status_reg[1:0] <= 2'b01;
                             end else begin
                                 state <= STA_ADDR; addr <= {extended_address,24'd0};
@@ -546,7 +566,7 @@ module spi_trx(
                     end
                     OP_PROGRAM: begin
                         if (status_reg[1] && !aai_active &&
-                            (received_byte != 8'h38 || cfg_jedec_id[7:0] == 8'hc2)) begin
+                            (received_byte != 8'h38 || sh_jedec[7:0] == 8'hc2)) begin
                             state <= STA_ADDR; addr <= {extended_address,24'd0};
                             addr_kind <= ADDR_KIND_WRITE;
                             addr_count <= (command_native || addr_4byte) ? 31 : 23;
@@ -614,7 +634,7 @@ module spi_trx(
                         state <= STA_BPRREAD; spi_io1_oe_ff <= 1; miso_byte <= 0;
                     end
                     OP_UNLOCK: status_reg[1] <= 0;
-                    OP_EWSR: if (!cfg_profile_valid) status_reg[1] <= 1;
+                    OP_EWSR: if (!sh_valid) status_reg[1] <= 1;
                     OP_BANKWRITE: state <= STA_REGWRITE;
                     OP_CONFIGREAD: begin
                         if (is_spansion && received_byte == 8'h65) begin
@@ -649,7 +669,7 @@ module spi_trx(
                             // address/dummy framing; no protection state exists.
                             vcr <= is_micron ? {nvcr[15:12],4'hb} : 8'hfb; evcr <= 8'hff;
                             addr_4byte <= is_micron ? !nvcr[0] : is_spansion ? status_reg3[7] : 1'b0;
-                            if (is_micron && !nvcr[1]) extended_address <= {6'b0,cfg_chip_erase_bursts[22:21]};
+                            if (is_micron && !nvcr[1]) extended_address <= {6'b0,sh_erase_bursts[22:21]};
                             aai_active <= 0;
                             cont_read <= 0;
                             status_reg[1:0] <= 0;
@@ -659,7 +679,7 @@ module spi_trx(
                     OP_ID: begin
                         state <= STA_READID;
                         spi_io1_oe_ff <= 1;
-                        miso_byte <= cfg_jedec_id[7:0];
+                        miso_byte <= sh_jedec[7:0];
                         addr_count <= 1;
                     end
                     
@@ -707,7 +727,7 @@ module spi_trx(
                             else begin
                                 if (is_fast_read) begin
                                     state <= STA_DUMMY;
-                                    dummy_count <= is_sfdp_read || !cfg_profile_valid ? {2'b0,FAST_READ_DUMMY_LAST} : transaction_wait - 5'd1;
+                                    dummy_count <= is_sfdp_read || !sh_valid ? {2'b0,FAST_READ_DUMMY_LAST} : transaction_wait - 5'd1;
                                 end
                                 else begin
                                     state <= STA_READ;
@@ -727,10 +747,10 @@ module spi_trx(
                                 write_type <= 2'd1;
                                 write_addr <= wrap_burst_addr(selected_erase_base[25:3]);
                                 write_len <= selected_erase_mask;
-                                status_reg <= (status_reg & ~profile_byte(7) & 8'hfd) | 8'h01;
+                                status_reg <= (status_reg & ~sh_p7 & 8'hfd) | 8'h01;
                             end else begin
                                 state <= STA_IGNORE;
-                                status_reg <= (status_reg & 8'hfd) | profile_byte(7);
+                                status_reg <= (status_reg & 8'hfd) | sh_p7;
                             end
                         end
                         ADDR_KIND_PROTECT: begin
@@ -755,7 +775,7 @@ module spi_trx(
                         ADDR_KIND_ID: begin
                             state <= STA_LEGACYID; spi_io1_oe_ff <= 1;
                             miso_byte <= transaction_opcode == 8'hab || addr_next[0] ?
-                                cfg_jedec_id[23:16]-8'd1 : cfg_jedec_id[7:0];
+                                sh_jedec[23:16]-8'd1 : sh_jedec[7:0];
                             register_index[0] <= !addr_next[0];
                         end
                         default: begin // ADDR_KIND_WRITE
@@ -781,7 +801,7 @@ module spi_trx(
                                 // byte_addr[25:3] -> burst address, page = 256 bytes = 32 bursts
                                 write_addr <= wrap_burst_addr({addr_next[25:8], 5'b0});
 
-                                status_reg <= (status_reg & ~profile_byte(7) & 8'hfd) | 8'h01;
+                                status_reg <= (status_reg & ~sh_p7 & 8'hfd) | 8'h01;
                             end
                         end
                         endcase
@@ -795,7 +815,7 @@ module spi_trx(
                             // so sfdp_rdata is valid now.
                             state <= STA_READSFDP;
                             spi_io1_oe_ff <= 1;
-                            miso_byte <= (!cfg_profile_valid || addr < 32'd128) ? sfdp_rdata : 8'hff;
+                            miso_byte <= (!sh_valid || addr < 32'd128) ? sfdp_rdata : 8'hff;
                         end
                         else begin
                             state <= STA_READ;
@@ -843,8 +863,8 @@ module spi_trx(
                 end
                 else if (state == STA_READID) begin
                     if (bit_count_in == 0) begin
-                        if (addr_count < ((cfg_profile_valid && command_flags[6]) ? 2 : 3)) begin
-                            miso_byte <= cfg_jedec_id[addr_count*8 +: 8];
+                        if (addr_count < ((sh_valid && command_flags[6]) ? 2 : 3)) begin
+                            miso_byte <= sh_jedec[addr_count*8 +: 8];
                             addr_count <= addr_count + 1;
                         end
                         else
@@ -852,12 +872,12 @@ module spi_trx(
                     end
                 end
                 else if ((state == STA_WRITE) && (bit_count_in == 0)) begin
-                    if (!cfg_profile_valid || !command_flags[4] || !byte_programmed) begin
+                    if (!sh_valid || !command_flags[4] || !byte_programmed) begin
                         write_buf_strobe <= 1;
                         write_buf_offset <= addr[7:0];
                         write_buf_val <= program_byte;
                         byte_programmed <= 1;
-                        addr[7:0] <= cfg_profile_valid ?
+                        addr[7:0] <= sh_valid ?
                             ((addr[7:0] & ~page_mask) | ((addr[7:0] + 8'd1) & page_mask)) : addr[7:0] + 8'd1;
                     end
                 end
@@ -922,7 +942,7 @@ module spi_trx(
                     else if (bit_count_in == 0) begin
                         // Compatibility profiles must not alias the header when
                         // the 7-bit table RAM address wraps at byte 128.
-                        miso_byte <= (!cfg_profile_valid || addr < 32'd127) ? sfdp_rdata : 8'hff;
+                        miso_byte <= (!sh_valid || addr < 32'd127) ? sfdp_rdata : 8'hff;
                         addr <= addr + 1;
                         log_byte_count <= log_byte_count + 1;
                     end
@@ -962,7 +982,7 @@ module spi_trx(
                 end
                 else if (state == STA_LEGACYID && bit_count_in == 0) begin
                     miso_byte <= transaction_opcode == 8'hab || register_index[0] ?
-                        cfg_jedec_id[23:16]-8'd1 : cfg_jedec_id[7:0];
+                        sh_jedec[23:16]-8'd1 : sh_jedec[7:0];
                     register_index[0] <= !register_index[0];
                 end
                 else if (state == STA_CONFIGREAD && bit_count_in == 0) begin
@@ -994,7 +1014,7 @@ module spi_trx(
                     if (uid_dummy == 0) begin
                         state <= STA_UID_READ;
                         spi_io1_oe_ff <= 1;
-                        miso_byte <= profile_byte(16);
+                        miso_byte <= profile_uid[7:0];
                         register_index <= 1;
                     end else uid_dummy <= uid_dummy - 1'b1;
                 end
