@@ -17,7 +17,7 @@
 // only in the window between dispatching a lookahead (continuation) READ
 // and the re-arm drop of that post. A refresh started there can at most
 // overlap the few clocks before the next post, while one started in the
-// gap before a post could delay that post by a whole refresh pair.
+// gap before a post could delay that post by a whole refresh event.
 //
 // One-burst lookahead: the first burst is requested during the address
 // phase (ACTIVATE once row/bank are known, READ once the column is known).

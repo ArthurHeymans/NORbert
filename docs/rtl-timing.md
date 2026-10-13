@@ -75,27 +75,30 @@ This is an ordering budget, not a routed RAM-to-comparator timing guarantee.
 
 ## Refresh scheduling
 
-At 120 MHz the nominal period is 468 clocks (a conservative 32 ms / 8192
-schedule for each chip). Deferral may reach twice that period, plus bounded
-safe-row-closure/access service time. Each refresh pair pays only one period
-of elapsed time; it does not discard overdue time. This preserves the nominal
-average rate even when SCK and CS stall indefinitely. The saturating counter
-has service-latency headroom above the dispatch deadline. Registered,
-increment-predicted deadline flags remove arithmetic/comparison from the
-command/data dispatch critical path without postponing the deadline.
-The refresh bench checks both maximum gaps and sustained refresh rate.
+At 120 MHz the nominal per-chip period is 468 clocks (a conservative
+32 ms / 8192 schedule). Refresh events alternate between the chips, one
+chip per event, so an event is due every 234 clocks and stalls dispatch
+for a single tRC instead of a back-to-back pair. Deferral may reach twice
+the per-chip period, plus bounded safe-row-closure/access service time.
+Each event pays only one event period of elapsed time; it does not discard
+overdue time. This preserves the nominal average rate even when SCK and CS
+stall indefinitely. The saturating counter has service-latency headroom
+above the dispatch deadline. Registered, increment-predicted deadline flags
+remove arithmetic/comparison from the command/data dispatch critical path
+without postponing the deadline. The refresh bench checks both maximum
+gaps and sustained refresh rate.
 
 SPI reads inhibit refresh from the first clock of every transaction until
-the opcode turns out not to be an array read, so a refresh pair cannot
-start late enough to delay the first burst. Throughout an array read the
+the opcode turns out not to be an array read, so a refresh cannot start
+late enough to delay the first burst. Throughout an array read the
 controller only starts a refresh in a window: after it dispatched a
 lookahead (continuation) READ and until the SPI side re-arms that post. The
-next post is then at least the re-arm-to-post gap away, so a 17-clock
-refresh pair overlaps it by only part of that gap, well inside the burst's
+next post is then at least the re-arm-to-post gap away, so a 9-clock
+refresh event overlaps it by only part of that gap, well inside the burst's
 margin. A refresh in the gap before a post would instead delay the post by
-the whole pair. Stopped SCK outside a window falls back to the deadline
+the whole event. Stopped SCK outside a window falls back to the deadline
 (hard) refresh. `quad_fast_tb` sweeps the refresh due time across one full
-period for every documented read limit.
+event period for every documented read limit.
 
 ## Required external I/O profile
 
