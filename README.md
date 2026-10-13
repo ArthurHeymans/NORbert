@@ -9,7 +9,7 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 - **SPI NOR flash emulation** with full command support: read, fast read, page program, sector/block/chip erase, JEDEC ID, status registers, SFDP. As on a real part, only status reads are accepted while a program/erase is in progress, and a program/erase is not executed if CS rises mid-byte
 - **Configurable chip identity** at runtime -- load any chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database to set JEDEC ID, size, and SFDP parameters (defaults to Winbond W25Q64FV)
 - **Multi-I/O modes**: 1-1-1, 1-1-2, 1-2-2, 1-1-4, and 1-4-4 SPI read modes, including continuous read (XIP) mode for 1-2-2/1-4-4 (mode bits `Axh`; `FFh`/`FFFFh` mode reset)
-- **Fast SPI reads**: one-burst lookahead with ping-pong SDRAM buffers supports 40 MHz dummy-less/quad-I/O reads and 50-70 MHz dummy-assisted reads in simulation (see limits below)
+- **Fast SPI reads**: lookahead over a four-slot SDRAM ring (two bursts ahead once primed) supports 40 MHz dummy-less/quad-I/O reads and 50-70 MHz dummy-assisted reads in simulation (see limits below)
 - **64MB backing store** using two SDRAM chips with byte-serial burst layout for minimal first-byte latency
 - **Pipelined prefetch**: SDRAM reads are issued during SPI address/dummy phases so data is ready on the first clock edge
 - **2 Mbaud UART** interface for loading and dumping images from a host PC
@@ -390,7 +390,8 @@ CLKOUT and OE# are not used in async mode. All signals are 3.3V LVCMOS.
 Sustained SPI clock limits are set by the SDRAM prefetch pipeline
 (`spi_prefetch.v` and `sdram.v`). Each 8-byte SDRAM burst takes ~12 system clock cycles (120 MHz)
 from post to data valid. Instead of posting just-in-time, the SPI engine keeps
-one burst in flight at all times (one-burst lookahead with ping-pong buffers),
+bursts in flight ahead of the one being shifted out (a four-slot ring,
+primed to two-burst lookahead by a dummy/mode phase),
 so the limit is throughput (one burst per ~12 sysclks), not single-burst
 latency. SDRAM runs at CAS latency 2 (in spec to 133 MHz for the W9825G6KH-6)
 with a byte-serial burst layout, so the first beat already completes bytes 0-1.
@@ -469,8 +470,8 @@ be trusted.
 src/
   top.v        Top-level module, clock/reset, bus wiring, TOCTOU address mux
   spi_trx.v    SPI flash transceiver (command decoder + data path)
-  spi_prefetch.v  SDRAM burst requests, ping-pong buffer selection and the prefetch fault flags
-  sdram.v      Dual-chip SDRAM controller, byte-serial bursts, ping-pong prefetch
+  spi_prefetch.v  SDRAM burst requests, ring buffer selection and the prefetch fault flags
+  sdram.v      Dual-chip SDRAM controller, byte-serial bursts, ring prefetch
   spi_flash_cmds.vh  Emulated SPI flash opcodes and read wait states
   host_protocol.vh   Host serial protocol opcodes and log packet types
   glue.v       Composition of independent host and SPI program clients

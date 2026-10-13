@@ -40,9 +40,10 @@ module quad_fast_tb;
 
     wire [22:0] ram_addr;
     wire ram_act, ram_read, ram_cont, ram_inh;
-    wire [63:0] read_buffer_a, read_buffer_b;
-    wire read_valid_a, read_valid_b, read_busy;
-    wire [3:0] read_beats_a, read_beats_b;
+    wire [255:0] read_buffers;
+    wire [3:0] read_valid;
+    wire read_busy;
+    wire [15:0] read_beats;
     wire post_toggle;
     wire thin;
     integer thin_hits = 0;
@@ -56,9 +57,9 @@ module quad_fast_tb;
         .spi_io3_in(io3_in), .spi_io3_out(io3_out), .spi_io3_oe(io3_oe),
         .ram_inhibit_refresh(ram_inh), .ram_activate(ram_act), .ram_read(ram_read),
         .ram_continuation(ram_cont), .ram_addr(ram_addr),
-        .ram_read_buffer(read_buffer_a), .ram_read_buffer_b(read_buffer_b),
-        .ram_read_valid_a(read_valid_a), .ram_read_valid_b(read_valid_b),
-        .ram_read_beats_a(read_beats_a), .ram_read_beats_b(read_beats_b),
+        .ram_read_buffers(read_buffers),
+        .ram_read_valid(read_valid),
+        .ram_read_beats(read_beats),
         .ram_read_busy(read_busy), .ram_post_toggle(post_toggle), .prefetch_thin(thin),
         .write_done(1'b0), .cfg_jedec_id(cfg_jedec_id), .cfg_4byte(cfg_4byte),
         .cfg_profile(cfg_profile), .cfg_profile_valid(cfg_profile_valid), .cfg_profile_epoch(cfg_profile_epoch),
@@ -81,9 +82,9 @@ module quad_fast_tb;
         .spi_cmd_activate(ram_act), .spi_cmd_read(ram_read), .spi_addr(ram_addr),
         .spi_cmd_post_toggle(post_toggle), .spi_cmd_continuation(ram_cont),
         .access_cmd(2'b00), .access_addr(25'b0), .inhibit_refresh(1'b0),
-        .read_buffer(read_buffer_a), .read_buffer_b(read_buffer_b),
-        .read_valid_a(read_valid_a), .read_valid_b(read_valid_b),
-        .read_beats_a(read_beats_a), .read_beats_b(read_beats_b),
+        .read_buffers(read_buffers),
+        .read_valid(read_valid),
+        .read_beats(read_beats),
         .read_busy(read_busy), .write_buffer(64'b0)
     );
 
@@ -385,9 +386,9 @@ module quad_fast_tb;
                     if (got !== want) begin
                         $display("0x6B addr %h len %0d fail at+%0d: got %h want %h",
                                  a, count, i, got, want);
-                        $display("  liveA=%h liveB=%h cons=%b underrun=%b",
-                                 spi.ram_read_buffer, spi.ram_read_buffer_b,
-                                 spi.prefetch.consume_sel, underrun);
+                        $display("  slots=%h cons=%0d underrun=%b",
+                                 spi.ram_read_buffers,
+                                 spi.prefetch.consume_idx, underrun);
                         for (integer j = 0; j < count; j++) begin
                             automatic logic [25:0] bj = 26'(a[25:0]) + 26'(j);
                             $display("  byte+%0d burst=%h idx=%0d want=%h",

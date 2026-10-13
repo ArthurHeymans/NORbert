@@ -12,7 +12,8 @@ module sdram_controller_tb;
     wire done, busy, read_busy, inhibit, accept;
     wire [1:0] access;
     wire [24:0] access_addr;
-    wire [63:0] write_buffer, read_buffer;
+    wire [255:0] read_buffers;
+    wire [63:0] write_buffer, read_buffer = read_buffers[63:0];
     wire ras, cas, we;
     wire [15:0] dq;
     integer cycles = 0, requests = 0, accepted = 0, writes = 0;
@@ -38,7 +39,7 @@ module sdram_controller_tb;
         .clk(clk), .aux_clk(clk), .reset(reset), .dq_io(dq),
         .spi_active(1'b0), .spi_inhibit_refresh(1'b0), .spi_cmd_activate(1'b0),
         .spi_cmd_read(1'b0), .spi_addr(23'b0), .access_cmd(access), .access_addr(access_addr),
-        .inhibit_refresh(inhibit), .cmd_busy(busy), .access_accept(accept), .read_buffer(read_buffer),
+        .inhibit_refresh(inhibit), .cmd_busy(busy), .access_accept(accept), .read_buffers(read_buffers),
         .read_busy(read_busy), .write_buffer(write_buffer), .ras_o(ras), .cas_o(cas), .we_o(we)
     );
 

@@ -40,9 +40,8 @@ module chip_profile_tb;
         .cfg_jedec_id(jedec),.cfg_4byte(1'b1),.cfg_chip_erase_bursts(capacity),
         .cfg_profile(compiled_profile),.cfg_profile_valid(valid),.cfg_profile_epoch(epoch),
         .cfg_erase_wren(erase_wren),.cfg_erase_waddr(erase_waddr),.cfg_erase_wdata(erase_wdata),
-        .sfdp_rdata(sfdp_byte),.ram_read_buffer(64'hffffffffffffffff),
-        .ram_read_buffer_b(64'hffffffffffffffff),.ram_read_beats_a(4'hf),.ram_read_beats_b(4'hf),
-        .ram_read_valid_a(1'b1),.ram_read_valid_b(1'b1),.ram_read_busy(1'b0)
+        .sfdp_rdata(sfdp_byte),.ram_read_buffers({256{1'b1}}),
+        .ram_read_beats(16'hffff),.ram_read_valid(4'hf),.ram_read_busy(1'b0)
     );
     always @(posedge clk) begin
         if (!command) seen<=0;

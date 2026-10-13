@@ -97,11 +97,11 @@ module top(
     // SDRAM Data Bus Handling
     // -----------------------------------------------------------
     
-    wire [63:0] sdram_read_buffer;
-    wire [63:0] sdram_read_buffer_b;
-    wire sdram_read_valid_a;
-    wire sdram_read_valid_b;
-    wire [3:0] sdram_read_beats_a, sdram_read_beats_b;
+    wire [255:0] sdram_read_buffers;
+    wire [3:0] sdram_read_valid;
+    wire [15:0] sdram_read_beats;
+    // Serial path (glue) reads slot 0.
+    wire [63:0] sdram_read_buffer = sdram_read_buffers[63:0];
     wire sdram_read_busy;
     wire [63:0] sdram_write_buffer;
     
@@ -292,12 +292,9 @@ module top(
         .ram_post_toggle(spi_ram_post_toggle),
         
         .ram_addr(spi_ram_addr),
-        .ram_read_buffer(sdram_read_buffer),
-        .ram_read_buffer_b(sdram_read_buffer_b),
-        .ram_read_valid_a(sdram_read_valid_a),
-        .ram_read_valid_b(sdram_read_valid_b),
-        .ram_read_beats_a(sdram_read_beats_a),
-        .ram_read_beats_b(sdram_read_beats_b),
+        .ram_read_buffers(sdram_read_buffers),
+        .ram_read_valid(sdram_read_valid),
+        .ram_read_beats(sdram_read_beats),
         .ram_read_busy(sdram_read_busy),
         .prefetch_underrun(prefetch_underrun),
         .prefetch_thin(prefetch_thin),
@@ -435,12 +432,9 @@ module top(
         .cmd_busy(sdram_cmd_busy),
         .access_accept(sdram_access_accept),
         
-        .read_buffer(sdram_read_buffer),
-        .read_buffer_b(sdram_read_buffer_b),
-        .read_valid_a(sdram_read_valid_a),
-        .read_valid_b(sdram_read_valid_b),
-        .read_beats_a(sdram_read_beats_a),
-        .read_beats_b(sdram_read_beats_b),
+        .read_buffers(sdram_read_buffers),
+        .read_valid(sdram_read_valid),
+        .read_beats(sdram_read_beats),
         .read_busy(sdram_read_busy),
         
         .write_buffer(sdram_write_buffer)

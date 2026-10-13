@@ -19,14 +19,15 @@ module sdram_protocol_tb;
     wire [1:0] bank;
     wire [12:0] a;
     wire [15:0] dq = 16'h1234;
-    wire [63:0] read_buffer;
+    wire [255:0] read_buffers;
+    wire [63:0] read_buffer = read_buffers[63:0];
 
     sdram #(.CLK_FREQ_MHZ(120)) ram(.clk(clk), .aux_clk(clk), .reset(reset), .dq_io(dq),
         .spi_active(spi_active), .spi_inhibit_refresh(spi_inhibit),
         .spi_cmd_activate(spi_activate), .spi_cmd_read(spi_read),
         .spi_cmd_post_toggle(1'b0), .spi_addr(spi_addr),
         .access_cmd(access_cmd), .access_addr(access_addr), .inhibit_refresh(1'b0),
-        .cmd_busy(busy), .access_accept(accept), .read_buffer(read_buffer),
+        .cmd_busy(busy), .access_accept(accept), .read_buffers(read_buffers),
         .read_busy(read_busy), .write_buffer(64'h0),
         .ras_o(ras), .cas_o(cas), .we_o(we), .cs_o(chip), .ba_o(bank), .a_o(a));
 

@@ -1,6 +1,6 @@
 // SDRAM burst prefetch for SPI reads (spi_clk domain).
 //
-// Owns the request handshake to the SDRAM controller and the ping-pong
+// Owns the request handshake to the SDRAM controller and the ring
 // buffer selection, so spi_trx only reports *when* things happen in the
 // SPI transaction. All inputs are single-clock event strobes computed from
 // spi_trx state; they are applied in a fixed order, so when several fire on
@@ -19,13 +19,22 @@
 // overlap the few clocks before the next post, while one started in the
 // gap before a post could delay that post by a whole refresh event.
 //
-// One-burst lookahead: the first burst is requested during the address
-// phase (ACTIVATE once row/bank are known, READ once the column is known).
-// The second burst is posted during the dummy/mode phase when there is
-// one, otherwise two clocks after the first data clock. From then on the
-// next burst is always in flight while the current one is shifted out: the
-// controller fills the idle half of ram_read_buffer/ram_read_buffer_b and
-// consume_sel tracks the half currently being shifted out.
+// Lookahead over a four-slot ring: the first burst is requested during
+// the address phase (ACTIVATE once row/bank are known, READ once the
+// column is known). The second burst is posted during the dummy/mode
+// phase when there is one, otherwise two clocks after the first data
+// clock. When a dummy/mode phase posted the second burst, a third is
+// primed during the first data burst: once the second burst's first
+// beat publishes (proof its READ dispatched), its levels drop and the
+// third burst posts two clocks later, holding off the next drop so its
+// own dispatch cannot be cut short. From then on two bursts are in
+// flight or filled ahead of the one being shifted out; without a dummy
+// phase there is no early post to prime from and the depth stays one.
+// ahead counts posts beyond the consume burst (capped at 2, leaving one
+// slot spare so a fill can never target the slot being consumed).
+// A post only fires while the request levels are down (!ram_activate):
+// levels still up mean the previous post has not been re-armed, and
+// raising them again would merge two posts into one dispatch.
 
 `default_nettype none
 
@@ -69,15 +78,12 @@ module spi_prefetch(
     output reg ram_post_toggle = 0,
     output reg [22:0] ram_addr,
 
-    input wire [63:0] ram_read_buffer,
-    input wire [63:0] ram_read_buffer_b,
-    input wire ram_read_valid_a,
-    input wire ram_read_valid_b,
-    input wire [3:0] ram_read_beats_a,
-    input wire [3:0] ram_read_beats_b,
+    input wire [255:0] ram_read_buffers,
+    input wire [3:0] ram_read_valid,
+    input wire [15:0] ram_read_beats,
 
     // Burst buffer currently shifted out. The controller only ever writes
-    // the idle half, so this view is stable for the whole burst.
+    // slots ahead of it, so this view is stable for the whole burst.
     output wire [63:0] live_buffer,
     output wire [3:0] live_beats,
     // First byte of the burst being started, selected from live_buffer by
@@ -95,28 +101,50 @@ module spi_prefetch(
     output reg prefetch_thin = 0
 );
 
-    // Half of the ping-pong pair being shifted out. Toggles at every burst
-    // end in lockstep with the controller's fill toggle; both restart at A
+    // Ring slot being shifted out. Advances at every burst end in
+    // lockstep with the controller's fill index; both restart at slot 0
     // on every CS drop, so pairing cannot drift across transactions.
-    reg consume_sel = 0;
-    // Set whenever the next burst has been requested during the current
-    // one and cleared at every burst end. The byte-7 fallback may therefore
-    // only fire for a first burst that started at offset 7 with no post
-    // yet; otherwise it would bump ram_addr a second time without a
-    // matching dispatch and walk the ping-pong pairing out of phase.
-    reg posted_this_burst = 0;
-    // Set when the second burst was already posted during a dummy/mode
-    // phase: the first data clock then only clears the flag instead of
-    // posting a duplicate request.
-    reg prefetch_pending = 0;
+    reg [1:0] consume_idx = 0;
+    // Bursts posted beyond the consume burst, capped at 2: at most one
+    // post per burst period reaches the controller (each post here sets
+    // it, every burst end clears one), which keeps the post/drop spacing
+    // of the original one-burst design. A post may only fire while the
+    // levels are down and ahead permits, otherwise it would bump
+    // ram_addr without a matching dispatch and walk the ring pairing
+    // out of phase.
+    reg [1:0] ahead = 0;
+    // Priming (see header): armed by a dummy/mode post, fires one extra
+    // post during the first data burst once that post's first beat has
+    // published. Posts that did not exist in the one-burst design (the
+    // priming post and the depth-2 catch-up posts) can land a clock or
+    // two before a scheduled drop, before the controller can have
+    // dispatched their ACTIVATE+READ through its synchronizers. They
+    // therefore hold their levels for at least MIN_HOLD SCK clocks:
+    // drop events during the hold pend and execute when it expires.
+    // Original-rhythm posts keep their proven drop timing.
+    localparam [2:0] MIN_HOLD = 3'd6;
+    // Set once priming first reaches ahead == 2. From then on the byte-7
+    // fallback is the catch-up post for bursts whose delayed post found
+    // the levels still up (a held priming post), so depth 2 sustains
+    // itself on either post rhythm.
+    reg depth2 = 0;
+    reg prime_armed = 0;
+    // The target slot's valid bit can still be stale-high from its last
+    // use until the post invalidation syncs into the controller; only a
+    // low-then-high observation proves this post's beat published.
+    reg prime_cleared = 0;
+    reg [1:0] prime_delay = 0;
+    reg [2:0] hold_age = 0;
+    reg hold_active = 0;
+    reg drop_pending = 0;
     // Two-cycle delayed fresh_read: the lookahead post fires here so the
     // burst-end drop always precedes it by >= 2 SPI clocks, even for
     // 2-clock offset-7 first bursts that have no byte 6 to drop on.
     reg post_arm1 = 0;
     reg post_arm2 = 0;
 
-    assign live_buffer = consume_sel ? ram_read_buffer_b : ram_read_buffer;
-    assign live_beats = consume_sel ? ram_read_beats_b : ram_read_beats_a;
+    assign live_buffer = ram_read_buffers[{consume_idx, 6'b000000} +: 64];
+    assign live_beats = ram_read_beats[{consume_idx, 2'b00} +: 4];
 
     // Explicit lanes rather than a variable part-select: safest across
     // Yosys, Verilator, and Gowin synthesis (as in sdram.v's read path).
@@ -147,9 +175,15 @@ module spi_prefetch(
                 ram_read <= 0;
                 ram_continuation <= 0;
                 ram_post_toggle <= 0;
-                consume_sel <= 0;
-                posted_this_burst <= 0;
-                prefetch_pending <= 0;
+                consume_idx <= 0;
+                ahead <= 0;
+                depth2 <= 0;
+                prime_armed <= 0;
+                prime_cleared <= 0;
+                prime_delay <= 0;
+                hold_age <= 0;
+                hold_active <= 0;
+                drop_pending <= 0;
                 post_arm1 <= 0;
                 post_arm2 <= 0;
                 prefetch_underrun <= 0;
@@ -160,22 +194,34 @@ module spi_prefetch(
                 // data. Do not let a later fill erase an earlier missing byte.
                 if (in_read && sample_missing)
                     prefetch_underrun <= 1;
-                // Lookahead post two clocks into every burst. With a
-                // dummy/mode-posted second burst there is nothing to post;
-                // just clear the flag (the burst-end drop already re-armed).
+                // Lookahead post two clocks into every burst, while fewer
+                // than two bursts are already ahead and the burst-end drop
+                // re-armed the handshake.
                 post_arm1 <= fresh_read;
                 post_arm2 <= post_arm1;
-                if (post_arm2 && in_read) begin
-                    if (prefetch_pending)
-                        prefetch_pending <= 0;
-                    else if (!posted_this_burst) begin
-                        ram_continuation <= 1;
-                        ram_activate <= 1;
-                        ram_read <= 1;
-                        ram_addr <= next_burst;
-                        posted_this_burst <= 1;
-                        ram_post_toggle <= ~ram_post_toggle;
+                if (post_arm2 && in_read && ahead < 2 && !ram_activate) begin
+                    ram_continuation <= 1;
+                    ram_activate <= 1;
+                    ram_read <= 1;
+                    ram_addr <= next_burst;
+                    ahead <= ahead + 1'b1;
+                    // This post may be the priming post (levels already
+                    // dropped by the prime logic, or never armed): the
+                    // armed post is no longer the latest, so priming must
+                    // not drop these levels from under its dispatch. As
+                    // the priming post it can land a clock before the
+                    // burst-end drop of a short first burst, so it holds
+                    // that drop off exactly like a prime-logic post.
+                    if (prime_armed) begin
+                        depth2 <= 1;
+                        hold_active <= 1;
+                        hold_age <= 0;
+                        drop_pending <= 0;
                     end
+                    prime_armed <= 0;
+                    prime_cleared <= 0;
+                    prime_delay <= 0;
+                    ram_post_toggle <= ~ram_post_toggle;
                 end
 
                 if (release_inhibit)
@@ -200,57 +246,138 @@ module spi_prefetch(
                 // bursts (high start offsets) still meet SDRAM latency at
                 // fast SCLK. The first burst's levels were dropped before,
                 // so the handshake re-arms across a multi-clock gap.
-                if (post_lookahead) begin
+                if (post_lookahead && ahead < 2 && !ram_activate) begin
                     ram_continuation <= 1;
                     ram_activate <= 1;
                     ram_read <= 1;
                     ram_addr <= next_burst;
-                    prefetch_pending <= 1;
-                    posted_this_burst <= 1;
+                    ahead <= ahead + 1'b1;
+                    prime_armed <= 1;
+                    prime_cleared <= 0;
                     ram_post_toggle <= ~ram_post_toggle;
                 end
 
+                // Minimum level hold for priming/catch-up posts (see the
+                // MIN_HOLD declaration): age the hold and execute a
+                // pended drop the clock it expires.
+                if (hold_active) begin
+                    if (hold_age == MIN_HOLD - 1'b1) begin
+                        hold_active <= 0;
+                        hold_age <= 0;
+                        if (drop_pending) begin
+                            drop_pending <= 0;
+                            ram_activate <= 0;
+                            ram_read <= 0;
+                        end
+                    end
+                    else
+                        hold_age <= hold_age + 1'b1;
+                end
+
                 // Re-arm: mid mode phase, and on the last clock of byte 6.
-                // This also closes the refresh window of the post.
+                // This also closes the refresh window of the post. During
+                // a minimum hold the drop pends instead of cutting a
+                // priming/catch-up dispatch short.
                 if (drop) begin
+                    if (hold_active)
+                        drop_pending <= 1;
+                    else begin
+                        ram_activate <= 0;
+                        ram_read <= 0;
+                    end
+                end
+
+                // Keep dummy/mode-posted levels up at mode end: that burst
+                // is still filling and priming (or byte 6) drops them.
+                if (mode_end && ahead == 0) begin
                     ram_activate <= 0;
                     ram_read <= 0;
                 end
 
-                // Keep mode-posted levels up: the second burst is still
-                // filling and byte 6 of the first burst drops them.
-                if (mode_end && !prefetch_pending) begin
+                // Priming: the dummy/mode post's first beat proves its
+                // READ dispatched, so its levels may drop; post one more
+                // burst two clocks later and hold the following drop.
+                // Ordered after the drop events above so a priming post
+                // landing on a drop clock (short first bursts reach byte
+                // 6 two clocks after the prime drop) wins over that drop
+                // instead of being counted but never raised; the minimum
+                // level hold then pends the following drops. It must not coincide
+                // with burst_end, whose ahead/drop bookkeeping would
+                // override the post the same way: priming gives up there
+                // and the next burst's delayed post takes over.
+                if (prime_delay != 0)
+                    prime_delay <= prime_delay - 1'b1;
+                if (prime_armed && !ram_read_valid[consume_idx + 1'b1])
+                    prime_cleared <= 1;
+                if (prime_armed && prime_cleared && prime_delay == 0 && ram_activate &&
+                    ram_read_valid[consume_idx + 1'b1]) begin
                     ram_activate <= 0;
                     ram_read <= 0;
+                    prime_delay <= 2;
                 end
-
-                // Fallback when a read starts directly at byte 7 and no
-                // lookahead post happened yet.
-                if (fallback && !ram_activate && !posted_this_burst) begin
+                if (prime_armed && prime_delay == 1 && in_read && ahead < 2 && !burst_end) begin
                     ram_continuation <= 1;
                     ram_activate <= 1;
                     ram_read <= 1;
                     ram_addr <= next_burst;
-                    posted_this_burst <= 1;
+                    ahead <= ahead + 1'b1;
+                    prime_armed <= 0;
+                    depth2 <= 1;
+                    hold_active <= 1;
+                    hold_age <= 0;
+                    drop_pending <= 0;
+                    ram_post_toggle <= ~ram_post_toggle;
+                end
+
+                // Fallback when a read starts directly at byte 7 and no
+                // lookahead post happened yet, and the catch-up post that
+                // sustains depth 2 in bursts whose delayed post found the
+                // levels held up. A depth-2 fallback post lands a clock
+                // before the burst-end drop, so it holds that drop off;
+                // the original ahead == 0 fallback keeps its old timing.
+                if (fallback && !ram_activate &&
+                    (ahead == 0 || (depth2 && ahead < 2))) begin
+                    ram_continuation <= 1;
+                    ram_activate <= 1;
+                    ram_read <= 1;
+                    ram_addr <= next_burst;
+                    ahead <= ahead + 1'b1;
+                    if (depth2) begin
+                        hold_active <= 1;
+                        hold_age <= 0;
+                        drop_pending <= 0;
+                    end
+                    prime_armed <= 0;
+                    prime_cleared <= 0;
+                    prime_delay <= 0;
                     ram_post_toggle <= ~ram_post_toggle;
                 end
 
                 if (burst_end) begin
-                    consume_sel <= ~consume_sel;
+                    consume_idx <= consume_idx + 1'b1;
+                    prime_armed <= 0;
+                    prime_cleared <= 0;
+                    prime_delay <= 0;
+                    if (ahead != 0)
+                        ahead <= ahead - 1'b1;
                     // First-beat readiness is a margin diagnostic only.
                     // The consumed-byte check above uses individual beats;
                     // a fill after consumption cannot hide a stale output.
                     // These bundled-data flags cross with their data and
                     // require the same bundled-data timing contract.
-                    if (consume_sel ? !ram_read_valid_a : !ram_read_valid_b)
+                    if (!ram_read_valid[consume_idx + 1'b1])
                         prefetch_thin <= 1;
                     // Burst-end drop re-arms the handshake for the delayed
-                    // post two clocks later and restarts the posted flag.
-                    // (Offset-7 first bursts have no byte 6; this is their
-                    // only drop.)
-                    ram_activate <= 0;
-                    ram_read <= 0;
-                    posted_this_burst <= 0;
+                    // post two clocks later, unless a priming/catch-up post
+                    // is still within its minimum hold, in which case it
+                    // pends. (Offset-7 first bursts have no byte 6; this is
+                    // their only drop.)
+                    if (hold_active)
+                        drop_pending <= 1;
+                    else begin
+                        ram_activate <= 0;
+                        ram_read <= 0;
+                    end
                 end
             end
         end

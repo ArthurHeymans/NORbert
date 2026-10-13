@@ -74,14 +74,14 @@ module sdram(
     output reg cmd_busy,
     output reg access_accept,   // One cycle at actual serial-path dispatch
 
-    output reg [63:0] read_buffer,
-    output reg [63:0] read_buffer_b,
-    output reg read_valid_a,
-    output reg read_valid_b,
-    // One bit per published 16-bit beat. Cleared before reuse and set
-    // with its data, so high-offset/short reads can check their own bytes.
-    output reg [3:0] read_beats_a,
-    output reg [3:0] read_beats_b,
+    // Four 64-bit burst slots for the SPI fast path, slot i at
+    // read_buffers[i*64 +: 64]; slot 0 doubles as the serial-path buffer.
+    output reg [255:0] read_buffers,
+    output reg [3:0] read_valid,
+    // One bit per published 16-bit beat, slot i at read_beats[i*4 +: 4].
+    // Cleared before reuse and set with its data, so high-offset/short
+    // reads can check their own bytes.
+    output reg [15:0] read_beats,
     output reg read_busy,
 
     input wire [63:0] write_buffer
@@ -204,21 +204,22 @@ module sdram(
     reg spi_cmd_read_ack;
     reg spi_abort_pending;
 
-    // One-burst lookahead (ping-pong) for the SPI fast path. The SPI side
-    // consumes one 64-bit buffer while the controller fills the other, so a
-    // completing SDRAM read never overwrites data still shifted out.
-    // fill_sel selects the target of the next SPI fill (0=A=read_buffer,
-    // 1=B=read_buffer_b) and toggles on every SPI READ completion. The SPI
-    // side keeps its own consume toggle; the two march in lockstep because
-    // serial-path reads are impossible while SPI is active (glue
-    // serial_gate) and both sides restart at buffer A on every CS drop.
-    reg fill_sel;
-    // Posts describe future buffers, not the fill currently in flight.
+    // Lookahead ring for the SPI fast path: four 64-bit slots, so up to
+    // two bursts can be posted ahead of the one being shifted out and a
+    // completing SDRAM read never overwrites data still needed.
+    // fill_idx selects the target of the next SPI fill and advances on
+    // every SPI READ completion. The SPI side keeps its own consume
+    // index; the two march in lockstep because serial-path reads are
+    // impossible while SPI is active (glue serial_gate) and both sides
+    // restart at slot 0 on every CS drop.
+    reg [1:0] fill_idx;
+    // Posts describe future slots, not the fill currently in flight.
     // Track their order separately so a post during progressive publish
     // cannot invalidate already-published beats of the current burst.
-    reg post_fill_sel;
+    reg [1:0] post_fill_idx;
     reg fill_reset_armed;
     reg serial_read_active;
+    wire [1:0] fill_target = serial_read_active ? 2'd0 : fill_idx;
     // Edge-arming for the SPI fast path. A dispatch additionally requires
     // the request level to have been observed LOW while selected since the
     // last dispatch (or reset). Stale-high levels left over from a previous
@@ -331,12 +332,9 @@ module sdram(
             refresh_chip <= 0;
             serial_row_open <= 0;
             
-            read_buffer <= 0;
-            read_buffer_b <= 0;
-            read_valid_a <= 0;
-            read_valid_b <= 0;
-            read_beats_a <= 0;
-            read_beats_b <= 0;
+            read_buffers <= 0;
+            read_valid <= 0;
+            read_beats <= 0;
             read_busy <= 0;
             readcount <= 0;
 
@@ -354,8 +352,8 @@ module sdram(
             spi_activate_done <= 0;
             spi_read_continuation <= 0;
             spi_addr_latched <= 0;
-            fill_sel <= 0;
-            post_fill_sel <= 1;
+            fill_idx <= 0;
+            post_fill_idx <= 1;
             fill_reset_armed <= 0;
             serial_read_active <= 0;
             spi_act_armed <= 1;
@@ -419,9 +417,9 @@ module sdram(
             // invalidating here can never clobber a completed fill.
             spi_post_sync <= {spi_post_sync[1:0], spi_cmd_post_toggle};
             if (spi_post_sync[1] ^ spi_post_sync[2]) begin
-                if (post_fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
-                else begin read_valid_a <= 0; read_beats_a <= 0; end
-                post_fill_sel <= ~post_fill_sel;
+                read_valid[post_fill_idx] <= 0;
+                read_beats[{post_fill_idx, 2'b00} +: 4] <= 0;
+                post_fill_idx <= post_fill_idx + 1'b1;
             end
             
             if (spi_cmd_activate_ack && !spi_cmd_activate_buf[1]) begin
@@ -727,12 +725,10 @@ module sdram(
                     spi_addr_latched <= spi_addr;
                     spi_act_armed <= 0;
                     if (fill_reset_armed) begin
-                        fill_sel <= 0;
-                        post_fill_sel <= 1;
-                        read_valid_a <= 0;
-                        read_valid_b <= 0;
-                        read_beats_a <= 0;
-                        read_beats_b <= 0;
+                        fill_idx <= 0;
+                        post_fill_idx <= 1;
+                        read_valid <= 0;
+                        read_beats <= 0;
                         fill_reset_armed <= 0;
                     end
 
@@ -758,8 +754,8 @@ module sdram(
                     serial_read_active <= 0;
                     // Invalidate the fill target up front; set again below
                     // when the final beat publishes.
-                    if (fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
-                    else begin read_valid_a <= 0; read_beats_a <= 0; end
+                    read_valid[fill_idx] <= 0;
+                    read_beats[{fill_idx, 2'b00} +: 4] <= 0;
 
                     // READ command with auto-precharge
                     cs_o <= spi_chip_sel;
@@ -799,8 +795,8 @@ module sdram(
                     cmd_wait <= (tREAD + 5'd2) > 1;
                     read_busy <= 1;
                     serial_read_active <= 1;
-                    read_valid_a <= 0;
-                    read_beats_a <= 0;
+                    read_valid[0] <= 0;
+                    read_beats[3:0] <= 0;
 
                     // READ command with auto-precharge
                     cs_o <= access_chip_sel;
@@ -874,71 +870,38 @@ module sdram(
             // over SPI and serial command dispatches in the same cycle.
             
             // Read data capture: each beat's bytes publish straight into
-            // the target buffer (progressive publish, see layout note at the
+            // the target slot (progressive publish, see layout note at the
             // top of this file). Beats of one READ arrive back-to-back, and
-            // the ping-pong target is always the idle half, so the SPI side
-            // never observes a torn burst.
+            // the fill target is never a slot still being shifted out, so
+            // the SPI side never observes a torn burst.
             if ((readcount > tCAS + RD_PIPELINE_DELAY) && (readcount <= tCAS + RD_PIPELINE_DELAY + BURST_LEN)) begin
                 // rdbuf_write_ptr counts 0..3 (4 words in burst).
                 // Byte-serial progressive publish: beat w completes bytes
-                // 2w/2w+1 straight into the target buffer (serial: A; SPI:
-                // ping-pong fill target). Beats of one READ arrive
+                // 2w/2w+1 straight into the target slot (serial: slot 0;
+                // SPI: ring fill target). Beats of one READ arrive
                 // back-to-back, so later bytes are always ready long before
                 // the SPI side shifts them out; only the first byte(s) of a
                 // burst are timing-critical. read_valid marks beat 0 for
                 // the thin-margin check; read_beats marks each beat for
                 // actual output checks, including high-offset short reads.
-                // (Explicit lanes rather than variable part-selects: safest
-                // across Yosys, Verilator, and Gowin synthesis.)
-                if (serial_read_active || !fill_sel)
-                    read_beats_a[rdbuf_write_ptr] <= 1;
-                else
-                    read_beats_b[rdbuf_write_ptr] <= 1;
-                case (rdbuf_write_ptr)
-                    2'd0: begin
-                        if (serial_read_active) begin
-                            read_buffer[15:0] <= dq_captured;
-                            read_valid_a <= 1;
-                        end
-                        else if (fill_sel) begin
-                            read_buffer_b[15:0] <= dq_captured;
-                            read_valid_b <= 1;
-                        end
-                        else begin
-                            read_buffer[15:0] <= dq_captured;
-                            read_valid_a <= 1;
-                        end
+                // The part-select base is an exact bit concatenation
+                // ({slot, beat, 4'b0} = slot*64 + beat*16), not arithmetic.
+                read_beats[{fill_target, rdbuf_write_ptr}] <= 1;
+                read_buffers[{fill_target, rdbuf_write_ptr, 4'b0000} +: 16] <= dq_captured;
+                if (rdbuf_write_ptr == 0)
+                    read_valid[fill_target] <= 1;
+                if (rdbuf_write_ptr == 3) begin
+                    read_busy <= 0;
+                    if (serial_read_active) begin
+                        // Serial completion restarts SPI pairing at slot 0.
+                        read_valid[3:1] <= 0;
+                        read_beats[15:4] <= 0;
+                        fill_idx <= 0;
+                        serial_read_active <= 0;
                     end
-                    2'd1: begin
-                        if (serial_read_active) read_buffer[31:16] <= dq_captured;
-                        else if (fill_sel) read_buffer_b[31:16] <= dq_captured;
-                        else read_buffer[31:16] <= dq_captured;
-                    end
-                    2'd2: begin
-                        if (serial_read_active) read_buffer[47:32] <= dq_captured;
-                        else if (fill_sel) read_buffer_b[47:32] <= dq_captured;
-                        else read_buffer[47:32] <= dq_captured;
-                    end
-                    2'd3: begin
-                        if (serial_read_active) begin
-                            read_buffer[63:48] <= dq_captured;
-                            read_valid_a <= 1;
-                            read_valid_b <= 0;
-                            read_beats_b <= 0;
-                            fill_sel <= 0;
-                            serial_read_active <= 0;
-                        end
-                        else if (fill_sel) begin
-                            read_buffer_b[63:48] <= dq_captured;
-                            fill_sel <= 0;
-                        end
-                        else begin
-                            read_buffer[63:48] <= dq_captured;
-                            fill_sel <= 1;
-                        end
-                        read_busy <= 0;
-                    end
-                endcase
+                    else
+                        fill_idx <= fill_idx + 1'b1;
+                end
 
                 rdbuf_write_ptr <= rdbuf_write_ptr + 1;
             end

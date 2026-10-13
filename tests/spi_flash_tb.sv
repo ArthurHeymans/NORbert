@@ -57,7 +57,7 @@ module spi_flash_tb;
         .clk(clk), .spi_clk(sck), .spi_reset(spi_reset), .spi_csel(cs),
         .spi_io0_in(mosi), .spi_io1_in(1'b0), .spi_io2_in(1'b1), .spi_io3_in(1'b1),
         .spi_io1_out(miso), .spi_io1_oe(miso_oe),
-        .ram_read_buffer(read_buffer), .ram_read_busy(busy),
+        .ram_read_buffers({4{read_buffer}}), .ram_read_busy(busy),
         .write_cmd(write_cmd), .write_type(write_type), .write_addr(write_addr),
         .write_len(write_len), .write_partial(write_partial), .write_done(write_done),
         .write_buf_strobe(write_strobe), .write_buf_offset(write_offset),

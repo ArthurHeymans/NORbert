@@ -11,7 +11,8 @@ module refresh_tb;
     wire [1:0] access;
     wire [24:0] address;
     wire busy, read_busy, inhibit, accept;
-    wire [63:0] read_buffer, write_buffer;
+    wire [255:0] read_buffers;
+    wire [63:0] read_buffer = read_buffers[63:0], write_buffer;
     reg spi_active = 0, spi_inhibit = 0, spi_activate = 0, spi_read = 0;
     wire ras, cas, we, chip;
     wire [1:0] bank;
@@ -36,7 +37,7 @@ module refresh_tb;
         .spi_cmd_activate(spi_activate), .spi_cmd_read(spi_read),
         .spi_cmd_post_toggle(1'b0), .spi_addr(23'h001234),
         .access_cmd(access), .access_addr(address), .inhibit_refresh(inhibit),
-        .cmd_busy(busy), .access_accept(accept), .read_buffer(read_buffer), .read_busy(read_busy),
+        .cmd_busy(busy), .access_accept(accept), .read_buffers(read_buffers), .read_busy(read_busy),
         .write_buffer(write_buffer), .ras_o(ras), .cas_o(cas), .we_o(we),
         .cs_o(chip), .ba_o(bank));
 

@@ -13,9 +13,9 @@ module prefetch_health_tb;
         .cfg_profile(460'b0), .cfg_profile_valid(1'b0), .cfg_profile_epoch(32'b0),
         .cfg_erase_wren(1'b0), .cfg_erase_waddr(5'b0), .cfg_erase_wdata(50'b0),
         .cfg_chip_erase_bursts(23'h0fffff), .sfdp_rdata(8'hff),
-        .ram_read_buffer(64'h0123456789abcdef), .ram_read_buffer_b(64'hfedcba9876543210),
-        .ram_read_valid_a(beats[0]), .ram_read_valid_b(1'b0),
-        .ram_read_beats_a(beats), .ram_read_beats_b(4'b0), .ram_read_busy(1'b1),
+        .ram_read_buffers({128'b0, 64'hfedcba9876543210, 64'h0123456789abcdef}),
+        .ram_read_valid({3'b000, beats[0]}),
+        .ram_read_beats({12'b0, beats}), .ram_read_busy(1'b1),
         .prefetch_underrun(underrun), .prefetch_thin(thin));
     task bit_spi(input bit b); io0=b; #20; sck=1; #20; sck=0; endtask
     task byte_spi(input [7:0] b); for(integer i=7;i>=0;i--) bit_spi(b[i]); endtask

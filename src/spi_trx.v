@@ -36,12 +36,9 @@ module spi_trx(
     output wire ram_continuation,
     output wire ram_post_toggle,
     output wire [22:0] ram_addr,       // 23-bit burst address for 64MB
-    input wire [63:0] ram_read_buffer,
-    input wire [63:0] ram_read_buffer_b,
-    input wire ram_read_valid_a,
-    input wire ram_read_valid_b,
-    input wire [3:0] ram_read_beats_a,
-    input wire [3:0] ram_read_beats_b,
+    input wire [255:0] ram_read_buffers,
+    input wire [3:0] ram_read_valid,
+    input wire [15:0] ram_read_beats,
     input wire ram_read_busy,
     // Sticky per-transaction diagnostics: an output sample used an unready
     // beat (underrun), or the upcoming first beat was not ready at a burst
@@ -336,12 +333,9 @@ module spi_trx(
         .ram_continuation(ram_continuation),
         .ram_post_toggle(ram_post_toggle),
         .ram_addr(ram_addr),
-        .ram_read_buffer(ram_read_buffer),
-        .ram_read_buffer_b(ram_read_buffer_b),
-        .ram_read_valid_a(ram_read_valid_a),
-        .ram_read_valid_b(ram_read_valid_b),
-        .ram_read_beats_a(ram_read_beats_a),
-        .ram_read_beats_b(ram_read_beats_b),
+        .ram_read_buffers(ram_read_buffers),
+        .ram_read_valid(ram_read_valid),
+        .ram_read_beats(ram_read_beats),
         .live_buffer(live_buffer),
         .live_beats(live_beats),
         .live_first_byte(live_first_byte),
@@ -845,7 +839,7 @@ module spi_trx(
                 // ---------------------------------------------------------
                 else if (state == STA_READ) begin
                     // The next burst starts after byte 7. spi_prefetch has
-                    // it in the other ping-pong half by then.
+                    // it in the next ring slot by then.
                     if (addr[2:0] == 7 && bit_count_in == 0)
                         fresh_read <= 1;
 
