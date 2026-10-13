@@ -251,10 +251,12 @@ module spi_trx(
     wire addr_last = addr_count == ({2'b00, addr_lanes} - 5'd1);
     
     // Set on the clock that starts a new burst in STA_READ; the first byte
-    // of the burst comes straight from live_buffer.
+    // of the burst comes straight from the prefetch buffer via
+    // live_first_byte (see spi_prefetch).
     reg fresh_read = 0;
     wire [63:0] live_buffer;
     wire [3:0] live_beats;
+    wire [7:0] live_first_byte;
     wire [2:0] next_byte = addr[2:0] + 3'd1;
 
     // Status registers
@@ -292,6 +294,7 @@ module spi_trx(
         .restart(reset_cs || reset_power),
         .addr_mask(cfg_chip_erase_bursts),
         .fresh_read(fresh_read),
+        .burst_offset(addr[2:0]),
         .in_read(in_read),
         .sample_missing(sample_missing),
         .release_inhibit(state == STA_CMD && bit_count_in == 0 &&
@@ -323,6 +326,7 @@ module spi_trx(
         .ram_read_beats_b(ram_read_beats_b),
         .live_buffer(live_buffer),
         .live_beats(live_beats),
+        .live_first_byte(live_first_byte),
         .prefetch_underrun(prefetch_underrun),
         .prefetch_thin(prefetch_thin)
     );
@@ -833,7 +837,7 @@ module spi_trx(
                     end
 
                     if (fresh_read) begin
-                        miso_byte <= live_buffer[addr[2:0]*8 +: 8];
+                        miso_byte <= live_first_byte;
                         miso_byte_valid <= live_beats[addr[2:1]];
                     end
                 end
@@ -1037,10 +1041,10 @@ module spi_trx(
             // IO3 = MSB of nibble, IO0 = LSB of nibble
             // bit_count_in=1: high nibble [7:4], bit_count_in=0: low nibble [3:0]
             if (fresh_read) begin
-                spi_io3_out <= live_buffer[addr[2:0]*8 + 7];
-                spi_io2_out <= live_buffer[addr[2:0]*8 + 6];
-                spi_io1_out <= live_buffer[addr[2:0]*8 + 5];
-                spi_io0_out <= live_buffer[addr[2:0]*8 + 4];
+                spi_io3_out <= live_first_byte[7];
+                spi_io2_out <= live_first_byte[6];
+                spi_io1_out <= live_first_byte[5];
+                spi_io0_out <= live_first_byte[4];
             end
             else begin
                 spi_io3_out <= miso_byte[{bit_count_in[0], 2'b11}];
@@ -1053,8 +1057,8 @@ module spi_trx(
             // Dual output: 2 bits per clock
             // IO1 = high bit of pair, IO0 = low bit of pair
             if (fresh_read) begin
-                spi_io1_out <= live_buffer[addr[2:0]*8 + 7];
-                spi_io0_out <= live_buffer[addr[2:0]*8 + 6];
+                spi_io1_out <= live_first_byte[7];
+                spi_io0_out <= live_first_byte[6];
             end
             else begin
                 spi_io1_out <= miso_byte[{bit_count_in[1:0], 1'b1}];
@@ -1064,7 +1068,7 @@ module spi_trx(
         else begin
             // Single output on IO1 (MISO)
             if (fresh_read)
-                spi_io1_out <= live_buffer[addr[2:0]*8 + 7];
+                spi_io1_out <= live_first_byte[7];
             else
                 spi_io1_out <= miso_byte[bit_count_in];
         end
