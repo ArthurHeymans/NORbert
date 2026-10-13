@@ -1,23 +1,48 @@
 // Controller protocol hints, not a model of flash protection circuitry.
+//
+// profile_byte reads the held system-domain cfg_profile bundle. It is
+// used only at the per-transaction capture edge below and for the
+// status reseed values read at that same edge in spi_trx; all runtime
+// decode below consumes the captured SCK-domain shadow fields, so no
+// decode path crosses clock domains. Configuration must be stable from
+// CS falling through that first clock (the host only reconfigures while
+// emulation is stopped, which is stronger).
 function [7:0] profile_byte;
     input integer index;
     begin profile_byte = cfg_profile[index*8 +: 8]; end
 endfunction
+always @(posedge spi_clk) begin
+    if (is_selected && (reset_cs || reset_power)) begin
+        sh_valid <= cfg_profile_valid;
+        sh_jedec <= cfg_jedec_id;
+        sh_4byte <= cfg_4byte;
+        sh_erase_bursts <= cfg_chip_erase_bursts;
+        sh_cmd_flags <= profile_byte(11);
+        sh_addr_flags <= profile_byte(10);
+        sh_p2 <= profile_byte(2);
+        sh_p7 <= profile_byte(7);
+        sh_is_atmel <= cfg_profile_valid && profile_byte(1) == 2;
+        sh_uid <= cfg_profile[191:128];
+        sh_page_mask <= 8'hff >> (4'd8 - {1'b0, cfg_profile[227:224]});
+        sh_erase_ops <= cfg_profile[319:256];
+        sh_erase_cnts <= cfg_profile[331:320];
+    end
+end
 wire [7:0] received_byte = {mosi_byte[7:1], spi_io0_in};
-wire [7:0] command_flags = profile_byte(11);
-wire [7:0] address_flags = profile_byte(10);
-wire [25:0] capacity_mask = {cfg_chip_erase_bursts, 3'b111};
-wire is_atmel = cfg_profile_valid && profile_byte(1) == 2;
-wire [63:0] profile_uid = cfg_profile[191:128];
-wire is_macronix = cfg_profile_valid && cfg_jedec_id[7:0] == 8'hc2;
-wire is_spansion = cfg_profile_valid && cfg_jedec_id[7:0] == 8'h01;
-wire [7:0] status_value = cfg_profile_valid ?
-    ((status_reg & ~(profile_byte(2) | profile_byte(7) | 8'h80) & 8'hfc) |
+wire [7:0] command_flags = sh_cmd_flags;
+wire [7:0] address_flags = sh_addr_flags;
+wire [25:0] capacity_mask = {sh_erase_bursts, 3'b111};
+wire is_atmel = sh_is_atmel;
+wire [63:0] profile_uid = sh_uid;
+wire is_macronix = sh_valid && sh_jedec[7:0] == 8'hc2;
+wire is_spansion = sh_valid && sh_jedec[7:0] == 8'h01;
+wire [7:0] status_value = sh_valid ?
+    ((status_reg & ~(sh_p2 | sh_p7 | 8'h80) & 8'hfc) |
      {6'b0,status_reg[1:0]} | (is_atmel ? 8'h10 : 8'h00)) : status_reg;
 wire [7:0] status_reg2_value = is_macronix ?
-    {status_reg2[7:6],addr_4byte,status_reg2[4:0]} : cfg_profile_valid ? status_reg2 & 8'hbe : status_reg2;
+    {status_reg2[7:6],addr_4byte,status_reg2[4:0]} : sh_valid ? status_reg2 & 8'hbe : status_reg2;
 wire can_mutate = !status_reg[0] || write_busy_clr;
-wire quad_enabled = cfg_profile_valid || status_reg2[1];
+wire quad_enabled = sh_valid || status_reg2[1];
 reg [7:0] transaction_opcode;
 reg [31:0] profile_epoch_seen = 0;
 reg profile_loaded = 0;
@@ -25,7 +50,7 @@ reg [7:0] status_reg3 = 0;
 reg [15:0] nvcr = 16'hffff;
 reg [7:0] vcr = 8'hfb, evcr = 8'hff;
 reg [7:0] config_reg3 = 0, config_reg4 = 0, config_reg5 = 0;
-wire is_micron = cfg_profile_valid && cfg_jedec_id[7:0] == 8'h20;
+wire is_micron = sh_valid && sh_jedec[7:0] == 8'h20;
 function [7:0] addressed_config;
     input [4:0] index;
     begin
@@ -69,7 +94,7 @@ reg program_quad = 0;
 wire [2:0] program_byte_top = program_quad ? 3'd1 : 3'd7;
 wire [7:0] program_byte = program_quad ?
     {mosi_byte[3:0], spi_io3_in, spi_io2_in, spi_io1_in, spi_io0_in} : received_byte;
-wire [7:0] page_mask = 8'hff >> (4'd8 - {1'b0, cfg_profile[227:224]});
+wire [7:0] page_mask = sh_page_mask;
 
 // Paired opcode descriptors: read both possible final-bit commands on the
 // penultimate command clock. The last bit selects one on the decode edge,
@@ -167,11 +192,11 @@ integer erase_i;
 always @* begin
     profile_erase_match = 0; profile_erase_native = 0; profile_erase_index = 0;
     for (erase_i=0; erase_i<4; erase_i=erase_i+1)
-        if (cfg_profile[320+erase_i*3 +:3] != 0 &&
-            (received_byte == cfg_profile[256+erase_i*16 +:8] ||
-             (cfg_profile[264+erase_i*16 +:8] != 0 && received_byte == cfg_profile[264+erase_i*16 +:8]))) begin
+        if (sh_erase_cnts[erase_i*3 +:3] != 0 &&
+            (received_byte == sh_erase_ops[erase_i*16 +:8] ||
+             (sh_erase_ops[erase_i*16+8 +:8] != 0 && received_byte == sh_erase_ops[erase_i*16+8 +:8]))) begin
             profile_erase_match = 1;
-            profile_erase_native = received_byte == cfg_profile[264+erase_i*16 +:8];
+            profile_erase_native = received_byte == sh_erase_ops[erase_i*16+8 +:8];
             profile_erase_index = erase_i[1:0];
         end
 end
