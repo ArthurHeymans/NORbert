@@ -146,6 +146,45 @@ set_input_delay -clock sdram_clk -min SDRAM_TCO_MIN_PLUS_FLIGHT [get_ports {IO_s
 
 ## Validation and remaining sign-off
 
+### SPI read prefetch: open rows, burst pair, critical word first
+
+Gowin Education 1.9.11.03 placed/routed every revision of the read
+performance stack with the checked-in constraints (setup/hold counts are
+the violated paths among the 2000 worst reported; all are SPI/system
+inter-clock paths, same-clock TNS is zero unless the system Fmax is below
+120 MHz):
+
+| Revision | SPI Fmax | System Fmax | Setup / hold violations |
+|---|---:|---:|---:|
+| Controller compatibility (base) | 68.799 MHz | 121.281 MHz | 210 / 78 |
+| Refresh one chip per event | 57.647 MHz | 120.124 MHz | 94 / 91 |
+| Fresh read byte in `spi_prefetch` | 63.882 MHz | 121.534 MHz | 187 / 104 |
+| SPI-domain configuration snapshot | 67.937 MHz | 121.589 MHz | 96 / 246 |
+| Open rows, unregistered row lookup | 66.594 MHz | **101.407 MHz** | 127 / 219 |
+| Open rows | 55.382 MHz | 120.937 MHz | 64 / 242 |
+| Controller-fetched burst pair | 69.844 MHz | 120.205 MHz | 11 / 257 |
+| Critical word first | 73.260 MHz | 120.038 MHz | 129 / 202 |
+
+These Fmax values only show how far place-and-route went past the
+constraints: the timing-driven flow stops once 40/120 MHz are met, so they
+cluster just above 120 MHz and the SPI figures swing with placement. The
+one real regression was the open-row lookup behind the redirect mux, until
+both the SPI and pair lookups were registered. Constrained for 150 MHz
+system and 100 MHz SPI clocks, with three placement algorithms each:
+
+| Revision | SPI Fmax | System Fmax |
+|---|---:|---:|
+| Controller compatibility (base) | 77.2-79.7 MHz | 122.7-125.9 MHz |
+| Critical word first | 79.0-83.5 MHz | 125.2-130.1 MHz |
+
+The system clock has a few percent of real headroom. The SPI clock domain
+closes near 80 MHz, limited by the half-period falling-edge output path
+(`addr`/`consume_sel` to the `spi_ioN_out` flops); that path, not the SDRAM
+pipeline, bounds reads above that. The configuration snapshot adds hold
+violations on its capture flops; the bundle is held while emulation runs,
+so they are not functional, but they still need an explicit exception
+before sign-off. No board was tested.
+
 ### Rebased protocol9 controller compatibility
 
 The PR integrates the upstream refresh/row interlocks, UART buffering, busy

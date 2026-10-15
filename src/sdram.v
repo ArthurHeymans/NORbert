@@ -35,7 +35,8 @@
 //   spi_addr[22]    = chip select (0=chip0, 1=chip1)
 //   spi_addr[21:9]  = row (13 bits)
 //   spi_addr[8:7]   = bank (2 bits)
-//   spi_addr[6:0]   = column / 4 (7 bits, col[8:2], burst-4 aligned)
+//   spi_addr[6:0]   = column / 4 (7 bits, col[8:2]); the READ's col[1:0]
+//                     is the start word (spi_word, critical word first)
 
 `default_nettype none
 
@@ -60,6 +61,10 @@ module sdram(
     input wire spi_cmd_activate,
     input wire spi_cmd_read,
     input wire [22:0] spi_addr,      // 23-bit burst address (64MB)
+    // First SDRAM word of the burst (critical word first): the READ
+    // starts there and the sequential burst wraps, so the word the SPI
+    // side needs first arrives first. Bundled with spi_addr's column.
+    input wire [1:0] spi_word,
     input wire spi_cmd_post_toggle, // Toggles on every SPI prefetch post
     input wire spi_cmd_continuation, // Post is a lookahead (bundled with spi_addr)
     // Second burst of an array read. The SPI side raises this level once
@@ -360,7 +365,7 @@ module sdram(
     wire spi_chip_sel  = spi_addr_latched[22];
     wire [12:0] spi_row  = spi_addr_latched[21:9];
     wire [1:0]  spi_bank = spi_addr_latched[8:7];
-    wire [8:0]  spi_col  = {spi_addr[6:0], 2'b00};  // Burst-4 aligned
+    wire [8:0]  spi_col  = {spi_addr[6:0], 2'b00};  // Burst-4 aligned base
 
     // Serial/glue path: 25-bit address = {chip, row, bank, col}
     //   [24]     = chip select
@@ -383,6 +388,7 @@ module sdram(
     reg [RD_STAGES-1:0] rd_pipe;
     reg [RD_STAGES-1:0] rd_tag_b;      // SPI fill into read_buffer_b
     reg [RD_STAGES-1:0] rd_tag_serial; // Serial-path read (always read_buffer)
+    reg [RD_STAGES-1:0] rd_tag_w0_lo, rd_tag_w0_hi; // Start word of the READ
     // A READ is on its way to or on the DQ bus. Serial READ/WRITE, a READ
     // to the other chip (shared DQ bus) and the SPI fill reset wait for
     // this to clear, keeping the old READ-to-access spacing and bus
@@ -396,6 +402,9 @@ module sdram(
                         beat_stage[2] ? 2'd2 : 2'd3;
     wire beat_b = |(rd_tag_b[RD_BEAT0 +: 4] & beat_stage);
     wire beat_serial = |(rd_tag_serial[RD_BEAT0 +: 4] & beat_stage);
+    // Buffer word of this beat: the burst wraps from its start word.
+    wire [1:0] beat_w = beat_k + {|(rd_tag_w0_hi[RD_BEAT0 +: 4] & beat_stage),
+                                  |(rd_tag_w0_lo[RD_BEAT0 +: 4] & beat_stage)};
     reg [2:0] wrbuf_read_ptr;
 
     // Read data capture: DQ sampled on aux_clk (phase-shifted for proper timing)
@@ -446,6 +455,8 @@ module sdram(
             rd_pipe <= 0;
             rd_tag_b <= 0;
             rd_tag_serial <= 0;
+            rd_tag_w0_lo <= 0;
+            rd_tag_w0_hi <= 0;
             last_read_chip <= 0;
 
             wrbuf_read_ptr <= 0;
@@ -489,6 +500,8 @@ module sdram(
             rd_pipe <= {rd_pipe[RD_STAGES-2:0], 1'b0};
             rd_tag_b <= {rd_tag_b[RD_STAGES-2:0], 1'b0};
             rd_tag_serial <= {rd_tag_serial[RD_STAGES-2:0], 1'b0};
+            rd_tag_w0_lo <= {rd_tag_w0_lo[RD_STAGES-2:0], 1'b0};
+            rd_tag_w0_hi <= {rd_tag_w0_hi[RD_STAGES-2:0], 1'b0};
 
             // Saturate at capacity, not the dispatch deadline: elapsed
             // service/deferral time remains owed until actually refreshed.
@@ -702,7 +715,7 @@ module sdram(
                         a_o[9] <= 1'b0;         // Write burst: programmed length
                         a_o[8:7] <= 2'b00;      // Standard operation
                         a_o[6:4] <= tCAS[2:0];  // CAS latency = 2 (tCAS)
-                        a_o[3] <= 1'b0;         // Burst type: sequential
+                        a_o[3] <= 1'b0;         // Burst type: sequential (spi_word wraps)
                         a_o[2:0] <= BURST_MODE; // Burst length = 4
                     end
                     else begin
@@ -1064,6 +1077,8 @@ module sdram(
                     rd_pipe[0] <= 1;
                     rd_tag_b[0] <= fill_sel;
                     rd_tag_serial[0] <= 0;
+                    rd_tag_w0_lo[0] <= spi_word[0];
+                    rd_tag_w0_hi[0] <= spi_word[1];
                     last_read_chip <= spi_chip_sel;
                     // Fills alternate in dispatch order. Invalidate the
                     // target up front; its beats set the flags again.
@@ -1079,7 +1094,7 @@ module sdram(
                     we_o <= 1;
                     ba_o <= spi_bank;
                     a_o <= 0;
-                    a_o[8:0] <= spi_col;     // 9-bit column, burst-4 aligned
+                    a_o[8:0] <= {spi_col[8:2], spi_word};
                     a_o[10] <= 0;
                     dq_oe_o <= 0;
                     dqm_o <= 2'b00;
@@ -1228,8 +1243,8 @@ module sdram(
             // Yosys, Verilator, and Gowin synthesis.)
             if (beat_any) begin
                 if (beat_serial || !beat_b) begin
-                    read_beats_a[beat_k] <= 1;
-                    case (beat_k)
+                    read_beats_a[beat_w] <= 1;
+                    case (beat_w)
                         2'd0: read_buffer[15:0] <= dq_captured;
                         2'd1: read_buffer[31:16] <= dq_captured;
                         2'd2: read_buffer[47:32] <= dq_captured;
@@ -1238,8 +1253,8 @@ module sdram(
                     if (beat_k == 2'd0) read_valid_a <= 1;
                 end
                 else begin
-                    read_beats_b[beat_k] <= 1;
-                    case (beat_k)
+                    read_beats_b[beat_w] <= 1;
+                    case (beat_w)
                         2'd0: read_buffer_b[15:0] <= dq_captured;
                         2'd1: read_buffer_b[31:16] <= dq_captured;
                         2'd2: read_buffer_b[47:32] <= dq_captured;
