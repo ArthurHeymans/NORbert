@@ -40,6 +40,7 @@ module quad_fast_tb;
 
     wire [22:0] ram_addr, ram_addr2;
     wire ram_pair;
+    wire [1:0] ram_word;
     wire ram_act, ram_read, ram_cont, ram_inh;
     wire [63:0] read_buffer_a, read_buffer_b;
     wire read_valid_a, read_valid_b, read_busy;
@@ -57,7 +58,7 @@ module quad_fast_tb;
         .spi_io3_in(io3_in), .spi_io3_out(io3_out), .spi_io3_oe(io3_oe),
         .ram_inhibit_refresh(ram_inh), .ram_activate(ram_act), .ram_read(ram_read),
         .ram_continuation(ram_cont), .ram_addr(ram_addr),
-        .ram_pair(ram_pair), .ram_addr2(ram_addr2),
+        .ram_word(ram_word), .ram_pair(ram_pair), .ram_addr2(ram_addr2),
         .ram_read_buffer(read_buffer_a), .ram_read_buffer_b(read_buffer_b),
         .ram_read_valid_a(read_valid_a), .ram_read_valid_b(read_valid_b),
         .ram_read_beats_a(read_beats_a), .ram_read_beats_b(read_beats_b),
@@ -82,7 +83,7 @@ module quad_fast_tb;
         .spi_active(!cs), .spi_inhibit_refresh(ram_inh),
         .spi_cmd_activate(ram_act), .spi_cmd_read(ram_read), .spi_addr(ram_addr),
         .spi_cmd_post_toggle(post_toggle), .spi_cmd_continuation(ram_cont),
-        .spi_cmd_pair(ram_pair), .spi_addr2(ram_addr2),
+        .spi_word(ram_word), .spi_cmd_pair(ram_pair), .spi_addr2(ram_addr2),
         .access_cmd(2'b00), .access_addr(25'b0), .inhibit_refresh(1'b0),
         .read_buffer(read_buffer_a), .read_buffer_b(read_buffer_b),
         .read_valid_a(read_valid_a), .read_valid_b(read_valid_b),
@@ -158,8 +159,9 @@ module quad_fast_tb;
                     // Queue the first beat two negedges after READ (CAS=2).
                     // dq_drv holds each beat for aux_clk's posedge capture;
                     // the main-clock logic consumes it one cycle later.
+                    // Sequential BL4 wraps from the start column a[1:0].
                     for (integer w = 0; w < 4; w++) begin
-                        beat_pipe[1+w] <= enc_word(burst, w[1:0]);
+                        beat_pipe[1+w] <= enc_word(burst, w[1:0] + a[1:0]);
                         beat_valid[1+w] <= 1;
                     end
                 end
@@ -662,8 +664,11 @@ module quad_fast_tb;
         sweep_offsets(9'heb, 32, 32'h00d800, 0);
         sweep_offsets(9'h6b, 32, 32'h00d800, 0);
         sclk_half = 7.143;
-        // Dual-IO at 70MHz (explore: short mode phase + tiny first bursts).
-        sweep_offsets(9'hbb, 32, 32'h00e000, 0);
+        // Dual-IO at 70MHz: the first burst starts at the byte-7 word's
+        // half (critical word first), so offsets 6-7 meet the short mode
+        // phase.
+        sweep_offsets(9'hbb, 32, 32'h00e000);
+        $display("quad_fast: 0xBB @70MHz OK");
         // Slow read above 40MHz (explore: only 3.5 clocks for all beats).
         sclk_half = 10.0;
         sweep_offsets(9'h03, 32, 32'h00f800, 0);
@@ -688,9 +693,9 @@ module quad_fast_tb;
         sclk_half = 7.143;  // 70 MHz, same as 0x6B
         sweep_offsets(9'h6c, 32, 32'h0123_4500);
         $display("quad_fast: 0x6C 4-byte quad-out @70MHz OK");
-        sclk_half = 8.333;  // 60 MHz, same as 0xBB
+        sclk_half = 7.143;  // 70 MHz, same as 0xBB
         sweep_offsets(9'hbc, 32, 32'h0123_4500);
-        $display("quad_fast: 0xBC 4-byte dual-io @60MHz OK");
+        $display("quad_fast: 0xBC 4-byte dual-io @70MHz OK");
         sclk_half = 7.143;  // 70 MHz, same as 0xEB
         sweep_offsets(9'hec, 32, 32'h0023_4500);
         $display("quad_fast: 0xEC 4-byte quad-io @70MHz OK");
@@ -729,7 +734,7 @@ module quad_fast_tb;
         refresh_sweep(9'hbb, 8.333, 32'h028000);
         refresh_sweep(9'h6b, 7.143, 32'h030000);
         refresh_sweep(9'heb, 7.143, 32'h038000);
-        refresh_sweep(9'hbb, 7.143, 32'h048000, 0);
+        refresh_sweep(9'hbb, 7.143, 32'h048000);
         refresh_sweep(9'h03, 10.0,  32'h050000, 0);
 
         short_read_run(25.0, 2000);

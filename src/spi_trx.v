@@ -36,6 +36,7 @@ module spi_trx(
     output wire ram_continuation,
     output wire ram_post_toggle,
     output wire [22:0] ram_addr,       // 23-bit burst address for 64MB
+    output wire [1:0] ram_word,        // Start word of the first burst
     output wire ram_pair,              // Address done: fetch ram_addr2 too
     output wire [22:0] ram_addr2,      // Second burst of an array read
     input wire [63:0] ram_read_buffer,
@@ -324,6 +325,12 @@ module spi_trx(
         .first_row(addr_quad ? {addr[13:0], spi_io3_in, spi_io2_in} : addr[15:0]),
         .first_read(addr_read && addr_count == 3),
         .first_col({addr[5:0], addr_lane_msb}),
+        // Quad: the column clock is the last address clock and IO2/IO1
+        // carry byte-address bits 2/1 (the SDRAM word). Dual: IO0 carries
+        // bit 2, so start at the even word of that half; the byte-7 word
+        // then arrives second instead of last.
+        .first_word(addr_quad ? {spi_io2_in, spi_io1_in} :
+                    addr_dual ? {spi_io0_in, 1'b0} : 2'b00),
         .first_done(addr_read && addr_last && !addr_dual && !addr_quad),
         .addr_end(addr_read && addr_last),
         .drop((state == STA_MODE_MULTI && mode_count == 3) ||
@@ -335,6 +342,7 @@ module spi_trx(
         .ram_continuation(ram_continuation),
         .ram_post_toggle(ram_post_toggle),
         .ram_addr(ram_addr),
+        .ram_word(ram_word),
         .ram_pair(ram_pair),
         .ram_addr2(ram_addr2),
         .ram_read_buffer(ram_read_buffer),
