@@ -11,4 +11,4 @@
 create_clock -name clk -period 8.333 [get_nets {clk}]
 create_clock -name aux_clk -period 8.333 [get_nets {aux_clk}]
 create_clock -name sdram_clk -period 8.333 [get_nets {clk_133_sdram}]
-create_clock -name spi_clk -period 25.000 [get_nets {spi_clk_in}]
+create_clock -name spi_clk -period 14.286 [get_nets {spi_clk_in}]

@@ -20,12 +20,15 @@ aux-to-main transfers are **not asynchronous exceptions**. The SDRAM pin
 clock is constrained at `O_sdram_clk`; its internal alias is optimized away
 by Gowin. Keep constraints and `src/pll.v` defparams in sync.
 
-The external SPI clock is unrelated and may stop indefinitely. The default
-constraint is 40 MHz: the strict all-opcode/all-offset **simulation** envelope
-for legacy/default framing. Profile-selected waits change the first-burst
-budget and need their own per-mode margins; configured framing checks are
-not a blanket 40 MHz guarantee for every latency setting. Faster modes in
-the fast-read bench are exploratory, not hardware promises.
+The external SPI clock is unrelated and may stop indefinitely. It is
+constrained at 70 MHz, the fastest documented read mode in simulation, so
+place-and-route closes the SPI domain for it; Gowin's timing-driven flow
+stops at the constraint, so a lower one would leave it to chance. The
+per-command limits (40 MHz for 0x03) come from the first-burst budget, not
+this clock domain. Profile-selected waits change that budget and need their
+own per-mode margins; configured framing checks are not a blanket guarantee
+for every latency setting. Faster modes in the fast-read bench are
+exploratory, not hardware promises.
 Mode-0 inputs are sampled on rising SCK and read outputs change on falling
 SCK. CS directly frames transactions and releases output enables; it is not
 debounced. Supply CS/SCK setup, hold, duty-cycle and reset-recovery margins

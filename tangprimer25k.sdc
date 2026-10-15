@@ -6,8 +6,9 @@ create_generated_clock -name sys_clk -source [get_ports {clk_50mhz}] -multiply_b
 create_generated_clock -name sdram_clk -source [get_ports {clk_50mhz}] -multiply_by 12 -divide_by 5 -phase 162 [get_ports {O_sdram_clk}]
 create_generated_clock -name aux_clk -source [get_ports {clk_50mhz}] -multiply_by 12 -divide_by 5 -phase 90 [get_nets {aux_clk}]
 
-// All-command functional test envelope; faster modes are exploratory.
-create_clock -name spi_clk -period 25.000 [get_ports {spi_clk_pin}]
+// Fastest documented read mode (70 MHz, see README). 0x03 is limited to
+// 40 MHz by its first-burst budget, not by this clock domain.
+create_clock -name spi_clk -period 14.286 [get_ports {spi_clk_pin}]
 
 // SPI and system clocks are unrelated. Bound their crossing datapaths
 // explicitly instead of false-pathing whole domains (which would hide
