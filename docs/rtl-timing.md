@@ -46,13 +46,13 @@ clock declarations must not be used as a phase-aware sign-off model.
 
 | Crossing | Contract |
 |---|---|
-| SPI requests/address to `sdram` | Synchronized control with a bundled, held address/post selector. A new post identifies a new descriptor; the in-flight fill and next posted fill have independent ownership. The source must retain its payload through destination capture. |
+| SPI requests/address to `sdram` | Synchronized control with a bundled, held address/post selector. A new post identifies a new descriptor; the in-flight fill and next posted fill have independent ownership. The source must retain its payload through destination capture. The controller registers the (redirected) post address on every clock and decides ACTIVATEs from that copy and its registered open-row lookups, at the post level's third synchronizer stage, so the crossing itself is a plain register capture. |
 | SPI burst pair to `sdram` | One level per array read, raised when the address phase ends, with the second burst's address bundled and held until the next transaction's address phase. Three synchronizer stages, so the level is never seen before the TOCTOU address event it races; the controller captures the (redirected) address only after the redirect decision is final. The pair burst is fetched in dispatch order right behind the first burst and accounted as the transaction's first lookahead post. |
 | SPI bytes/command to `spi_program` | Two-stage control sampling; no logic reads the first stage. A byte is committed from the held offset/value once the second stage shows its strobe; they stay stable until the next completed SPI byte. The write command level, type/address/length and the partial-byte flag are held until completion clears WIP, so the engine may start long after later (status-only) transactions began. It starts only after the last byte of its transaction is committed and cannot preempt an outstanding host SDRAM operation. |
 | `spi_program.done` to SPI WIP | Completion toggle synchronized into SCK and consumed even when deselected. With stopped SCK the toggle remains held until clocks resume; no pulse must survive an arbitrary stopped-clock interval. |
 | SDRAM buffers/readiness to SPI output | Deliberately low-latency progressive data, **not a conventional fully handshaked async FIFO**. Readiness is tracked per beat and checked for each consumed sample. Both data and qualifying metadata need bounded routing and worst-phase analysis; fault detection alone does not establish CDC safety. |
-| Logger CMD/ADDR/END to system | Three-stage event sampling with held payloads. Pulses must span a system sampling opportunity and events/payloads must not be overwritten before capture. Frames serialize in capture order; overflow drops new frames and reports a saturated event count. |
-| Configuration/SFDP to SPI | Configure only while stopped, after the STOP drain acknowledgement. The 460-bit decoded control bundle and 32-bit completion epoch are held configuration, not a per-bit synchronized stream. On the first SCK clock of each transaction the SPI side captures the runtime fields it needs (JEDEC ID, capacity mask, flags, UID, page mask, erase opcodes) into SCK-domain shadow registers; command decode reads only the shadows, so the bundle crossing reduces to that one capture per transaction plus the status reseed values read at the same edge. Configuration must be stable from CS falling through that clock. Geometry is compiled into dual-clock erase RAM; its final system-clock write and complete validation precede publication. Keep controls and both RAMs unchanged through START and while running. The SPI side detects the epoch and reseeds before accepting a new command. SFDP and erase RAM read ports belong to SCK. START acknowledgement also waits for page-buffer initialization. |
+| Logger CMD/ADDR/END to system | Three-stage event sampling with held payloads. The address payload is consumed only on its event, two system clocks after its first stage, so the SDC gives it two periods. Pulses must span a system sampling opportunity and events/payloads must not be overwritten before capture. Frames serialize in capture order; overflow drops new frames and reports a saturated event count. |
+| Configuration/SFDP to SPI | Configure only while stopped, after the STOP drain acknowledgement. The 460-bit decoded control bundle and 32-bit completion epoch are held configuration, not a per-bit synchronized stream. On the first SCK clock of each transaction the SPI side captures the runtime fields it needs (JEDEC ID, capacity mask, flags, UID, page mask, erase opcodes) into SCK-domain shadow registers; command decode reads only the shadows, so the bundle crossing reduces to that one capture per transaction plus the status reseed values read at the same edge. Configuration must be stable from CS falling through that clock. Geometry is compiled into dual-clock erase RAM; its final system-clock write and complete validation precede publication. Keep controls and both RAMs unchanged through START and while running. The SPI side detects the epoch and reseeds before accepting a new command. SFDP and erase RAM read ports belong to SCK. START acknowledgement also waits for page-buffer initialization. The SDC therefore false-paths configuration registers (`cfg_*`, the profile store, SFDP control) into the SPI clock, and the run control (`spi_reset`, `spi_run_requested`, page-buffer `init_done`), which only changes with a quiescent master. |
 | UART/FT245 flags to system | Scalar input synchronizers; FT245 data is sampled only after the RD setup interval. Output strobes and bus turnaround must meet the FT2232H timing specification plus actual board skew. |
 | Host/program requests to `sdram` | Same clock domain. Hold command/address/write snapshot until `access_accept`; wait for access completion before issuing the next command. Ownership cannot switch across an outstanding request or open-row pair. |
 
@@ -64,7 +64,10 @@ or exempt related PLL clocks. This routing bound is necessary but not a
 proof that every bundle/qualifier has adequate settling or skew margin.
 Audit the actual destination-capture interval and tighten individual path
 budgets if needed. Never replace these bounds with blanket asynchronous
-clock groups merely to obtain a clean report.
+clock groups merely to obtain a clean report. The few individual exceptions
+in the SDC each name the register group and the contract above that backs
+it; hold is also released into the write-completion synchronizer's first
+stage and into the sticky first-beat margin diagnostic.
 
 ## Erase-table lookup
 
@@ -183,10 +186,17 @@ system and 100 MHz SPI clocks, with three placement algorithms each:
 The system clock has a few percent of real headroom. The SPI clock domain
 closes near 80 MHz, limited by the half-period falling-edge output path
 (`addr`/`consume_sel` to the `spi_ioN_out` flops); that path, not the SDRAM
-pipeline, bounds reads above that. The configuration snapshot adds hold
-violations on its capture flops; the bundle is held while emulation runs,
-so they are not functional, but they still need an explicit exception
-before sign-off. No board was tested.
+pipeline, bounds reads above that. No board was tested.
+
+With the SPI clock constrained at 70 MHz and the explicit exceptions for
+held configuration, run control, the logger payload and the two
+asynchronous hold endpoints, Gowin (placement options 1 and 0) reports no
+setup or hold violations at all: 70.5/121.8 MHz and 73.2/120.1 MHz SPI/
+system. The remaining violation, the SPI post address reaching the
+controller's row lookup within one system clock, was removed in RTL by
+registering the address first. Placement option 3 misses both clocks;
+placement results vary by several MHz between options and small RTL
+changes, so every timing change should be checked with more than one.
 
 ### Rebased protocol9 controller compatibility
 
