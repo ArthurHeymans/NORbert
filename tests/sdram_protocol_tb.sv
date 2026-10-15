@@ -3,7 +3,7 @@
 // SDRAM bank protocol at the controller's client boundary.
 //
 // The SPI fast path and the serial (host/program) path share the banks.
-// Either may hold a row between its ACTIVATE and auto-precharged access;
+// Either may hold a row between its ACTIVATE and its access dispatch;
 // the other must not open a bank, refresh or access under it. An SPI post
 // can also be withdrawn after its ACTIVATE but before its READ (a refresh
 // delayed the pair), and the row must still be closed afterwards.
