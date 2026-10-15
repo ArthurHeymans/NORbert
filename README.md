@@ -409,10 +409,10 @@ checker on the command bus). During an array read, refresh only starts
 right after a lookahead burst has been dispatched, so a refresh can
 no longer land in front of a burst the SPI side is about to need. Refresh
 events alternate between the two SDRAM chips, so one event stalls dispatch
-for a single tRC instead of a back-to-back pair. 60-70 MHz operation
-also needs timing closure past the default 40 MHz `spi_clk` constraint plus
-signal-integrity validation on the PMOD leads -- simulated margins below do
-not replace that. The matrix uses legacy/default waits; profile-configured
+for a single tRC instead of a back-to-back pair. The `spi_clk` constraint
+is the 70 MHz limit below, so the routed design closes the SPI domain for
+it; 50-70 MHz operation still needs board I/O timing and signal-integrity
+validation on the PMOD leads -- simulated margins below do not replace that. The matrix uses legacy/default waits; profile-configured
 latency changes the first-burst budget and needs separate per-mode validation.
 Configured framing checks are not a 40 MHz promise for every register setting.
 
