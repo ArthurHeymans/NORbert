@@ -184,9 +184,13 @@ system and 100 MHz SPI clocks, with three placement algorithms each:
 | Critical word first | 79.0-83.5 MHz | 125.2-130.1 MHz |
 
 The system clock has a few percent of real headroom. The SPI clock domain
-closes near 80 MHz, limited by the half-period falling-edge output path
-(`addr`/`consume_sel` to the `spi_ioN_out` flops); that path, not the SDRAM
-pipeline, bounds reads above that. No board was tested.
+closed near 80 MHz, limited by the half-period falling-edge output path
+(`addr`/`consume_sel` through the fresh-byte mux to the `spi_ioN_out`
+flops). The fresh byte now comes from an AND-OR of both buffers with a
+one-hot select registered when the burst starts; constrained for 100 MHz,
+the SPI clock closes at 90.5-98.5 MHz (previously 76.0-84.9 MHz with the
+same placement options), still limited by that half-period path and by
+full-period command decode. No board was tested.
 
 With the SPI clock constrained at 70 MHz and the explicit exceptions for
 held configuration, run control, the logger payload and the two

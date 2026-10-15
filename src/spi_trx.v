@@ -272,12 +272,20 @@ module spi_trx(
     wire addr_last = addr_count == ({2'b00, addr_lanes} - 5'd1);
     
     // Set on the clock that starts a new burst in STA_READ; the first byte
-    // of the burst comes straight from the prefetch buffer via
-    // live_first_byte (see spi_prefetch).
+    // of the burst comes straight from the prefetch buffer via fresh_byte
+    // (see spi_prefetch), selected by fresh_sel, which is set on the same
+    // clock: buffer A at the transaction's start offset for the first
+    // burst, byte 0 of the other half for every later one.
     reg fresh_read = 0;
+    reg [15:0] fresh_sel = 0;
     wire [63:0] live_buffer;
     wire [3:0] live_beats;
-    wire [7:0] live_first_byte;
+    wire [7:0] fresh_byte;
+    wire fresh_ready, consume_b;
+    function [15:0] fresh_first;
+        input [2:0] offset;
+        begin fresh_first = {8'b0, 8'b1 << offset}; end
+    endfunction
     wire [2:0] next_byte = addr[2:0] + 3'd1;
 
     // Status registers
@@ -315,7 +323,7 @@ module spi_trx(
         .restart(reset_cs || reset_power),
         .addr_mask(sh_erase_bursts),
         .fresh_read(fresh_read),
-        .burst_offset(addr[2:0]),
+        .fresh_sel(fresh_sel),
         .in_read(in_read),
         .sample_missing(sample_missing),
         .release_inhibit(state == STA_CMD && bit_count_in == 0 &&
@@ -353,7 +361,9 @@ module spi_trx(
         .ram_read_beats_b(ram_read_beats_b),
         .live_buffer(live_buffer),
         .live_beats(live_beats),
-        .live_first_byte(live_first_byte),
+        .fresh_byte(fresh_byte),
+        .fresh_ready(fresh_ready),
+        .consume_b(consume_b),
         .prefetch_underrun(prefetch_underrun),
         .prefetch_thin(prefetch_thin)
     );
@@ -742,6 +752,7 @@ module spi_trx(
                                     state <= STA_READ;
                                     spi_io1_oe_ff <= 1;
                                     fresh_read <= 1;
+                                    fresh_sel <= fresh_first(addr_next[2:0]);
                                 end
                             end
                         end
@@ -833,6 +844,7 @@ module spi_trx(
                             spi_io2_oe_ff <= is_quad_read;
                             spi_io3_oe_ff <= is_quad_read;
                             fresh_read <= 1;
+                            fresh_sel <= fresh_first(addr[2:0]);
                         end
                     end
                     else begin
@@ -855,8 +867,11 @@ module spi_trx(
                 else if (state == STA_READ) begin
                     // The next burst starts after byte 7. spi_prefetch has
                     // it in the other ping-pong half by then.
-                    if (addr[2:0] == 7 && bit_count_in == 0)
+                    // spi_prefetch switches halves on this same clock.
+                    if (addr[2:0] == 7 && bit_count_in == 0) begin
                         fresh_read <= 1;
+                        fresh_sel <= consume_b ? 16'h0001 : 16'h0100;
+                    end
 
                     if (bit_count_in == 0) begin
                         miso_byte <= live_buffer[next_byte*8 +: 8];
@@ -866,8 +881,8 @@ module spi_trx(
                     end
 
                     if (fresh_read) begin
-                        miso_byte <= live_first_byte;
-                        miso_byte_valid <= live_beats[addr[2:1]];
+                        miso_byte <= fresh_byte;
+                        miso_byte_valid <= fresh_ready;
                     end
                 end
                 else if (state == STA_READID) begin
@@ -929,6 +944,7 @@ module spi_trx(
                         spi_io2_oe_ff <= is_quad_read;
                         spi_io3_oe_ff <= is_quad_read;
                         fresh_read <= 1;
+                        fresh_sel <= fresh_first(addr[2:0]);
                     end
                     else begin
                         mode_count <= mode_count - 1;
@@ -1064,16 +1080,16 @@ module spi_trx(
         // The following posedge is the master's sampling edge. Checking
         // only at burst end would miss short reads and late-arriving fills.
         sample_missing <= is_selected && in_read &&
-            !(fresh_read ? live_beats[addr[2:1]] : miso_byte_valid);
+            !(fresh_read ? fresh_ready : miso_byte_valid);
         if (spi_io2_oe_ff) begin
             // Quad output: 4 bits per clock (2 clocks per byte)
             // IO3 = MSB of nibble, IO0 = LSB of nibble
             // bit_count_in=1: high nibble [7:4], bit_count_in=0: low nibble [3:0]
             if (fresh_read) begin
-                spi_io3_out <= live_first_byte[7];
-                spi_io2_out <= live_first_byte[6];
-                spi_io1_out <= live_first_byte[5];
-                spi_io0_out <= live_first_byte[4];
+                spi_io3_out <= fresh_byte[7];
+                spi_io2_out <= fresh_byte[6];
+                spi_io1_out <= fresh_byte[5];
+                spi_io0_out <= fresh_byte[4];
             end
             else begin
                 spi_io3_out <= miso_byte[{bit_count_in[0], 2'b11}];
@@ -1086,8 +1102,8 @@ module spi_trx(
             // Dual output: 2 bits per clock
             // IO1 = high bit of pair, IO0 = low bit of pair
             if (fresh_read) begin
-                spi_io1_out <= live_first_byte[7];
-                spi_io0_out <= live_first_byte[6];
+                spi_io1_out <= fresh_byte[7];
+                spi_io0_out <= fresh_byte[6];
             end
             else begin
                 spi_io1_out <= miso_byte[{bit_count_in[1:0], 1'b1}];
@@ -1097,7 +1113,7 @@ module spi_trx(
         else begin
             // Single output on IO1 (MISO)
             if (fresh_read)
-                spi_io1_out <= live_first_byte[7];
+                spi_io1_out <= fresh_byte[7];
             else
                 spi_io1_out <= miso_byte[bit_count_in];
         end
