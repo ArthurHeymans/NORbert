@@ -44,6 +44,7 @@ clock declarations must not be used as a phase-aware sign-off model.
 | Crossing | Contract |
 |---|---|
 | SPI requests/address to `sdram` | Synchronized control with a bundled, held address/post selector. A new post identifies a new descriptor; the in-flight fill and next posted fill have independent ownership. The source must retain its payload through destination capture. |
+| SPI burst pair to `sdram` | One level per array read, raised when the address phase ends, with the second burst's address bundled and held until the next transaction's address phase. Three synchronizer stages, so the level is never seen before the TOCTOU address event it races; the controller captures the (redirected) address only after the redirect decision is final. The pair burst is fetched in dispatch order right behind the first burst and accounted as the transaction's first lookahead post. |
 | SPI bytes/command to `spi_program` | Two-stage control sampling; no logic reads the first stage. A byte is committed from the held offset/value once the second stage shows its strobe; they stay stable until the next completed SPI byte. The write command level, type/address/length and the partial-byte flag are held until completion clears WIP, so the engine may start long after later (status-only) transactions began. It starts only after the last byte of its transaction is committed and cannot preempt an outstanding host SDRAM operation. |
 | `spi_program.done` to SPI WIP | Completion toggle synchronized into SCK and consumed even when deselected. With stopped SCK the toggle remains held until clocks resume; no pulse must survive an arbitrary stopped-clock interval. |
 | SDRAM buffers/readiness to SPI output | Deliberately low-latency progressive data, **not a conventional fully handshaked async FIFO**. Readiness is tracked per beat and checked for each consumed sample. Both data and qualifying metadata need bounded routing and worst-phase analysis; fault detection alone does not establish CDC safety. |
@@ -93,12 +94,22 @@ the opcode turns out not to be an array read, so a refresh cannot start
 late enough to delay the first burst. Throughout an array read the
 controller only starts a refresh in a window: after it dispatched a
 lookahead (continuation) READ and until the SPI side re-arms that post. The
-next post is then at least the re-arm-to-post gap away, so a 9-clock
-refresh event overlaps it by only part of that gap, well inside the burst's
-margin. A refresh in the gap before a post would instead delay the post by
-the whole event. Stopped SCK outside a window falls back to the deadline
-(hard) refresh. `quad_fast_tb` sweeps the refresh due time across one full
-event period for every documented read limit.
+second burst, which the controller fetches itself, opens the same window:
+from its READ until the SPI side drops the pair level at the first burst's
+re-arm point. The next post is then at least the re-arm-to-post gap away,
+so a 9-clock refresh event overlaps it by only part of that gap, well
+inside the burst's margin. A refresh in the gap before a post would instead
+delay the post by the whole event. Stopped SCK outside a window falls back
+to the deadline (hard) refresh. `quad_fast_tb` sweeps the refresh due time
+across one full event period for every documented read limit.
+
+Reads too short to post a lookahead burst, back to back with little
+deselect time (firmware fetching code in place), only get the pair's
+window. Without it the backlog reaches the hard deadline, and a hard
+refresh between the first burst's ACTIVATE and READ outlasts the READ
+request, so the burst is never fetched. A Foxconn D41S (ICH7) hung in
+early boot on it; `quad_fast_tb` runs 2000 such reads at 20 MHz with
+15 ns deselect time.
 
 ## Required external I/O profile
 

@@ -22,10 +22,11 @@ module toctou_tb;
     );
 
     integer notifications = 0, accepted_reads = 0, delayed_initial_reads = 0;
-    reg watch_transaction = 0, want_redirect = 0, previous_read_ack = 0;
+    reg watch_transaction = 0, want_redirect = 0;
     reg [23:0] current_address = 0, expected_mask = 0, expected_base = 0;
     reg [1:0] expected_index = 0;
     reg [22:0] wanted_burst, actual_burst;
+    reg [12:0] active_row [0:1][0:3];
     always @(negedge clk) begin
         if (watch_transaction && dut.trap_notify_strobe) begin
             notifications++;
@@ -33,24 +34,31 @@ module toctou_tb;
                 dut.trap_notify_index !== expected_index)
                 $fatal(1, "Trap notification has wrong address, priority or access count");
         end
-        // Check what the SDRAM controller actually accepted, not merely
-        // the live address mux. A late redirect could mix an OLD latched
-        // row/bank with a NEW column, even though the mux now looks right.
-        if (watch_transaction && dut.sdram_i.spi_cmd_read_ack && !previous_read_ack) begin
+        // Check the SPI READ commands the SDRAM controller actually issued
+        // (no auto-precharge; serial reads carry it), not merely the live
+        // address mux. A late redirect could mix an OLD latched row/bank
+        // with a NEW column, even though the mux now looks right. The row
+        // is the one last activated in the addressed bank (tracked from
+        // the command bus, so this also works on the gate netlist). This
+        // also covers the second burst, which the controller fetches
+        // itself without a SPI-side post.
+        if (!dut.O_sdram_ras_n && dut.O_sdram_cas_n && dut.O_sdram_wen_n)
+            active_row[dut.O_sdram_cs_n][dut.O_sdram_ba] = dut.O_sdram_addr;
+        if (watch_transaction && dut.O_sdram_ras_n && !dut.O_sdram_cas_n &&
+            dut.O_sdram_wen_n && !dut.O_sdram_addr[10]) begin
             if (accepted_reads == 0 && want_redirect && dut.redirect_active)
                 delayed_initial_reads++;
             wanted_burst = {2'b0, current_address[23:3]} + 23'(accepted_reads);
             if (want_redirect && accepted_reads != 0)
                 wanted_burst = (wanted_burst & ~{2'b0, expected_mask[23:3]}) |
                     {2'b0, (expected_base[23:3] & expected_mask[23:3])};
-            actual_burst = {dut.O_sdram_cs_n, dut.sdram_i.spi_addr_latched[21:9],
+            actual_burst = {dut.O_sdram_cs_n, active_row[dut.O_sdram_cs_n][dut.O_sdram_ba],
                             dut.O_sdram_ba, dut.O_sdram_addr[8:2]};
             if (actual_burst !== wanted_burst)
                 $fatal(1, "Read %h burst %0d: SDRAM accepted %h, expected %h",
                        current_address, accepted_reads, actual_burst, wanted_burst);
             accepted_reads++;
         end
-        previous_read_ack = dut.sdram_i.spi_cmd_read_ack;
     end
 
     task host_byte(input [7:0] b);

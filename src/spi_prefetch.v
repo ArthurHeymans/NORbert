@@ -21,11 +21,15 @@
 //
 // One-burst lookahead: the first burst is requested during the address
 // phase (ACTIVATE once row/bank are known, READ once the column is known).
-// The second burst is posted during the dummy/mode phase when there is
-// one, otherwise two clocks after the first data clock. From then on the
-// next burst is always in flight while the current one is shifted out: the
-// controller fills the idle half of ram_read_buffer/ram_read_buffer_b and
-// consume_sel tracks the half currently being shifted out.
+// The second burst is not posted: ram_pair rises when the address phase
+// ends and the controller fetches ram_addr2 right behind the first burst,
+// without a second synchronized handshake. That is what a read starting
+// at byte 7 needs, whose second burst is due a few clocks after the
+// address. From the second burst on, the next burst is posted two clocks
+// into each burst, so it is always in flight while the current one is
+// shifted out: the controller fills the idle half of
+// ram_read_buffer/ram_read_buffer_b and consume_sel tracks the half
+// currently being shifted out.
 
 `default_nettype none
 
@@ -51,23 +55,29 @@ module spi_prefetch(
     input wire first_read,           // Column known
     input wire [6:0] first_col,      // Burst address bits [6:0]
     input wire first_done,           // Single-lane address phase ended
+    input wire addr_end,             // Array-read address phase ended
 
-    input wire post_lookahead,       // Post the second burst mid dummy/mode
     input wire drop,                 // Re-arm the handshake
-    input wire mode_end,             // Mode phase ends
-    input wire fallback,             // First clock of byte 7 in a burst
     input wire burst_end,            // Last clock of byte 7 in a burst
 
     output reg ram_inhibit_refresh = 0,
     output reg ram_activate = 0,
     output reg ram_read = 0,
     output reg ram_continuation = 0, // Only subsequent bursts may be redirected
-    // Toggles on every lookahead post (dummy, mode and first-clock posts).
-    // The controller invalidates the upcoming fill target on each edge, so
-    // a burst that never fills (blocked post, lost race) is always flagged
-    // by the underrun check instead of aliasing a stale buffer.
+    // Toggles on every lookahead post. The controller invalidates the
+    // upcoming fill target on each edge, so a burst that never fills
+    // (blocked post, lost race) is always flagged by the underrun check
+    // instead of aliasing a stale buffer. The pair fetch does not toggle;
+    // the controller accounts for it when a transaction starts.
     output reg ram_post_toggle = 0,
     output reg [22:0] ram_addr,
+    // Second burst, fetched by the controller once ram_pair is seen.
+    // ram_addr2 is set with the first burst's column and held until the
+    // next transaction's; ram_pair is one level per transaction. It drops
+    // at the first burst's re-arm point, closing the refresh window the
+    // pair READ opens (see sdram.v), like the re-arm of a post.
+    output reg ram_pair = 0,
+    output reg [22:0] ram_addr2 = 0,
 
     input wire [63:0] ram_read_buffer,
     input wire [63:0] ram_read_buffer_b,
@@ -100,17 +110,13 @@ module spi_prefetch(
     // on every CS drop, so pairing cannot drift across transactions.
     reg consume_sel = 0;
     // Set whenever the next burst has been requested during the current
-    // one and cleared at every burst end. The byte-7 fallback may therefore
-    // only fire for a first burst that started at offset 7 with no post
-    // yet; otherwise it would bump ram_addr a second time without a
-    // matching dispatch and walk the ping-pong pairing out of phase.
+    // one and cleared at every burst end, so each burst posts once. The
+    // pair counts as the first burst's post.
     reg posted_this_burst = 0;
-    // Set when the second burst was already posted during a dummy/mode
-    // phase: the first data clock then only clears the flag instead of
-    // posting a duplicate request.
-    reg prefetch_pending = 0;
+    // The pair fetched the burst after ram_addr, so the next post skips it.
+    reg pair_skip = 0;
     // Two-cycle delayed fresh_read: the lookahead post fires here so the
-    // burst-end drop always precedes it by >= 2 SPI clocks, even for
+    // burst-end drop always precedes it by >= 1 SPI clock, even for
     // 2-clock offset-7 first bursts that have no byte 6 to drop on.
     reg post_arm1 = 0;
     reg post_arm2 = 0;
@@ -135,7 +141,7 @@ module spi_prefetch(
     end
     assign live_first_byte = first_byte_mux;
 
-    wire [22:0] next_burst = (ram_addr + 1'b1) & addr_mask;
+    wire [22:0] next_burst = (ram_addr + (pair_skip ? 23'd2 : 23'd1)) & addr_mask;
 
     always @(posedge spi_clk) begin
         if (active) begin
@@ -149,7 +155,8 @@ module spi_prefetch(
                 ram_post_toggle <= 0;
                 consume_sel <= 0;
                 posted_this_burst <= 0;
-                prefetch_pending <= 0;
+                pair_skip <= 0;
+                ram_pair <= 0;
                 post_arm1 <= 0;
                 post_arm2 <= 0;
                 prefetch_underrun <= 0;
@@ -160,22 +167,18 @@ module spi_prefetch(
                 // data. Do not let a later fill erase an earlier missing byte.
                 if (in_read && sample_missing)
                     prefetch_underrun <= 1;
-                // Lookahead post two clocks into every burst. With a
-                // dummy/mode-posted second burst there is nothing to post;
-                // just clear the flag (the burst-end drop already re-armed).
+                // Lookahead post two clocks into every burst (the first
+                // burst's was the pair).
                 post_arm1 <= fresh_read;
                 post_arm2 <= post_arm1;
-                if (post_arm2 && in_read) begin
-                    if (prefetch_pending)
-                        prefetch_pending <= 0;
-                    else if (!posted_this_burst) begin
-                        ram_continuation <= 1;
-                        ram_activate <= 1;
-                        ram_read <= 1;
-                        ram_addr <= next_burst;
-                        posted_this_burst <= 1;
-                        ram_post_toggle <= ~ram_post_toggle;
-                    end
+                if (post_arm2 && in_read && !posted_this_burst) begin
+                    ram_continuation <= 1;
+                    ram_activate <= 1;
+                    ram_read <= 1;
+                    ram_addr <= next_burst;
+                    pair_skip <= 0;
+                    posted_this_burst <= 1;
+                    ram_post_toggle <= ~ram_post_toggle;
                 end
 
                 if (release_inhibit)
@@ -190,24 +193,19 @@ module spi_prefetch(
                 if (first_read) begin
                     ram_read <= 1;
                     ram_addr[6:0] <= first_col & addr_mask[6:0];
+                    ram_addr2 <= ({ram_addr[22:7], first_col & addr_mask[6:0]} + 1'b1) &
+                                 addr_mask;
                 end
                 if (first_done) begin
                     ram_activate <= 0;
                     ram_read <= 0;
                 end
-
-                // Mid dummy/mode post of the second burst, so short first
-                // bursts (high start offsets) still meet SDRAM latency at
-                // fast SCLK. The first burst's levels were dropped before,
-                // so the handshake re-arms across a multi-clock gap.
-                if (post_lookahead) begin
-                    ram_continuation <= 1;
-                    ram_activate <= 1;
-                    ram_read <= 1;
-                    ram_addr <= next_burst;
-                    prefetch_pending <= 1;
+                // The whole address is known: the controller may fetch the
+                // second burst (after the address event, see sdram.v).
+                if (addr_end) begin
+                    ram_pair <= 1;
+                    pair_skip <= 1;
                     posted_this_burst <= 1;
-                    ram_post_toggle <= ~ram_post_toggle;
                 end
 
                 // Re-arm: mid mode phase, and on the last clock of byte 6.
@@ -215,24 +213,7 @@ module spi_prefetch(
                 if (drop) begin
                     ram_activate <= 0;
                     ram_read <= 0;
-                end
-
-                // Keep mode-posted levels up: the second burst is still
-                // filling and byte 6 of the first burst drops them.
-                if (mode_end && !prefetch_pending) begin
-                    ram_activate <= 0;
-                    ram_read <= 0;
-                end
-
-                // Fallback when a read starts directly at byte 7 and no
-                // lookahead post happened yet.
-                if (fallback && !ram_activate && !posted_this_burst) begin
-                    ram_continuation <= 1;
-                    ram_activate <= 1;
-                    ram_read <= 1;
-                    ram_addr <= next_burst;
-                    posted_this_burst <= 1;
-                    ram_post_toggle <= ~ram_post_toggle;
+                    if (in_read) ram_pair <= 0;
                 end
 
                 if (burst_end) begin
@@ -250,6 +231,7 @@ module spi_prefetch(
                     // only drop.)
                     ram_activate <= 0;
                     ram_read <= 0;
+                    ram_pair <= 0;
                     posted_this_burst <= 0;
                 end
             end
