@@ -36,6 +36,7 @@ module refresh_tb;
         .spi_active(spi_active), .spi_inhibit_refresh(spi_inhibit),
         .spi_cmd_activate(spi_activate), .spi_cmd_read(spi_read),
         .spi_cmd_post_toggle(1'b0), .spi_addr(23'h001234),
+        .spi_cmd_pair(1'b0), .spi_addr2(23'h0),
         .access_cmd(access), .access_addr(address), .inhibit_refresh(inhibit),
         .cmd_busy(busy), .access_accept(accept), .read_buffer(read_buffer), .read_busy(read_busy),
         .write_buffer(write_buffer), .ras_o(ras), .cas_o(cas), .we_o(we),
