@@ -437,10 +437,10 @@ Known corners detected by the simulated prefetch fault checks:
   window, particularly at high offsets. Real NOR flashes likewise impose a
   lower clock limit on 0x03 than on dummy-assisted reads.
 
-Beyond 70 MHz the SPI clock domain of the routed design becomes the limit
-rather than the SDRAM pipeline: constrained for 100 MHz, Gowin closes it at
-77-85 MHz, limited by the half-period falling-edge output path. Quad reads
-still pass every offset at 80 MHz in simulation.
+Beyond 70 MHz the SPI clock domain of the routed design and the board I/O
+become the limit rather than the SDRAM pipeline: constrained for 100 MHz,
+Gowin closes the SPI clock at 90-98 MHz, and quad reads still pass every
+offset at 80 MHz in simulation.
 
 Sequential bursts keep their SDRAM row open (per bank), so same-row
 bursts skip ACTIVATE and tRCD entirely; a sequential stream pays them once

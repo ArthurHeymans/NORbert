@@ -42,10 +42,10 @@ module spi_prefetch(
     input wire fresh_read,           // spi_trx starts a new burst
     input wire in_read,              // spi_trx is in its data output phase
     input wire sample_missing,       // Previous falling-edge output lacked its beat
-    // Byte offset of the burst being started; only sampled while
-    // fresh_read is set (the first byte after STA_READ entry has the
-    // transaction start offset, later bursts always start at 0).
-    input wire [2:0] burst_offset,
+    // One-hot {buffer B byte 7..0, buffer A byte 7..0} of the first byte
+    // of the burst being started, registered by spi_trx on the clock that
+    // sets fresh_read. Only meaningful while fresh_read is set.
+    input wire [15:0] fresh_sel,
 
     input wire release_inhibit,      // Opcode decoded: not an array read
 
@@ -96,13 +96,16 @@ module spi_prefetch(
     // the idle half, so this view is stable for the whole burst.
     output wire [63:0] live_buffer,
     output wire [3:0] live_beats,
-    // First byte of the burst being started, selected from live_buffer by
-    // burst_offset. The fresh-byte paths in spi_trx (falling-edge output
-    // and the miso_byte load) close in half/one SCK period against beats
-    // that may publish in the same half period, so they consume this one
-    // shared byte mux instead of variable part-selects over 64 bits at
-    // each use site. Only meaningful while fresh_read is set.
-    output wire [7:0] live_first_byte,
+    // First byte of the burst being started and the readiness of its
+    // beat. The falling-edge output samples them half an SCK period after
+    // fresh_read is set, against beats that may publish in that same half
+    // period, so they are a plain AND-OR of the two buffers with the
+    // registered one-hot fresh_sel: no buffer or offset decode and no
+    // high-fanout select in that half period.
+    output wire [7:0] fresh_byte,
+    output wire fresh_ready,
+    // Half being shifted out (B when set), for spi_trx's fresh_sel.
+    output wire consume_b,
 
     // Sticky diagnostics, cleared at the start of every transaction.
     // Underrun is checked on each master's data sampling edge, including
@@ -130,22 +133,25 @@ module spi_prefetch(
     assign live_buffer = consume_sel ? ram_read_buffer_b : ram_read_buffer;
     assign live_beats = consume_sel ? ram_read_beats_b : ram_read_beats_a;
 
-    // Explicit lanes rather than a variable part-select: safest across
-    // Yosys, Verilator, and Gowin synthesis (as in sdram.v's read path).
-    reg [7:0] first_byte_mux;
+    assign consume_b = consume_sel;
+
+    wire [127:0] both_buffers = {ram_read_buffer_b, ram_read_buffer};
+    // Beat w carries bytes 2w and 2w+1.
+    wire [15:0] byte_ready = {ram_read_beats_b[3], ram_read_beats_b[3], ram_read_beats_b[2],
+                              ram_read_beats_b[2], ram_read_beats_b[1], ram_read_beats_b[1],
+                              ram_read_beats_b[0], ram_read_beats_b[0],
+                              ram_read_beats_a[3], ram_read_beats_a[3], ram_read_beats_a[2],
+                              ram_read_beats_a[2], ram_read_beats_a[1], ram_read_beats_a[1],
+                              ram_read_beats_a[0], ram_read_beats_a[0]};
+    reg [7:0] fresh_or;
+    integer lane;
     always @* begin
-        case (burst_offset)
-            3'd0: first_byte_mux = live_buffer[7:0];
-            3'd1: first_byte_mux = live_buffer[15:8];
-            3'd2: first_byte_mux = live_buffer[23:16];
-            3'd3: first_byte_mux = live_buffer[31:24];
-            3'd4: first_byte_mux = live_buffer[39:32];
-            3'd5: first_byte_mux = live_buffer[47:40];
-            3'd6: first_byte_mux = live_buffer[55:48];
-            3'd7: first_byte_mux = live_buffer[63:56];
-        endcase
+        fresh_or = 0;
+        for (lane = 0; lane < 16; lane = lane + 1)
+            fresh_or = fresh_or | (both_buffers[lane*8 +: 8] & {8{fresh_sel[lane]}});
     end
-    assign live_first_byte = first_byte_mux;
+    assign fresh_byte = fresh_or;
+    assign fresh_ready = |(byte_ready & fresh_sel);
 
     wire [22:0] next_burst = (ram_addr + (pair_skip ? 23'd2 : 23'd1)) & addr_mask;
 
