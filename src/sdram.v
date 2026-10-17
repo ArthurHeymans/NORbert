@@ -212,7 +212,7 @@ module sdram(
     // Buffer control signals from SPI domain
     reg [2:0] spi_active_buf;
     reg [1:0] spi_inhibit_refresh_buf;
-    reg [1:0] spi_cmd_activate_buf;
+    reg [2:0] spi_cmd_activate_buf;
     reg [1:0] spi_cmd_read_buf;
     
     reg spi_cmd_activate_ack;
@@ -302,15 +302,22 @@ module sdram(
     // auto-precharge and clear their bank's record at dispatch.
     reg [12:0] open_rows [0:7];
     reg [7:0] open_valid;
-    wire [2:0] spi_open_idx = {spi_addr[22], spi_addr[8:7]};
-    // The SPI ACTIVATE decision uses registered row lookups, keeping the
-    // redirect mux and the row compare out of the dispatch path. spi_addr
-    // is valid one system clock before its synchronized post arrives
-    // (bundled-data contract). A redirect decision changes it, so posts
-    // also wait out the clock after redirect_pending; and every command
-    // that changes the open-row records waits >= 2 clocks, so the lookup
-    // is current whenever dispatch evaluates.
-    reg spi_row_hit, spi_bank_open, spi_redirect_settle;
+    // Registered copy of the (redirected) post address; see below.
+    reg [22:0] spi_post_addr;
+    wire [2:0] spi_open_idx = {spi_post_addr[22], spi_post_addr[8:7]};
+    // The SPI ACTIVATE decision uses a registered copy of the post address
+    // (spi_addr through the redirect mux, bundled with the post level) and
+    // registered row lookups of that copy, so neither the crossing nor the
+    // redirect mux nor the row compare share a clock with dispatch. The
+    // copy is current one clock after the post's second synchronizer
+    // stage, its lookups a clock later, so ACTIVATE decisions wait for the
+    // third stage (spi_act_post). A redirect decision changes the address,
+    // so posts also wait out two clocks after redirect_pending; and every
+    // command that changes the open-row records waits >= 2 clocks, so the
+    // lookups are current whenever dispatch evaluates.
+    reg spi_row_hit, spi_bank_open;
+    reg [1:0] spi_redirect_settle;
+    wire spi_act_post = spi_cmd_activate_buf[2] && spi_cmd_activate_buf[1];
     wire [3:0] refresh_open = refresh_chip ? open_valid[7:4] : open_valid[3:0];
     // Burst pair. Posting the second burst from the SPI side costs a
     // second synchronized handshake, and for a read starting at byte 7
@@ -489,6 +496,7 @@ module sdram(
             spi_row_hit <= 0;
             spi_bank_open <= 0;
             spi_redirect_settle <= 0;
+            spi_post_addr <= 0;
             auto_hit_fresh <= 0;
             auto_opened <= 0;
             spi_pair_read_done <= 0;
@@ -516,7 +524,7 @@ module sdram(
             spi_active_buf <= {spi_active_buf[1:0], spi_active};
             spi_inhibit_refresh_buf <= {spi_inhibit_refresh_buf[0],
                                         spi_inhibit_refresh && spi_active};
-            spi_cmd_activate_buf <= {spi_cmd_activate_buf[0],
+            spi_cmd_activate_buf <= {spi_cmd_activate_buf[1:0],
                                      spi_cmd_activate && spi_active};
             spi_cmd_read_buf <= {spi_cmd_read_buf[0],
                                  spi_cmd_read && spi_active};
@@ -581,10 +589,11 @@ module sdram(
                 auto_ready <= 1;
             end
             auto_hit <= open_valid[auto_idx] && open_rows[auto_idx] == auto_addr[21:9];
+            spi_post_addr <= spi_addr;
             spi_row_hit <= open_valid[spi_open_idx] &&
-                           open_rows[spi_open_idx] == spi_addr[21:9];
+                           open_rows[spi_open_idx] == spi_post_addr[21:9];
             spi_bank_open <= open_valid[spi_open_idx];
-            spi_redirect_settle <= spi_redirect_pending;
+            spi_redirect_settle <= {spi_redirect_settle[0], spi_redirect_pending};
             auto_hit_fresh <= auto_ready;
             // A post always precedes its fill by ~10 sysclks, so
             // invalidating here can never clobber a completed fill.
@@ -974,8 +983,8 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
-                else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
-                         !serial_row_open && !spi_redirect_pending && !spi_redirect_settle &&
+                else if (spi_act_post && !spi_cmd_activate_ack && spi_act_armed &&
+                         !serial_row_open && !spi_redirect_pending && spi_redirect_settle == 0 &&
                          !auto_opened && !(fill_reset_armed && rd_inflight) && spi_row_hit) begin
                     // SPI fast-path activate, row already open: acknowledge
                     // without issuing ACTIVATE; READ may dispatch next cycle
@@ -985,7 +994,7 @@ module sdram(
                     cmd_wait <= 0;
                     spi_cmd_activate_ack <= 1;
                     spi_activate_done <= 1;
-                    spi_addr_latched <= spi_addr;
+                    spi_addr_latched <= spi_post_addr;
                     spi_act_armed <= 0;
                     if (fill_reset_armed) begin
                         // A fill still in flight from the previous
@@ -1005,8 +1014,8 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
-                else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
-                         !serial_row_open && !spi_redirect_pending && !spi_redirect_settle &&
+                else if (spi_act_post && !spi_cmd_activate_ack && spi_act_armed &&
+                         !serial_row_open && !spi_redirect_pending && spi_redirect_settle == 0 &&
                          !auto_opened && spi_bank_open) begin
                     // A different row is open in this bank: close it first.
                     // Not an acceptance: the post levels stay up and
@@ -1016,17 +1025,17 @@ module sdram(
                     cmdtarget <= tRP;
                     cmd_wait <= tRP > 1;
                     open_valid[spi_open_idx] <= 0;
-                    cs_o <= spi_addr[22];
+                    cs_o <= spi_post_addr[22];
                     ras_o <= 0;
                     cas_o <= 1;
                     we_o <= 0;
-                    ba_o <= spi_addr[8:7];
+                    ba_o <= spi_post_addr[8:7];
                     a_o <= 0;
                     a_o[10] <= 0;
                     dqm_o <= 2'b11;
                 end
-                else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
-                         !serial_row_open && !spi_redirect_pending && !spi_redirect_settle &&
+                else if (spi_act_post && !spi_cmd_activate_ack && spi_act_armed &&
+                         !serial_row_open && !spi_redirect_pending && spi_redirect_settle == 0 &&
                          !auto_opened && !(fill_reset_armed && rd_inflight)) begin
                     // SPI fast-path activate
                     state <= STA_ACTIVATE;
@@ -1034,9 +1043,9 @@ module sdram(
                     cmd_wait <= tRCD > 1;
                     spi_cmd_activate_ack <= 1;
                     spi_activate_done <= 1;
-                    spi_addr_latched <= spi_addr;
+                    spi_addr_latched <= spi_post_addr;
                     spi_act_armed <= 0;
-                    open_rows[spi_open_idx] <= spi_addr[21:9];
+                    open_rows[spi_open_idx] <= spi_post_addr[21:9];
                     open_valid[spi_open_idx] <= 1;
                     if (fill_reset_armed) begin
                         // A fill still in flight from the previous
@@ -1053,13 +1062,13 @@ module sdram(
                     end
 
                     // ACTIVATE command
-                    cs_o <= spi_addr[22];
+                    cs_o <= spi_post_addr[22];
                     ras_o <= 0;
                     cas_o <= 1;
                     we_o <= 1;
                     dqm_o <= 2'b11;
-                    ba_o <= spi_addr[8:7];
-                    a_o <= spi_addr[21:9];
+                    ba_o <= spi_post_addr[8:7];
+                    a_o <= spi_post_addr[21:9];
                 end
                 else if (spi_cmd_read_buf[1] && !spi_cmd_read_ack && spi_activate_done && spi_read_armed &&
                          !serial_row_open && !auto_opened &&
