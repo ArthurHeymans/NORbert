@@ -28,7 +28,8 @@
 //     ~2.5ns phase shift) to sample DQ in the middle of the valid window.
 //   - With the ~3.75ns SDRAM clock delay and CAS=2, read data arrives
 //     ~3 logic clock cycles after the READ command. RD_PIPELINE_DELAY=0
-//     with the `readcount > tCAS` capture condition matches this timing.
+//     with beats publishing from read pipeline stage tCAS+1 matches this
+//     timing.
 //
 // Address mapping (23-bit burst address, 8 bytes per burst = 64MB):
 //   spi_addr[22]    = chip select (0=chip0, 1=chip1)
@@ -61,6 +62,13 @@ module sdram(
     input wire [22:0] spi_addr,      // 23-bit burst address (64MB)
     input wire spi_cmd_post_toggle, // Toggles on every SPI prefetch post
     input wire spi_cmd_continuation, // Post is a lookahead (bundled with spi_addr)
+    // Second burst of an array read. The SPI side raises this level once
+    // the address phase is complete; the controller then fetches spi_addr2
+    // itself right behind the first burst (see the burst pair below).
+    // spi_addr2 is bundled with the level and held until the next
+    // transaction's address phase.
+    input wire spi_cmd_pair,
+    input wire [22:0] spi_addr2,
     // TOCTOU decision for this transaction's address not final yet. Holds
     // SPI ACTIVATEs: lookahead addresses pass through the redirect mux.
     // (The initial ACTIVATE is posted before the address ends, so it is
@@ -151,6 +159,7 @@ module sdram(
     localparam [4:0] RD_PIPELINE_DELAY = 5'd0;
 
     // Derived timing
+    // READ to next command when it is not a streamed SPI READ.
     localparam [4:0] tREAD  = tCAS + RD_PIPELINE_DELAY + BURST_LEN + 1;
     localparam [4:0] tWRITE = BURST_LEN + tDPL + tRP;
 
@@ -209,7 +218,8 @@ module sdram(
     // consumes one 64-bit buffer while the controller fills the other, so a
     // completing SDRAM read never overwrites data still shifted out.
     // fill_sel selects the target of the next SPI fill (0=A=read_buffer,
-    // 1=B=read_buffer_b) and toggles on every SPI READ completion. The SPI
+    // 1=B=read_buffer_b) and toggles on every SPI READ dispatch (fills
+    // complete in dispatch order, see the read data pipeline). The SPI
     // side keeps its own consume toggle; the two march in lockstep because
     // serial-path reads are impossible while SPI is active (glue
     // serial_gate) and both sides restart at buffer A on every CS drop.
@@ -217,6 +227,7 @@ module sdram(
     // Posts describe future buffers, not the fill currently in flight.
     // Track their order separately so a post during progressive publish
     // cannot invalidate already-published beats of the current burst.
+    // A transaction's first post toggle targets A: B goes to the pair.
     reg post_fill_sel;
     reg fill_reset_armed;
     reg serial_read_active;
@@ -249,8 +260,19 @@ module sdram(
     // SPI side re-arms that post (see spi_prefetch). The next request is
     // then at least the post's remaining burst away, so the refresh
     // cannot delay it by more than the clocks between re-arm and post.
+    // The burst pair opens the same window: from its READ until the SPI
+    // side drops spi_cmd_pair at the first burst's re-arm point. Reads
+    // too short for a lookahead post have no other window, and without
+    // one the refresh backlog would end in a hard refresh between the
+    // first burst's ACTIVATE and READ. The pair window is registered
+    // (it closes a clock after the drop is seen) to keep it out of the
+    // dispatch priority logic.
     reg spi_read_continuation;
-    wire spi_refresh_window = spi_cmd_read_ack && spi_cmd_read_buf[1] && spi_read_continuation;
+    reg [2:0] spi_pair_buf;  // spi_cmd_pair synchronizer (see the burst pair)
+    reg spi_pair_read_done;  // Pair READ of this transaction dispatched
+    reg spi_pair_window;
+    wire spi_refresh_window = (spi_cmd_read_ack && spi_cmd_read_buf[1] && spi_read_continuation) ||
+                              spi_pair_window;
     wire do_inhibit_refresh = (spi_inhibit_refresh_buf[1] && !spi_refresh_window) ||
                               inhibit_refresh;
     // Registered deadline flags keep counter arithmetic/comparison out of
@@ -285,11 +307,41 @@ module sdram(
     // is current whenever dispatch evaluates.
     reg spi_row_hit, spi_bank_open, spi_redirect_settle;
     wire [3:0] refresh_open = refresh_chip ? open_valid[7:4] : open_valid[3:0];
+    // Burst pair. Posting the second burst from the SPI side costs a
+    // second synchronized handshake, and for a read starting at byte 7
+    // that request could only go out during the mode/dummy clocks, a few
+    // SPI clocks before its data was due. Instead the SPI side raises
+    // spi_cmd_pair at the end of the address phase and the controller
+    // fetches spi_addr2 itself, BURST_LEN clocks behind the first READ
+    // when the row is already open. spi_addr2 is a continuation address
+    // (redirected like any lookahead), so the fetch also waits for the
+    // redirect decision. The pair level uses three synchronizer stages so
+    // it cannot overtake the address event that starts that decision.
+    // The SPI side counts the pair as the transaction's first lookahead
+    // post without toggling spi_cmd_post_toggle; the fill reset below
+    // accounts for it. (spi_pair_buf is declared with the refresh window.)
+    reg spi_pair_armed;
+    reg spi_txn_read_done;   // First SPI READ of this transaction dispatched
+    reg auto_pending;
+    // The redirected address is captured once the redirect decision is
+    // final, and its open-row hit is registered, so neither the redirect
+    // mux nor the row compare sits in front of the dispatch logic. The
+    // registered hit is current whenever dispatch evaluates: every
+    // command that changes the open-row records waits >= 2 clocks.
+    reg auto_ready;
+    reg [22:0] auto_addr;
+    reg auto_hit;
+    reg auto_hit_fresh;      // auto_hit already reflects auto_addr
+    reg auto_opened;         // Pair ACTIVATE issued, its READ not yet
+    wire [2:0] auto_idx = {auto_addr[22], auto_addr[8:7]};
+    wire auto_go = auto_ready && auto_hit_fresh && spi_txn_read_done;
+
     // A refresh may dispatch (modulo closing open rows first) under the
-    // same conditions as the hard/soft dispatch branches below.
+    // same conditions as the hard/soft dispatch branches below, except
+    // that a pair burst between its ACTIVATE and READ keeps its row.
     // An open serial row is never closed for refresh, independent of the
     // client's inhibit hint (its READ/WRITE auto-precharges it).
-    wire refresh_wanted = !serial_row_open && (
+    wire refresh_wanted = !auto_opened && !serial_row_open && (
         (hard_refresh_due && access_cmd == 0 &&
          (!spi_activate_done || spi_cmd_read_ack)) ||
         (refresh_due && !do_inhibit_refresh && spi_row_idle));
@@ -320,8 +372,30 @@ module sdram(
     wire [1:0]  access_bank = access_addr[10:9];
     wire [8:0]  access_col  = access_addr[8:0];
 
-    reg [4:0] readcount;
-    reg [1:0] rdbuf_write_ptr;
+    // Read data pipeline. A READ dispatch enters stage 0; its beats
+    // publish from stages RD_BEAT0 to RD_BEAT0+3 (CAS latency plus the
+    // aux_clk capture register), one beat per clock (BL4 only). Consecutive SPI READs to the same chip dispatch
+    // BURST_LEN clocks apart, so their beats stream back to back and at
+    // most one READ is ever in stages 3-6. Each stage carries its READ's
+    // target buffer and client so publishing needs no further state.
+    localparam integer RD_BEAT0 = {27'd0, tCAS} + {27'd0, RD_PIPELINE_DELAY} + 1;
+    localparam integer RD_STAGES = RD_BEAT0 + 4;
+    reg [RD_STAGES-1:0] rd_pipe;
+    reg [RD_STAGES-1:0] rd_tag_b;      // SPI fill into read_buffer_b
+    reg [RD_STAGES-1:0] rd_tag_serial; // Serial-path read (always read_buffer)
+    // A READ is on its way to or on the DQ bus. Serial READ/WRITE, a READ
+    // to the other chip (shared DQ bus) and the SPI fill reset wait for
+    // this to clear, keeping the old READ-to-access spacing and bus
+    // turnaround. ACTIVATE, PRECHARGE and REFRESH may follow BURST_LEN
+    // after a READ: a PRECHARGE there never truncates the burst.
+    wire rd_inflight = |rd_pipe[RD_STAGES-2:0];
+    reg last_read_chip;
+    wire [3:0] beat_stage = rd_pipe[RD_BEAT0 +: 4];
+    wire beat_any = |beat_stage;
+    wire [1:0] beat_k = beat_stage[0] ? 2'd0 : beat_stage[1] ? 2'd1 :
+                        beat_stage[2] ? 2'd2 : 2'd3;
+    wire beat_b = |(rd_tag_b[RD_BEAT0 +: 4] & beat_stage);
+    wire beat_serial = |(rd_tag_serial[RD_BEAT0 +: 4] & beat_stage);
     reg [2:0] wrbuf_read_ptr;
 
     // Read data capture: DQ sampled on aux_clk (phase-shifted for proper timing)
@@ -361,9 +435,6 @@ module sdram(
             refresh_chip <= 0;
             serial_row_open <= 0;
             open_valid <= 0;
-            spi_row_hit <= 0;
-            spi_bank_open <= 0;
-            spi_redirect_settle <= 0;
             
             read_buffer <= 0;
             read_buffer_b <= 0;
@@ -372,9 +443,11 @@ module sdram(
             read_beats_a <= 0;
             read_beats_b <= 0;
             read_busy <= 0;
-            readcount <= 0;
+            rd_pipe <= 0;
+            rd_tag_b <= 0;
+            rd_tag_serial <= 0;
+            last_read_chip <= 0;
 
-            rdbuf_write_ptr <= 0;
             wrbuf_read_ptr <= 0;
             
             spi_active_buf <= 0;
@@ -389,14 +462,34 @@ module sdram(
             spi_read_continuation <= 0;
             spi_addr_latched <= 0;
             fill_sel <= 0;
-            post_fill_sel <= 1;
+            post_fill_sel <= 0;     // B goes to the pair fetch (see fill reset)
             fill_reset_armed <= 0;
             serial_read_active <= 0;
             spi_act_armed <= 1;
             spi_read_armed <= 1;
             spi_post_sync <= 0;
+            spi_pair_buf <= 0;
+            spi_pair_armed <= 1;
+            spi_txn_read_done <= 0;
+            auto_pending <= 0;
+            auto_ready <= 0;
+            auto_addr <= 0;
+            auto_hit <= 0;
+            spi_row_hit <= 0;
+            spi_bank_open <= 0;
+            spi_redirect_settle <= 0;
+            auto_hit_fresh <= 0;
+            auto_opened <= 0;
+            spi_pair_read_done <= 0;
+            spi_pair_window <= 0;
         end
         else begin
+            // Read pipeline advances every clock; a READ dispatch below
+            // enters stage 0.
+            rd_pipe <= {rd_pipe[RD_STAGES-2:0], 1'b0};
+            rd_tag_b <= {rd_tag_b[RD_STAGES-2:0], 1'b0};
+            rd_tag_serial <= {rd_tag_serial[RD_STAGES-2:0], 1'b0};
+
             // Saturate at capacity, not the dispatch deadline: elapsed
             // service/deferral time remains owed until actually refreshed.
             if (!(&refreshcount))
@@ -444,18 +537,45 @@ module sdram(
             if (spi_deselect_event) begin
                 spi_act_armed <= 0;
                 spi_read_armed <= 0;
+                spi_pair_armed <= 0;
             end
             else begin
                 if (!spi_cmd_activate_buf[1] && spi_active_buf[1]) spi_act_armed <= 1;
                 if (!spi_cmd_read_buf[1] && spi_active_buf[1]) spi_read_armed <= 1;
+                // Both pair stages low: the third stage lags spi_active_buf
+                // by a clock, so a stale-high level must not arm through it.
+                if (spi_pair_buf[2:1] == 2'b00 && spi_active_buf[1]) spi_pair_armed <= 1;
             end
-            // A post always precedes its fill by ~10 sysclks, so
-            // invalidating here can never clobber a completed fill.
-            spi_post_sync <= {spi_post_sync[1:0], spi_cmd_post_toggle};
+            // Burst pair: one per transaction, armed like the posts above.
+            // A deselect drops a pair that has not opened a row yet; one
+            // that has completes its READ (harmless, and it keeps tRAS).
+            spi_pair_buf <= {spi_pair_buf[1:0], spi_cmd_pair && spi_active};
+            spi_pair_window <= spi_pair_read_done && spi_pair_buf[1];
+            if (spi_deselect_event) begin
+                spi_txn_read_done <= 0;
+                spi_pair_read_done <= 0;
+                if (!auto_opened) begin
+                    auto_pending <= 0;
+                    auto_ready <= 0;
+                end
+            end
+            else if (spi_pair_buf[2] && spi_pair_armed && spi_active_buf[1]) begin
+                spi_pair_armed <= 0;
+                auto_pending <= 1;
+            end
+            else if (auto_pending && !auto_ready && !spi_redirect_pending) begin
+                auto_addr <= spi_addr2;
+                auto_ready <= 1;
+            end
+            auto_hit <= open_valid[auto_idx] && open_rows[auto_idx] == auto_addr[21:9];
             spi_row_hit <= open_valid[spi_open_idx] &&
                            open_rows[spi_open_idx] == spi_addr[21:9];
             spi_bank_open <= open_valid[spi_open_idx];
             spi_redirect_settle <= spi_redirect_pending;
+            auto_hit_fresh <= auto_ready;
+            // A post always precedes its fill by ~10 sysclks, so
+            // invalidating here can never clobber a completed fill.
+            spi_post_sync <= {spi_post_sync[1:0], spi_cmd_post_toggle};
             if (spi_post_sync[1] ^ spi_post_sync[2]) begin
                 if (post_fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
                 else begin read_valid_a <= 0; read_beats_a <= 0; end
@@ -740,6 +860,71 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
+                else if (auto_go && auto_hit &&
+                         (!rd_inflight || last_read_chip == auto_addr[22])) begin
+                    // Burst pair READ, row open: streams right behind the
+                    // first burst (no auto-precharge, like any SPI READ).
+                    state <= STA_READ;
+                    cmdtarget <= BURST_LEN;
+                    cmd_wait <= BURST_LEN > 1;
+                    read_busy <= 1;
+                    auto_pending <= 0;
+                    auto_ready <= 0;
+                    auto_opened <= 0;
+                    spi_pair_read_done <= 1;
+                    rd_pipe[0] <= 1;
+                    rd_tag_b[0] <= fill_sel;
+                    rd_tag_serial[0] <= 0;
+                    last_read_chip <= auto_addr[22];
+                    fill_sel <= ~fill_sel;
+                    if (fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
+                    else begin read_valid_a <= 0; read_beats_a <= 0; end
+
+                    cs_o <= auto_addr[22];
+                    ras_o <= 1;
+                    cas_o <= 0;
+                    we_o <= 1;
+                    ba_o <= auto_addr[8:7];
+                    a_o <= 0;
+                    a_o[8:0] <= {auto_addr[6:0], 2'b00};
+                    a_o[10] <= 0;
+                    dq_oe_o <= 0;
+                    dqm_o <= 2'b00;
+                end
+                else if (auto_go && open_valid[auto_idx]) begin
+                    // Pair burst in a bank holding another row: close it.
+                    // That row was opened before the first burst's READ
+                    // dispatched, so tRAS is met, and a PRECHARGE BURST_LEN
+                    // after a READ never truncates its data.
+                    state <= STA_ROW_PRECHARGE;
+                    cmdtarget <= tRP;
+                    cmd_wait <= tRP > 1;
+                    open_valid[auto_idx] <= 0;
+                    cs_o <= auto_addr[22];
+                    ras_o <= 0;
+                    cas_o <= 1;
+                    we_o <= 0;
+                    ba_o <= auto_addr[8:7];
+                    a_o <= 0;
+                    a_o[10] <= 0;
+                    dqm_o <= 2'b11;
+                end
+                else if (auto_go) begin
+                    // Pair burst crosses into a closed bank.
+                    state <= STA_ACTIVATE;
+                    cmdtarget <= tRCD;
+                    cmd_wait <= tRCD > 1;
+                    auto_opened <= 1;
+                    open_rows[auto_idx] <= auto_addr[21:9];
+                    open_valid[auto_idx] <= 1;
+                    cs_o <= auto_addr[22];
+                    ras_o <= 0;
+                    cas_o <= 1;
+                    we_o <= 1;
+                    dqm_o <= 2'b11;
+                    ba_o <= auto_addr[8:7];
+                    a_o <= auto_addr[21:9];
+                end
                 else if (refresh_wanted && refresh_open != 0) begin
                     // Refresh needs every bank of its chip closed; close
                     // them with one precharge-all and let refresh dispatch
@@ -778,7 +963,7 @@ module sdram(
                 end
                 else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
                          !serial_row_open && !spi_redirect_pending && !spi_redirect_settle &&
-                         spi_row_hit) begin
+                         !auto_opened && !(fill_reset_armed && rd_inflight) && spi_row_hit) begin
                     // SPI fast-path activate, row already open: acknowledge
                     // without issuing ACTIVATE; READ may dispatch next cycle
                     // (saves the ACTIVATE command and tRCD).
@@ -790,8 +975,12 @@ module sdram(
                     spi_addr_latched <= spi_addr;
                     spi_act_armed <= 0;
                     if (fill_reset_armed) begin
+                        // A fill still in flight from the previous
+                        // transaction must land first (see the guard).
+                        // The pair fetch takes buffer B without a post
+                        // toggle, so the first toggle targets A again.
                         fill_sel <= 0;
-                        post_fill_sel <= 1;
+                        post_fill_sel <= 0;
                         read_valid_a <= 0;
                         read_valid_b <= 0;
                         read_beats_a <= 0;
@@ -805,7 +994,7 @@ module sdram(
                 end
                 else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
                          !serial_row_open && !spi_redirect_pending && !spi_redirect_settle &&
-                         spi_bank_open) begin
+                         !auto_opened && spi_bank_open) begin
                     // A different row is open in this bank: close it first.
                     // Not an acceptance: the post levels stay up and
                     // ACTIVATE dispatches after tRP. The previous burst
@@ -824,7 +1013,8 @@ module sdram(
                     dqm_o <= 2'b11;
                 end
                 else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
-                         !serial_row_open && !spi_redirect_pending && !spi_redirect_settle) begin
+                         !serial_row_open && !spi_redirect_pending && !spi_redirect_settle &&
+                         !auto_opened && !(fill_reset_armed && rd_inflight)) begin
                     // SPI fast-path activate
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
@@ -836,8 +1026,12 @@ module sdram(
                     open_rows[spi_open_idx] <= spi_addr[21:9];
                     open_valid[spi_open_idx] <= 1;
                     if (fill_reset_armed) begin
+                        // A fill still in flight from the previous
+                        // transaction must land first (see the guard).
+                        // The pair fetch takes buffer B without a post
+                        // toggle, so the first toggle targets A again.
                         fill_sel <= 0;
-                        post_fill_sel <= 1;
+                        post_fill_sel <= 0;
                         read_valid_a <= 0;
                         read_valid_b <= 0;
                         read_beats_a <= 0;
@@ -855,18 +1049,25 @@ module sdram(
                     a_o <= spi_addr[21:9];
                 end
                 else if (spi_cmd_read_buf[1] && !spi_cmd_read_ack && spi_activate_done && spi_read_armed &&
-                         !serial_row_open) begin
-                    // SPI fast-path read
+                         !serial_row_open && !auto_opened &&
+                         (!rd_inflight || last_read_chip == spi_chip_sel)) begin
+                    // SPI fast-path read. Same-chip READs stream BURST_LEN
+                    // clocks apart (see the read data pipeline).
                     state <= STA_READ;
-                    cmdtarget <= tREAD;
-                    cmd_wait <= tREAD > 1;
+                    cmdtarget <= BURST_LEN;
+                    cmd_wait <= BURST_LEN > 1;
                     read_busy <= 1;
                     spi_cmd_read_ack <= 1;
                     spi_read_armed <= 0;
                     spi_read_continuation <= spi_cmd_continuation;
-                    serial_read_active <= 0;
-                    // Invalidate the fill target up front; set again below
-                    // when the final beat publishes.
+                    spi_txn_read_done <= 1;
+                    rd_pipe[0] <= 1;
+                    rd_tag_b[0] <= fill_sel;
+                    rd_tag_serial[0] <= 0;
+                    last_read_chip <= spi_chip_sel;
+                    // Fills alternate in dispatch order. Invalidate the
+                    // target up front; its beats set the flags again.
+                    fill_sel <= ~fill_sel;
                     if (fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
                     else begin read_valid_a <= 0; read_beats_a <= 0; end
 
@@ -883,7 +1084,7 @@ module sdram(
                     dq_oe_o <= 0;
                     dqm_o <= 2'b00;
                 end
-                else if (access_cmd == 2'b11 && spi_row_idle &&
+                else if (access_cmd == 2'b11 && spi_row_idle && !auto_opened &&
                          open_valid[{access_chip_sel, access_bank}]) begin
                     // Close the row left open in the serial target bank
                     // first; not an acceptance (the client holds its
@@ -901,7 +1102,7 @@ module sdram(
                     a_o[10] <= 0;
                     dqm_o <= 2'b11;
                 end
-                else if (access_cmd == 2'b11 && spi_row_idle) begin
+                else if (access_cmd == 2'b11 && spi_row_idle && !auto_opened) begin
                     // Serial path activate
                     access_accept <= 1;
                     serial_row_open <= 1;
@@ -920,7 +1121,7 @@ module sdram(
                     ba_o <= access_bank;
                     a_o <= access_row;
                 end
-                else if (access_cmd == 2'b01 && spi_row_idle) begin
+                else if (access_cmd == 2'b01 && spi_row_idle && !auto_opened && !rd_inflight) begin
                     // Serial path read (auto-precharge closes its row)
                     access_accept <= 1;
                     serial_row_open <= 0;
@@ -930,6 +1131,10 @@ module sdram(
                     cmd_wait <= (tREAD + 5'd2) > 1;
                     read_busy <= 1;
                     serial_read_active <= 1;
+                    rd_pipe[0] <= 1;
+                    rd_tag_b[0] <= 0;
+                    rd_tag_serial[0] <= 1;
+                    last_read_chip <= access_chip_sel;
                     read_valid_a <= 0;
                     read_beats_a <= 0;
 
@@ -945,7 +1150,7 @@ module sdram(
                     dq_oe_o <= 0;
                     dqm_o <= 2'b00;
                 end
-                else if (access_cmd == 2'b10 && spi_row_idle) begin
+                else if (access_cmd == 2'b10 && spi_row_idle && !auto_opened && !rd_inflight) begin
                     // Serial path write (auto-precharge closes its row)
                     access_accept <= 1;
                     serial_row_open <= 0;
@@ -1005,79 +1210,55 @@ module sdram(
             // dispatcher (as the STA_REFRESH case) so it takes priority
             // over SPI and serial command dispatches in the same cycle.
             
+            // Keep read data unmasked until the last beat has left the
+            // SDRAM (DQM read latency 2), whatever dispatches meanwhile.
+            if (rd_inflight) dqm_o <= 2'b00;
+
             // Read data capture: each beat's bytes publish straight into
             // the target buffer (progressive publish, see layout note at the
-            // top of this file). Beats of one READ arrive back-to-back, and
-            // the ping-pong target is always the idle half, so the SPI side
-            // never observes a torn burst.
-            if ((readcount > tCAS + RD_PIPELINE_DELAY) && (readcount <= tCAS + RD_PIPELINE_DELAY + BURST_LEN)) begin
-                // rdbuf_write_ptr counts 0..3 (4 words in burst).
-                // Byte-serial progressive publish: beat w completes bytes
-                // 2w/2w+1 straight into the target buffer (serial: A; SPI:
-                // ping-pong fill target). Beats of one READ arrive
-                // back-to-back, so later bytes are always ready long before
-                // the SPI side shifts them out; only the first byte(s) of a
-                // burst are timing-critical. read_valid marks beat 0 for
-                // the thin-margin check; read_beats marks each beat for
-                // actual output checks, including high-offset short reads.
-                // (Explicit lanes rather than variable part-selects: safest
-                // across Yosys, Verilator, and Gowin synthesis.)
-                if (serial_read_active || !fill_sel)
-                    read_beats_a[rdbuf_write_ptr] <= 1;
-                else
-                    read_beats_b[rdbuf_write_ptr] <= 1;
-                case (rdbuf_write_ptr)
-                    2'd0: begin
-                        if (serial_read_active) begin
-                            read_buffer[15:0] <= dq_captured;
-                            read_valid_a <= 1;
-                        end
-                        else if (fill_sel) begin
-                            read_buffer_b[15:0] <= dq_captured;
-                            read_valid_b <= 1;
-                        end
-                        else begin
-                            read_buffer[15:0] <= dq_captured;
-                            read_valid_a <= 1;
-                        end
+            // top of this file). Byte-serial: beat w completes bytes 2w/2w+1
+            // (serial: A; SPI: the fill target tagged at dispatch). Only
+            // the first byte(s) of a burst are timing-critical; later bytes
+            // are ready long before the SPI side shifts them out, and the
+            // target is never the half being shifted out, so the SPI side
+            // never observes a torn burst. read_valid marks beat 0 for the
+            // thin-margin check; read_beats marks each beat for the actual
+            // output checks, including high-offset short reads. (Explicit
+            // lanes rather than variable part-selects: safest across
+            // Yosys, Verilator, and Gowin synthesis.)
+            if (beat_any) begin
+                if (beat_serial || !beat_b) begin
+                    read_beats_a[beat_k] <= 1;
+                    case (beat_k)
+                        2'd0: read_buffer[15:0] <= dq_captured;
+                        2'd1: read_buffer[31:16] <= dq_captured;
+                        2'd2: read_buffer[47:32] <= dq_captured;
+                        2'd3: read_buffer[63:48] <= dq_captured;
+                    endcase
+                    if (beat_k == 2'd0) read_valid_a <= 1;
+                end
+                else begin
+                    read_beats_b[beat_k] <= 1;
+                    case (beat_k)
+                        2'd0: read_buffer_b[15:0] <= dq_captured;
+                        2'd1: read_buffer_b[31:16] <= dq_captured;
+                        2'd2: read_buffer_b[47:32] <= dq_captured;
+                        2'd3: read_buffer_b[63:48] <= dq_captured;
+                    endcase
+                    if (beat_k == 2'd0) read_valid_b <= 1;
+                end
+                if (beat_k == 2'd3) begin
+                    // Busy until the last streamed READ has published.
+                    read_busy <= |rd_pipe[RD_BEAT0-1:0];
+                    if (beat_serial) begin
+                        // A serial read restarts the SPI pairing at A.
+                        read_valid_b <= 0;
+                        read_beats_b <= 0;
+                        fill_sel <= 0;
+                        serial_read_active <= 0;
                     end
-                    2'd1: begin
-                        if (serial_read_active) read_buffer[31:16] <= dq_captured;
-                        else if (fill_sel) read_buffer_b[31:16] <= dq_captured;
-                        else read_buffer[31:16] <= dq_captured;
-                    end
-                    2'd2: begin
-                        if (serial_read_active) read_buffer[47:32] <= dq_captured;
-                        else if (fill_sel) read_buffer_b[47:32] <= dq_captured;
-                        else read_buffer[47:32] <= dq_captured;
-                    end
-                    2'd3: begin
-                        if (serial_read_active) begin
-                            read_buffer[63:48] <= dq_captured;
-                            read_valid_a <= 1;
-                            read_valid_b <= 0;
-                            read_beats_b <= 0;
-                            fill_sel <= 0;
-                            serial_read_active <= 0;
-                        end
-                        else if (fill_sel) begin
-                            read_buffer_b[63:48] <= dq_captured;
-                            fill_sel <= 0;
-                        end
-                        else begin
-                            read_buffer[63:48] <= dq_captured;
-                            fill_sel <= 1;
-                        end
-                        read_busy <= 0;
-                    end
-                endcase
-
-                rdbuf_write_ptr <= rdbuf_write_ptr + 1;
+                end
             end
-            else
-                rdbuf_write_ptr <= 0;
-            
-            readcount <= (state == STA_READ) ? cmdcount : 0;
         end
     end
 

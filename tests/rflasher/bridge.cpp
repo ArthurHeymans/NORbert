@@ -14,7 +14,7 @@ class Bridge {
     Vwrapper dut;
     std::vector<uint8_t> memory = std::vector<uint8_t>(64 * 1024 * 1024, 0xff);
     std::vector<uint8_t> host_output;
-    bool prev_read = false, prev_post = false, fill_b = false;
+    bool prev_read = false, prev_post = false, prev_pair = false, fill_b = false;
     unsigned busy_ticks = 0;
 
     uint64_t load(size_t addr) const {
@@ -22,23 +22,29 @@ class Bridge {
         for (unsigned i = 0; i < 8; ++i) value |= uint64_t(memory.at(addr + i)) << (8 * i);
         return value;
     }
+    void fill(uint32_t burst) {
+        const uint64_t data = load(size_t(burst) * 8);
+        if (fill_b) { dut.ram_b = data; dut.valid_b = 1; dut.beats_b = 0xf; }
+        else { dut.ram_a = data; dut.valid_a = 1; dut.beats_a = 0xf; }
+        fill_b = !fill_b;
+    }
     void prefetch() {
         if (dut.cs) {
             prev_read = dut.ram_read;
             prev_post = dut.ram_post_toggle;
+            prev_pair = dut.ram_pair;
             fill_b = false;
             dut.valid_a = dut.valid_b = 0;
             dut.beats_a = dut.beats_b = 0;
         } else {
             // A post-toggle edge may accompany a read rising edge: one fill only.
-            if (dut.ram_read && (!prev_read || dut.ram_post_toggle != prev_post)) {
-                const uint64_t data = load(size_t(dut.ram_addr) * 8);
-                if (fill_b) { dut.ram_b = data; dut.valid_b = 1; dut.beats_b = 0xf; }
-                else { dut.ram_a = data; dut.valid_a = 1; dut.beats_a = 0xf; }
-                fill_b = !fill_b;
-            }
+            if (dut.ram_read && (!prev_read || dut.ram_post_toggle != prev_post))
+                fill(dut.ram_addr);
+            // The controller fetches the pair burst right behind the first.
+            if (dut.ram_pair && !prev_pair) fill(dut.ram_addr2);
             prev_read = dut.ram_read;
             prev_post = dut.ram_post_toggle;
+            prev_pair = dut.ram_pair;
         }
         dut.eval();
     }

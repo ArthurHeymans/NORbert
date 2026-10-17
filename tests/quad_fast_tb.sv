@@ -38,7 +38,8 @@ module quad_fast_tb;
     wire io0_oe, io1_oe, io2_oe, io3_oe;
     real sclk_half = 16.667;
 
-    wire [22:0] ram_addr;
+    wire [22:0] ram_addr, ram_addr2;
+    wire ram_pair;
     wire ram_act, ram_read, ram_cont, ram_inh;
     wire [63:0] read_buffer_a, read_buffer_b;
     wire read_valid_a, read_valid_b, read_busy;
@@ -56,6 +57,7 @@ module quad_fast_tb;
         .spi_io3_in(io3_in), .spi_io3_out(io3_out), .spi_io3_oe(io3_oe),
         .ram_inhibit_refresh(ram_inh), .ram_activate(ram_act), .ram_read(ram_read),
         .ram_continuation(ram_cont), .ram_addr(ram_addr),
+        .ram_pair(ram_pair), .ram_addr2(ram_addr2),
         .ram_read_buffer(read_buffer_a), .ram_read_buffer_b(read_buffer_b),
         .ram_read_valid_a(read_valid_a), .ram_read_valid_b(read_valid_b),
         .ram_read_beats_a(read_beats_a), .ram_read_beats_b(read_beats_b),
@@ -80,6 +82,7 @@ module quad_fast_tb;
         .spi_active(!cs), .spi_inhibit_refresh(ram_inh),
         .spi_cmd_activate(ram_act), .spi_cmd_read(ram_read), .spi_addr(ram_addr),
         .spi_cmd_post_toggle(post_toggle), .spi_cmd_continuation(ram_cont),
+        .spi_cmd_pair(ram_pair), .spi_addr2(ram_addr2),
         .access_cmd(2'b00), .access_addr(25'b0), .inhibit_refresh(1'b0),
         .read_buffer(read_buffer_a), .read_buffer_b(read_buffer_b),
         .read_valid_a(read_valid_a), .read_valid_b(read_valid_b),
@@ -273,6 +276,35 @@ module quad_fast_tb;
 
     task deselect_spi;
         #(sclk_half*2 + 35); cs = 1; #(sclk_half*2 + 70);
+    endtask
+
+    // Firmware executing in place issues long runs of short reads with
+    // little deselect time between them (an Intel ICH fetching code at
+    // 20 MHz, for example). Such reads post no lookahead burst, so refresh
+    // has to fit into the window the burst pair opens. Without it the
+    // backlog ended in a hard refresh between a first burst's ACTIVATE and
+    // READ, and the burst was lost.
+    task short_read_run(input real half, input integer reads);
+        reg [7:0] got, want;
+        reg [31:0] a;
+        integer n;
+        sclk_half = half;
+        for (integer r = 0; r < reads; r++) begin
+            a = {8'h00, 24'((r * 32'h9e3779b1) >> 7)};
+            n = 1 + (r % 4);
+            cs = 0; #(sclk_half);
+            send_byte(8'h0b);
+            send_byte(a[23:16]); send_byte(a[15:8]); send_byte(a[7:0]);
+            repeat (fast_wait) sclk_tick;
+            for (integer i = 0; i < n; i++) begin
+                recv_single(got);
+                want = expected_byte(a, i);
+                if (got !== want) cell_mismatch(9'h0b, a, i, got, want);
+            end
+            #(sclk_half); cs = 1;
+            check_underrun(a, 9'h0b);
+            #15;
+        end
     endtask
 
     /* verilator lint_on ZERODLY */
@@ -610,18 +642,26 @@ module quad_fast_tb;
         sweep_offsets(9'h6b, 32, 32'h00a000);
         $display("quad_fast: 0x6B @70MHz OK");
 
-        // Quad-IO at 40MHz supports every offset. At 50MHz and above,
-        // offset 7 can use unready first bits even when their values happen
-        // to match; classify those cells as exploration, not supported.
+        // Quad-IO, every offset up to 70MHz: the controller fetches the
+        // second burst itself right behind the first, so a read starting
+        // at byte 7 no longer waits for a mode-phase post.
         sclk_half = 12.5;
         sweep_offsets(9'heb, 32, 32'h00b000);
         $display("quad_fast: 0xEB @40MHz OK");
         sclk_half = 10.0;
-        sweep_offsets(9'heb, 32, 32'h00b800, 0);
+        sweep_offsets(9'heb, 32, 32'h00b800);
+        $display("quad_fast: 0xEB @50MHz OK");
         sclk_half = 8.333;
-        sweep_offsets(9'heb, 32, 32'h00c000, 0);
+        sweep_offsets(9'heb, 32, 32'h00c000);
+        $display("quad_fast: 0xEB @60MHz OK");
         sclk_half = 7.143;
-        sweep_offsets(9'heb, 32, 32'h00d000, 0);
+        sweep_offsets(9'heb, 32, 32'h00d000);
+        $display("quad_fast: 0xEB @70MHz OK");
+        // Beyond the SPI-domain Fmax of the routed design (explore).
+        sclk_half = 6.25;
+        sweep_offsets(9'heb, 32, 32'h00d800, 0);
+        sweep_offsets(9'h6b, 32, 32'h00d800, 0);
+        sclk_half = 7.143;
         // Dual-IO at 70MHz (explore: short mode phase + tiny first bursts).
         sweep_offsets(9'hbb, 32, 32'h00e000, 0);
         // Slow read above 40MHz (explore: only 3.5 clocks for all beats).
@@ -651,9 +691,9 @@ module quad_fast_tb;
         sclk_half = 8.333;  // 60 MHz, same as 0xBB
         sweep_offsets(9'hbc, 32, 32'h0123_4500);
         $display("quad_fast: 0xBC 4-byte dual-io @60MHz OK");
-        sclk_half = 12.5;   // 40 MHz, same as 0xEB
+        sclk_half = 7.143;  // 70 MHz, same as 0xEB
         sweep_offsets(9'hec, 32, 32'h0023_4500);
-        $display("quad_fast: 0xEC 4-byte quad-io @40MHz OK");
+        $display("quad_fast: 0xEC 4-byte quad-io @70MHz OK");
         // Long sequential runs across row/bank boundaries with refresh
         // coexistence: 2KB from 0x3FF800 crosses the 4KB row at 0x400000
         // plus bank boundaries on the way. (Chip select is byte 25,
@@ -688,10 +728,12 @@ module quad_fast_tb;
         refresh_sweep(9'h3b, 10.0,  32'h020000);
         refresh_sweep(9'hbb, 8.333, 32'h028000);
         refresh_sweep(9'h6b, 7.143, 32'h030000);
-        refresh_sweep(9'heb, 12.5,  32'h038000);
-        refresh_sweep(9'heb, 10.0,  32'h040000, 0);
+        refresh_sweep(9'heb, 7.143, 32'h038000);
         refresh_sweep(9'hbb, 7.143, 32'h048000, 0);
         refresh_sweep(9'h03, 10.0,  32'h050000, 0);
+
+        short_read_run(25.0, 2000);
+        $display("quad_fast: 2000 short 0x0B reads @20MHz, 15ns deselect OK");
 
         // The mode pair: 0xB7 widens the address phase of the plain 0x03
         // and 0xE9 narrows it again. Placed after the streaming runs
