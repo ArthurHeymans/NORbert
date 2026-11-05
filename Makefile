@@ -16,6 +16,7 @@ VERILOG_FILES = \
 	src/glue.v \
 	src/spi_program.v \
 	src/host_protocol.v \
+	src/chip_profile_store.v \
 	src/sdram_client_mux.v \
 	src/uart.v \
 	src/ft245.v \
@@ -27,6 +28,7 @@ VERILOG_FILES = \
 # Included by the sources above
 VERILOG_HEADERS = \
 	src/spi_flash_cmds.vh \
+	src/spi_chip_profile.vh \
 	src/host_protocol.vh
 
 # Constraints
@@ -52,7 +54,14 @@ all: build
 # Full build: synthesis + PnR via Gowin CLI
 build: $(BITSTREAM)
 
-$(BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) tangprimer25k.sdc build.tcl
+.PHONY: check-clocks test-clocks
+check-clocks:
+	python3 tests/check_clocks.py --oss-sdc $(OSS_SDC)
+
+test-clocks: check-clocks
+	python3 -m unittest discover -s tests -p check_clocks_test.py
+
+$(BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) tangprimer25k.sdc build.tcl | check-clocks
 	gw_sh build.tcl
 
 # Open-source build. Keep shadow SRAM disabled (-nolutram) until the
@@ -65,14 +74,15 @@ $(BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) tangprimer25k.sdc 
 # borrowed from GW2A, so the Gowin build stays the reference.
 build-oss: $(OSS_BITSTREAM)
 
-$(OSS_BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) $(OSS_SDC)
+$(OSS_BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) $(OSS_SDC) tests/check_clocks.py | check-clocks
 	mkdir -p $(OSS_DIR)
 	yosys -q -l $(OSS_DIR)/yosys.log \
 		-p "read_verilog -Isrc $(VERILOG_FILES); synth_gowin -family gw5a -nolutram -nowidelut -top top -json $(OSS_DIR)/top.json"
 	nextpnr-himbaechel --json $(OSS_DIR)/top.json --write $(OSS_DIR)/pnr.json \
 		--device $(DEVICE) --vopt family=GW5A-25A --vopt cst=$(CST_FILE) \
 		--vopt i2c_as_gpio --vopt sspi_as_gpio \
-		--sdc $(OSS_SDC) --timing-allow-fail -l $(OSS_DIR)/nextpnr.log
+		--sdc $(OSS_SDC) --timing-allow-fail -l $(OSS_DIR)/nextpnr.log --report $(OSS_DIR)/timing.json
+	python3 tests/check_clocks.py --oss-sdc $(OSS_SDC) --report $(OSS_DIR)/timing.json --log $(OSS_DIR)/nextpnr.log
 	gowin_pack -d GW5A-25A --i2c_as_gpio --sspi_as_gpio --mspi_as_gpio \
 		--ready_as_gpio --done_as_gpio --cpu_as_gpio -o $@ $(OSS_DIR)/pnr.json
 
@@ -105,9 +115,9 @@ lint-verilator:
 # Width warnings are not suppressed here either: the testbenches must see
 # the same width discipline as the lint build, so a testbench cannot hide a
 # width bug in the RTL it is exercising.
-test:
+test: test-clocks
 	@set -eu; build=$$(mktemp -d); trap 'rm -rf "$$build"' EXIT; \
-	for test in spi_flash host_protocol top_io sdram_controller refresh sdram_protocol access_handshake write_completion prefetch_health toctou quad_fast fifo logger uart ft245; do \
+	for test in chip_profile spi_flash host_protocol top_io sdram_controller refresh sdram_protocol access_handshake write_completion prefetch_health toctou quad_fast fifo logger uart ft245; do \
 		echo "Testing $$test"; \
 		verilator --binary --timing -j 2 --top-module $${test}_tb -Isrc \
 			-Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD \
@@ -118,6 +128,10 @@ test:
 	done
 
 # The same testbenches against the Yosys GW5A netlist.
+.PHONY: test-rflasher
+test-rflasher:
+	$(MAKE) -C tests/rflasher test-rflasher
+
 test-gate:
 	tests/gate.sh
 
@@ -161,6 +175,7 @@ help:
 	@echo "  make prog-oss  - Program the open-source bitstream (volatile)"
 	@echo "  make prog    - Program FPGA (volatile)"
 	@echo "  make flash   - Program to flash (persistent)"
+	@echo "  make test-clocks - Check PLL/SDC consistency and required OSS clock targets"
 	@echo "  make lint    - Check Verilog with Yosys and Verilator"
 	@echo "  make test    - Simulate SPI, SDRAM, TOCTOU, FIFO, logger, UART and FT245"
 	@echo "  make test-gate - Run the testbenches on the Yosys GW5A netlist"

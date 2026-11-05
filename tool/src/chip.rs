@@ -1,6 +1,7 @@
 //! Flash chip database access backed by rflasher.
 
 use anyhow::{Context, Result, bail};
+use rflasher_chips::WriteGranularity;
 pub use rflasher_chips::{ChipDatabase, EraseBlock, Features, FlashChip};
 use std::path::Path;
 
@@ -33,8 +34,13 @@ impl FlashChipExt for FlashChip {
     }
 
     fn supports_4byte(&self) -> bool {
-        self.features
-            .intersects(Features::FOUR_BYTE_ADDR | Features::FOUR_BYTE_ENTER)
+        self.features.intersects(
+            Features::FOUR_BYTE_ADDR
+                | Features::FOUR_BYTE_ENTER
+                | Features::FOUR_BYTE_ENTER_WREN
+                | Features::FOUR_BYTE_ENTER_EAR7
+                | Features::FOUR_BYTE_READ,
+        )
     }
 
     fn supports_dual(&self) -> bool {
@@ -51,32 +57,42 @@ impl FlashChipExt for FlashChip {
 
     fn write_byte(&self) -> bool {
         self.features.contains(Features::WRITE_BYTE)
+            || self.write_granularity == WriteGranularity::Byte
     }
 
     fn supports_sfdp(&self) -> bool {
-        // rflasher's database never sets the SFDP feature, so assume SFDP
-        // unless the chip is an SST25 AAI part. Those predate JESD216, and
-        // a fabricated table would make SFDP-probing tools override their
-        // correct chip-table handling.
-        self.features.contains(Features::SFDP) || !self.aai_word()
+        // No catalog-wide guess: only explicit metadata or these audited
+        // modern Winbond identities can expose our synthesized BFPT.
+        let audited = self.jedec_manufacturer == 0xef
+            && matches!(
+                self.name.as_str(),
+                "W25Q128.V" | "W25Q64.V" | "W25Q64BV/W25Q64CV/W25Q64FV" | "W25Q64JV-.Q"
+            );
+        !self.features.contains(Features::AT25F_ID)
+            && !self.name.starts_with("SST25")
+            && (self.total_size <= 16 * 1024 * 1024 || self.features.supports_4ba_mode_switch())
+            && (self.features.contains(Features::SFDP) || audited)
+            && self
+                .erase_blocks
+                .iter()
+                .filter(|erase| !erase.is_chip_erase())
+                .all(|erase| erase.is_uniform())
     }
 
     fn sector_erase_ops(&self) -> Vec<&EraseBlock> {
         let mut ops: Vec<&EraseBlock> = self
             .erase_blocks
             .iter()
-            .filter(|erase| {
-                erase_block_size(erase).is_some_and(|block_size| block_size < self.total_size)
-            })
+            .filter(|erase| !erase.is_chip_erase())
             .collect();
         ops.sort_by_key(|erase| erase_block_size(erase).unwrap_or(0));
         ops
     }
 }
 
-/// Return the first region's block size, matching NORbert's uniform-chip use.
+/// Return a block size only when the complete operation is uniform.
 pub fn erase_block_size(erase: &EraseBlock) -> Option<u32> {
-    erase.regions.first().map(|region| region.size)
+    erase.uniform_size()
 }
 
 /// Load rflasher's compiled-in chip database, or an explicit directory override.

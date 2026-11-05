@@ -31,24 +31,47 @@ module logger(
                          !active_sync[1] && active_sync[2],
                          addr_valid_sync[1] && !addr_valid_sync[2],
                          cmd_valid_sync[1] && !cmd_valid_sync[2]} & {4{enable}};
-    wire [2:0] event_count = {2'b0, events[0]} + {2'b0, events[1]} +
-                             {2'b0, events[2]} + {2'b0, events[3]};
+    // Snapshot events and their held payload on the original capture edge.
+    // Queue them one cycle later: enable/CDC edge decode must not feed the
+    // high-fanout first-word-fallthrough register enable combinationally.
+    reg [3:0] captured_events;
+    reg captured_any;
+    reg [89:0] captured_payload;
+    always @(posedge clk) begin
+        if (reset) begin
+            captured_events <= 0;
+            captured_any <= 0;
+            captured_payload <= 0;
+        end else begin
+            captured_events <= events;
+            captured_any <= events != 0;
+            captured_payload <= {spi_log_cmd_opcode, spi_log_addr,
+                                 spi_log_byte_count, trap_notify_index,
+                                 trap_notify_addr};
+        end
+    end
+    wire [2:0] event_count = {2'b0, captured_events[0]} + {2'b0, captured_events[1]} +
+                             {2'b0, captured_events[2]} + {2'b0, captured_events[3]};
     reg [15:0] lost_pending;
+    reg lost_waiting;
     wire [16:0] lost_sum = {1'b0, lost_pending} + {14'b0, event_count};
     wire frame_space, frame_available;
     wire [110:0] frame_data;
-    wire frame_write = frame_space && (events != 0 || lost_pending != 0);
+    wire frame_write = frame_space && (captured_any || lost_waiting);
     reg frame_pop;
     fifo #(.WIDTH(111), .NUM(8), .FREESPACE(1)) event_fifo(
         .clk(clk), .reset(reset), .space_available(frame_space),
-        .write_data({lost_pending != 0, events, lost_pending,
-                     spi_log_cmd_opcode, spi_log_addr, spi_log_byte_count,
-                     trap_notify_index, trap_notify_addr}),
+        .write_data({lost_waiting, captured_events, lost_pending, captured_payload}),
         .write_strobe(frame_write), .data_available(frame_available),
         .more_available(), .read_data(frame_data), .read_strobe(frame_pop));
     always @(posedge clk) begin
-        if (reset || frame_write) lost_pending <= 0;
-        else if (events != 0) lost_pending <= lost_sum[16] ? 16'hffff : lost_sum[15:0];
+        if (reset || frame_write) begin
+            lost_pending <= 0;
+            lost_waiting <= 0;
+        end else if (captured_any) begin
+            lost_pending <= lost_sum[16] ? 16'hffff : lost_sum[15:0];
+            lost_waiting <= 1;
+        end
     end
 
     wire byte_space;

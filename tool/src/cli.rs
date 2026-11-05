@@ -93,6 +93,14 @@ pub(crate) enum Commands {
         /// Chip name to emulate (substring match, e.g. "W25Q128.V")
         #[arg(short, long)]
         chip: String,
+
+        /// Compatibility option: only =false is supported; protection is never enforced
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        protected: Option<bool>,
+
+        /// Eight UID bytes in SPI response order, as 16 hex digits
+        #[arg(long, value_parser = crate::profile::parse_uid)]
+        uid: Option<[u8; 8]>,
     },
 
     /// Control target flash #HOLD pin for SPI bus sharing
@@ -220,5 +228,44 @@ mod tests {
     fn address_parser_accepts_hex_and_decimal() {
         assert_eq!(parse_address("0x10"), Ok(16));
         assert_eq!(parse_address("16"), Ok(16));
+    }
+    #[test]
+    fn configure_options_parse_uid_and_legacy_protection_request() {
+        let cli = Cli::try_parse_from([
+            "tool",
+            "configure",
+            "--chip",
+            "W25Q128.V",
+            "--protected",
+            "--uid",
+            "0123456789abcdef",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Configure { protected, uid, .. } => {
+                assert_eq!(protected, Some(true));
+                assert_eq!(uid.unwrap(), [1, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+            }
+            _ => panic!("expected configure"),
+        }
+        assert!(
+            Cli::try_parse_from(["tool", "configure", "--chip", "W25Q128.V", "--uid", "1234"])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "tool",
+            "configure",
+            "--chip",
+            "AT25DF321",
+            "--protected=false",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Configure {
+                protected: Some(false),
+                ..
+            }
+        ));
     }
 }

@@ -1,0 +1,7 @@
+{
+  "chip": "AT25DF321",
+  "jedec": [31, 71, 0],
+  "capacity_bytes": 4194304,
+  "profile_hex": "at25df321.profile.hex",
+  "initial_state": "unprotected compatibility default"
+}

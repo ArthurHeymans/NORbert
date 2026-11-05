@@ -161,6 +161,14 @@ make tool
 
 This builds `spi-flash-tool` at `tool/target/release/spi-flash-tool`.
 
+Chip selection requires protocol 9 and configures controller-facing SPI-NOR
+framing, erase geometry and addressing—not just the JEDEC ID. The CLI and
+browser share a permissive builder, without a protection-policy whitelist.
+Emulation starts unprotected; BP/WP/lock writes do not block array operations.
+See [chip compatibility](docs/chip-profiles.md) for supported protocols and
+hardware limits. `--protected=true` is deliberately rejected.
+`make test-rflasher` exercises real rflasher-core operations against simulated RTL.
+
 The tool also exposes a WebAssembly library for browser frontends.
 `WebFlashDevice.requestUsb()` opens the FT2232H FT245 interface through WebUSB,
 while `WebFlashDevice.requestSerial()` opens the dock's 2 Mbaud UART through Web
@@ -270,7 +278,7 @@ spi-flash-tool dump output.bin --length 0x100000
 spi-flash-tool read 0x0 0x100
 
 # Configure chip identity (uses rflasher chip database)
-spi-flash-tool configure W25Q128JV --chips-dir ~/src/rflasher/chips/vendors
+spi-flash-tool configure --chip "W25Q128.V" --uid 0123456789abcdef
 
 # Gate SPI emulation explicitly (the dance above does this automatically)
 spi-flash-tool start
@@ -356,7 +364,7 @@ spi-flash-tool ft-list
 spi-flash-tool --ft245 version
 spi-flash-tool --ft245 load firmware.bin --verify
 spi-flash-tool --ft245 dump output.bin --length 0x100000
-spi-flash-tool --ft245 configure W25Q128JV --chips-dir ~/src/rflasher/chips/vendors
+spi-flash-tool --ft245 configure --chip "W25Q128.V"
 
 # Select a specific FT2232H by serial number (when multiple are connected)
 spi-flash-tool --ft245 --ft-serial FT6XXXXX load firmware.bin
@@ -393,9 +401,11 @@ system-clock offset into the transaction, with an SDRAM bank-protocol
 checker on the command bus). During an array read, refresh only starts
 right after a lookahead burst has been dispatched, so a refresh pair can
 no longer land in front of a burst the SPI side is about to need. 60-70 MHz operation
-also needs timing closure past the default 30 MHz `spi_clk` constraint plus
+also needs timing closure past the default 40 MHz `spi_clk` constraint plus
 signal-integrity validation on the PMOD leads -- simulated margins below do
-not replace that.
+not replace that. The matrix uses legacy/default waits; profile-configured
+latency changes the first-burst budget and needs separate per-mode validation.
+Configured framing checks are not a 40 MHz promise for every register setting.
 
 | Command | Mode | Simulated max (all offsets) | Notes |
 |---------|------|-----------------------------|-------|
@@ -463,6 +473,7 @@ src/
   host_protocol.vh   Host serial protocol opcodes and log packet types
   glue.v       Composition of independent host and SPI program clients
   host_protocol.v  UART/FT245 protocol, configuration, TOCTOU, LOGPOLL, fault latch and LEDs
+  chip_profile_store.v  Streamed profile validation and compiled erase geometry
   spi_program.v    Page-buffer BSRAM, NOR program/erase/RMW and completion
   sdram_client_mux.v  Stable client ownership and acceptance routing
   logger.v     Ordered capture-frame queue, loss accounting and 512-byte output FIFO
@@ -490,14 +501,15 @@ other port wait there until it completes. A parser left mid-command returns
 to idle after ~546 us without a byte, or ~35 ms inside a RAMWRITE payload, so
 a USB stall within a data block is not mistaken for an abandoned command.
 
-`VERSION` reports the protocol version, currently 7. The host tool talks to
-any version from 3 up to its own and enables commands by version, but it
-refuses a newer bitstream rather than guess at its protocol: a version 7
-bitstream needs a tool from the same release or later.
+`VERSION` reports protocol 9. The host tool talks to versions 3 through its
+own version and enables commands by capability, but refuses newer bitstreams
+rather than guessing their protocol. Catalog chip compatibility needs both a
+protocol 9 bitstream and a matching tool; raw legacy configuration remains
+available on older supported versions.
 
 | Opcode | Name       | Args                                                | Reply                            |
 |--------|------------|-----------------------------------------------------|----------------------------------|
-| `0x30` | VERSION    | none                                                | 1 byte (current: `0x07`)         |
+| `0x30` | VERSION    | none                                                | 1 byte (current: `0x09`)         |
 | `0x31` | RAMREAD    | 3-byte burst addr + 2-byte burst count              | `count*8` data bytes             |
 | `0x32` | RAMWRITE   | 3-byte burst addr + 2-byte burst count + data       | `0x01`                           |
 | `0x33` | CHIPCONFIG | JEDEC(3) + flags + erase_bursts(3) + sfdp_len + sfdp| `0x01`                           |
@@ -509,6 +521,7 @@ bitstream needs a tool from the same release or later.
 | `0x39` | TOCTOU     | sub-command + args (see below)                      | `0x01`                           |
 | `0x3A` | LOGPOLL    | none                                                | log bytes terminated by `0xA0`   |
 | `0x3B` | PREFETCH   | none                                                | 1 byte: `0x80` valid + `0x01` underrun + `0x02` thin |
+| `0x3C` | CHIPPROFILE | 128-byte format 2 compatibility packet, while stopped | `0x01` accepted / `0x02` invalid |
 
 A clean PREFETCH reply is `0x80` (not `0x00`, which the host discards as
 transport noise); `0x81`, `0x82` and `0x83` report faults. PREFETCH is a
@@ -526,12 +539,12 @@ TOCTOU sub-commands (all prefixed with opcode `0x39`):
 | `0x04` | RESET     | index -- clear triggered flag                        |
 | `0x05` | RESET_ALL | none -- disarm + clear all four                      |
 
-RAMREAD/RAMWRITE/CHIPCONFIG are only accepted while emulation is stopped, to
-avoid racing the SPI fast path on SDRAM, and their bytes wait (on either
-port) while the target holds CS low or an SPI program/erase owns SDRAM. All
-other commands, including HOLDCTL, LOGCTL and TOCTOU with their arguments,
-touch neither and are processed immediately, so the host can reach the tool
-even while a target is hammering the bus.
+RAMREAD/RAMWRITE/CHIPCONFIG/CHIPPROFILE require stopped emulation. STOP is a
+drain barrier: it cancels uncommitted mutations and ACKs only after accepted
+array work drains and page flags are scrubbed. START returns `0x02` for an
+incomplete/invalid configuration. SDRAM-owning command bytes wait on either
+port while SPI or accepted program work owns RAM. Always-safe commands,
+including HOLDCTL, LOGCTL and TOCTOU arguments, bypass that gate.
 
 ## Acknowledgments
 

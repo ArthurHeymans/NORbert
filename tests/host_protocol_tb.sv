@@ -40,6 +40,7 @@ module host_protocol_tb;
         .sdram_read_buffer(read_buffer), .sdram_write_buffer(write_buffer),
         .spi_reset(!running), .spi_csel(cs), .spi_cmd_write(program_command),
         .spi_write_type(2'd1), .spi_write_addr(23'h4000), .spi_write_len(23'd400),
+        .spi_write_partial(1'b0),
         .spi_write_done(write_done), .spi_write_buf_strobe(1'b0),
         .spi_write_buf_offset(8'b0), .spi_write_buf_val(8'b0), .spi_clk(clk),
         .sfdp_raddr(7'b0), .spi_running(running), .hold_out(hold), .log_active(log_active),
@@ -151,7 +152,7 @@ module host_protocol_tb;
         expect_reply(ft_replies, 8'h01, "FT245 TOCTOU SET across a UART byte");
         if (dut.host_i.trap_replace[1] !== 24'h005600)
             $fatal(1, "UART byte leaked into the FT245 command");
-        expect_reply(uart_replies, 8'h07, "queued UART VERSION");
+        expect_reply(uart_replies, 8'h09, "queued UART VERSION");
 
         // Wait for the program, then stop emulation for SDRAM commands.
         while (dut.spi_writing) tick(1);
@@ -176,15 +177,23 @@ module host_protocol_tb;
                 $fatal(1, "stalled RAMWRITE stored %h %h", memory[5], memory[6]);
         end
 
-        // 6. A gated command waits behind a program without losing bytes:
-        //    queue RAMREAD over UART while the engine owns SDRAM.
+        // 6. STOP drains accepted work before ACK; an SDRAM command on
+        //    the other port waits behind it without losing any bytes.
+        uart_byte(8'h34); expect_reply(uart_replies, 8'h01, "restart for program");
         program_command = 1;
         while (!dut.spi_writing) tick(1);
-        uart_byte(8'h31); uart_byte(0); uart_byte(0); uart_byte(8'h05);
-        uart_byte(0); uart_byte(1);
+        uart_byte(8'h35);
         if (!dut.spi_writing) $fatal(1, "program finished too early for coverage");
+        expect_quiet(uart_replies, "STOP before program drain");
+        ft_byte(8'h31); ft_byte(0); ft_byte(0); ft_byte(8'h05);
+        ft_byte(0); ft_byte(1);
+        tick(20);
+        expect_quiet(ft_replies, "RAMREAD before STOP drain");
+        expect_reply(uart_replies, 8'h01, "STOP after program drain");
+        program_command = 0;
+        if (dut.spi_writing) $fatal(1, "STOP ACK preceded program drain");
         for (integer i = 0; i < 8; i++)
-            expect_reply(uart_replies, 8'(8'h80 + i), "RAMREAD queued behind a program");
+            expect_reply(ft_replies, 8'(8'h80 + i), "RAMREAD queued behind STOP/program");
 
         $display("PASS HOST_PROTOCOL: ungated commands with CS low/program, no dropped UART bytes, port isolation, payload stall");
         $finish;
