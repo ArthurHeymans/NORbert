@@ -12,8 +12,16 @@ have divider 10 and zero fine phase:
 | Clock | Frequency | Coarse steps | Rising-edge offset from main |
 |---|---:|---:|---:|
 | Main/system (`CLKOUT0`) | 120 MHz | 0 | 0 ns |
-| SDRAM pin (`CLKOUT1`) | 120 MHz | 9 | +3.750 ns / 162 degrees |
-| DQ capture (`CLKOUT2`) | 120 MHz | 5 | +2.083333 ns / 90 degrees |
+| SDRAM pin (`CLKOUT1`) | 120 MHz | 9 | +7.500 ns / 324 degrees |
+| DQ capture (`CLKOUT2`) | 120 MHz | 5 | +4.166667 ns / 180 degrees |
+
+Gowin UG306-1.0.4E section 5.1 (page 46) specifies
+`phase = (COARSE + FINE/8) / ODIV * 360`: a coarse step is a **full**
+VCO period, not half a period. These are ideal PLL offsets, not measured
+board/pin arrival times. The former 162/90-degree declarations were wrong;
+correcting the constraints does not change the RTL PLL settings or calibrate
+a new placement. `make test-clocks` guards the formula against the live
+PLL parameters.
 
 `tangprimer25k.sdc` declares these as related generated clocks. In particular,
 aux-to-main transfers are **not asynchronous exceptions**. The SDRAM pin
@@ -38,6 +46,11 @@ That guard is not permission to START in the middle of an active master frame.
 The nextpnr file is only a frequency-based placement target. That flow does
 not model these PLL phase relationships or board I/O timing. Its independent
 clock declarations must not be used as a phase-aware sign-off model.
+The pinned nextpnr preserves the external SPI input-port constraint through
+packing; constrain `spi_clk_pin`, not its optimized-away internal alias.
+Every OSS build checks the routed report's required system and SPI targets
+and rejects unmatched selectors. This coverage check deliberately permits
+reported experimental Fmax failures; it does not establish timing closure.
 
 ## Crossings and ownership
 
@@ -131,6 +144,13 @@ set_input_delay -clock sdram_clk -min SDRAM_TCO_MIN_PLUS_FLIGHT [get_ports {IO_s
 ```
 
 ## Validation and remaining sign-off
+
+**Historical phase caveat:** the reports below used the former half-VCO
+phase declarations (3.750/2.083333 ns). Those numbers describe the old SDC,
+not the actual PLL offsets. Retain the measurements as historical evidence,
+but do not use their clean path counts or Fmax as related-clock closure
+under the corrected 324/180-degree model. Re-run STA and board validation
+for each newly placed image; the external I/O profiles remain required.
 
 ### Rebased protocol9 controller compatibility
 
@@ -233,7 +253,7 @@ All RTL/constraint hashes matched the tested snapshot afterward.
 SPI same-domain timing now passes the declared requirement, but **system
 same-domain timing still fails**. Overall STA reports 351 setup-violated and
 124 hold-violated endpoints across 19,458 paths, including constrained
-crossings. PLL offsets remain 0, 3.750 and 2.083 ns. Resource fit/bitstream
+crossings. The then-declared PLL offsets were 0, 3.750 and 2.083 ns. Resource fit/bitstream
 creation is not timing sign-off; the design is not a timing-closed release.
 
 The three-stage stopped-state geometry compiler and serial descriptor
@@ -259,8 +279,8 @@ Gowin Education 1.9.11.03 successfully synthesized and placed/routed revision
 | SPI | 40 MHz | 35.377 MHz | 7 |
 | System | 120 MHz | 77.453 MHz | 186 |
 
-The report confirms the intended 120 MHz PLL clocks and offsets of 0, 3.750
-and 2.083 ns. Across all analyzed paths it reports 831 setup-violated and
+The report records 120 MHz PLL clocks and the now-superseded declared
+offsets of 0, 3.750 and 2.083 ns. Across all analyzed paths it reports 831 setup-violated and
 131 hold-violated endpoints, including the explicitly constrained crossings.
 The worst reported setup path is from
 `glue_i/host_i/cfg_chip_erase_bursts_9_s0/Q` to

@@ -65,6 +65,9 @@ jobs:
       # forks in flake.lock, not the stock OSS CAD Suite.
       - uses: cachix/install-nix-action@v31
 
+      - name: Check PLL phases and clock-coverage regressions
+        run: nix develop .#oss --command make test-clocks
+
       - name: Run Yosys and Verilator checks
         run: nix develop .#oss --command make lint
 

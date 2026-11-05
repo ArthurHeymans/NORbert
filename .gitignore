@@ -5,6 +5,7 @@ tool/target/
 
 # Tool caches
 .direnv/
+__pycache__/
 
 # Scratch space for local notes and one-off scripts
 .local/

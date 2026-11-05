@@ -1,14 +1,14 @@
 // PLL Configuration for Tang Primer 25K (GW5A-LV25MG121NC1/I0)
 // Input: 50MHz crystal oscillator
 // Output: clkout      = 120MHz for SDRAM operation (main clock, no phase shift)
-//         clkout_sdram = 120MHz dedicated SDRAM clock output (+3.75ns)
+//         clkout_sdram = 120MHz dedicated SDRAM clock output (+7.5ns)
 //         clkoutp     = 120MHz phase-shifted for SDRAM DQ read capture (aux clock)
 //
 // IMPORTANT: The SDRAM clock MUST use a separate PLL output from the main
 // logic clock. This design uses PLL phase steps, not an IODELAY:
 //   clkout0 = main logic clock, 0ns
-//   clkout1 = SDRAM pin clock, +3.75ns
-//   clkout2 = read capture clock, +2.083333ns
+//   clkout1 = SDRAM pin clock, +7.5ns
+//   clkout2 = read capture clock, +4.166667ns
 // tangprimer25k.sdc must track these relationships; see docs/rtl-timing.md.
 //
 // GW5A uses PLLA primitive (not rPLL - that's for GW1N/GW2A series)
@@ -29,12 +29,14 @@
 //   CRITICAL: DIVISOR must be divisible by 4 (uart_rx uses DIVISOR/4)
 //
 // SDRAM read capture timing:
-//   PE_COARSE step = T_VCO/2 = 0.833ns/2 = 0.417ns (for VCO=1200MHz)
-//   PE_COARSE=5 -> 5 * 0.417ns = 2.08ns phase shift (90 degrees)
-//   This centers the DQ sampling point within the SDRAM data valid window.
+//   UG306 section 5.1: phase = (COARSE + FINE/8) / ODIV * 360 degrees.
+//   PE_COARSE step = T_VCO = 0.833333ns (for VCO=1200MHz).
+//   PE_COARSE=5 -> 4.166667ns phase shift (180 degrees).
+//   These are ideal PLL offsets, not measured DQ/pin arrival times.
 //   Measured on hardware with the Gowin IDE build: reads are clean from
 //   PE_COARSE=3 to 7 plus 4 PE_FINE steps and fail at 2 plus 4 PE_FINE
-//   steps and at 8, leaving about 1ns of margin on each side at 5. The
+//   steps and at 8. Those settings are historical functional observations,
+//   not measured nanosecond or PVT margins for this placement. The
 //   window includes the routing delay from the DQ pins to the dq_captured
 //   registers, so it moves when the placer moves those registers; measure
 //   again after changes that affect their placement.
@@ -48,7 +50,7 @@
 module pll(
     input wire clkin,        // 50MHz input
     output wire clkout,      // 120MHz output (main logic clock, no phase shift)
-    output wire clkout_sdram,// 120MHz output (dedicated SDRAM clock, +3.75ns)
+    output wire clkout_sdram,// 120MHz output (dedicated SDRAM clock, +7.5ns)
     output wire clkoutp,     // 120MHz phase-shifted output (aux/read capture clock)
     output wire locked       // PLL lock indicator
 );
@@ -134,9 +136,9 @@ module pll(
     defparam pll_inst.CLK6_OUT_SEL = 1'b0;
     defparam pll_inst.CLKOUT0_PE_COARSE = 0;      // Main clock: no phase shift
     defparam pll_inst.CLKOUT0_PE_FINE = 0;
-    defparam pll_inst.CLKOUT1_PE_COARSE = 9;     // SDRAM clock: ~3.75ns delay (max for ODIV=10)
+    defparam pll_inst.CLKOUT1_PE_COARSE = 9;     // SDRAM clock: ideal +7.5ns (324 degrees)
     defparam pll_inst.CLKOUT1_PE_FINE = 0;
-    defparam pll_inst.CLKOUT2_PE_COARSE = 5;     // Aux clock: ~2.08ns phase shift for DQ read capture
+    defparam pll_inst.CLKOUT2_PE_COARSE = 5;     // Aux clock: ideal +4.166667ns (180 degrees)
     defparam pll_inst.CLKOUT2_PE_FINE = 0;
     defparam pll_inst.CLKOUT3_PE_COARSE = 0;
     defparam pll_inst.CLKOUT3_PE_FINE = 0;

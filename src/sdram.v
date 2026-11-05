@@ -20,13 +20,13 @@
 //
 // Clock and timing architecture:
 //   - SDRAM clock is a separate PLL output (CLKOUT1) with PE_COARSE=9
-//     phase shift (~3.75ns delay from logic clock). This provides setup
-//     time for commands and write data at the SDRAM pins.
+//     phase shift (ideal +7.5ns / 324 degrees from the logic clock).
+//     Board/pin setup and hold require separate I/O timing analysis.
 //   - IODELAY does NOT work for clock outputs on this device; PLL phase
 //     shift is used instead.
-//   - Read data is captured using aux_clk (CLKOUT2 with PE_COARSE=6,
-//     ~2.5ns phase shift) to sample DQ in the middle of the valid window.
-//   - With the ~3.75ns SDRAM clock delay and CAS=2, read data arrives
+//   - Read data is captured using aux_clk (CLKOUT2 with PE_COARSE=5,
+//     ideal +4.166667ns / 180 degrees; see src/pll.v and the vendor SDC).
+//   - With the separate forwarded clock and CAS=2, read data arrives
 //     ~3 logic clock cycles after the READ command. RD_PIPELINE_DELAY=0
 //     with the `readcount > tCAS` capture condition matches this timing.
 //

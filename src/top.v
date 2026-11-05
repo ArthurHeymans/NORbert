@@ -90,7 +90,7 @@ module top(
     wire clk = clk_133;
     
     // SDRAM clock output: use PE_COARSE=9 on dedicated PLL output (no inversion)
-    // This gives ~3.75ns delay which provides SDRAM write setup time.
+    // Ideal offset: +7.5ns (324 degrees), not a board-level setup guarantee.
     assign O_sdram_clk = clk_133_sdram;
     
     // -----------------------------------------------------------
