@@ -7,8 +7,9 @@
 //   - ACTIVATE to a bank that already has an open row
 //   - READ/WRITE to a bank without an open row
 //   - AUTO REFRESH or MODE REGISTER SET with any bank open on that chip
-// READ/WRITE always carry auto-precharge in this design, so they close
-// the bank. PRECHARGE closes one bank, or all with A10.
+// SPI READs leave their row open; other accesses may carry
+// auto-precharge (A10), which closes the bank. PRECHARGE closes one
+// bank, or all with A10.
 module sdram_bank_checker(
     input wire clk,
     input wire enable,
@@ -39,9 +40,8 @@ module sdram_bank_checker(
                 if (!row_open[cs][ba])
                     $fatal(1, "SDRAM: %s without ACTIVATE (chip %0d bank %0d) at %0t",
                            we ? "READ" : "WRITE", cs, ba, $time);
-                if (!a[10])
-                    $fatal(1, "SDRAM: access without auto-precharge at %0t", $time);
-                row_open[cs][ba] = 0;
+                if (a[10])
+                    row_open[cs][ba] = 0;
                 accesses++;
             end
             3'b010: begin

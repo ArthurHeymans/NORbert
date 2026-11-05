@@ -433,9 +433,11 @@ Known corners detected by the simulated prefetch fault checks:
   lower clock limit on 0x03 than on dummy-assisted reads.
 - **70 MHz dual-I/O reads** can underrun; 60 MHz is the all-offset limit.
 
-If you need more: the levers are open-row (skip re-ACTIVATE on same-row
-bursts, saves ~2 sysclks per burst) and master-configured extra dummy clocks
-for 0xEB/0xBB, not a faster SDRAM clock.
+Sequential bursts keep their SDRAM row open (per bank), so same-row
+bursts skip ACTIVATE and tRCD entirely; a sequential stream pays them once
+per 1KB, when it moves on to the next bank.
+If you need more: the remaining lever is master-configured extra dummy
+clocks for 0xEB/0xBB, not a faster SDRAM clock.
 
 ### Checking the prefetch path
 
