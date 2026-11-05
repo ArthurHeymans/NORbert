@@ -399,8 +399,10 @@ Validated by simulation (`make test`, `tests/quad_fast_tb.sv`: all start
 offsets 0-7, row/bank crossings, and a refresh that becomes due at every
 system-clock offset into the transaction, with an SDRAM bank-protocol
 checker on the command bus). During an array read, refresh only starts
-right after a lookahead burst has been dispatched, so a refresh pair can
-no longer land in front of a burst the SPI side is about to need. 60-70 MHz operation
+right after a lookahead burst has been dispatched, so a refresh can
+no longer land in front of a burst the SPI side is about to need. Refresh
+events alternate between the two SDRAM chips, so one event stalls dispatch
+for a single tRC instead of a back-to-back pair. 60-70 MHz operation
 also needs timing closure past the default 40 MHz `spi_clk` constraint plus
 signal-integrity validation on the PMOD leads -- simulated margins below do
 not replace that. The matrix uses legacy/default waits; profile-configured
