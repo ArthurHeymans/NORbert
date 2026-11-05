@@ -165,6 +165,37 @@ set_input_delay -clock sdram_clk -min SDRAM_TCO_MIN_PLUS_FLIGHT [get_ports {IO_s
 
 ## Validation and remaining sign-off
 
+### Corrected-clock stack validation
+
+The controller-compatibility base and full performance stack were rebased
+onto the toolchain pins merged in #62. PLL parameter values, functional RTL
+and operating frequencies are unchanged; the vendor constraints now use
+324/180 degrees, and the OSS input-port constraint survives packing.
+`tests/check_clocks.py` verifies both the source contract and nextpnr's actual
+system/SPI target frequencies before packing a bitstream. Missing clocks,
+unmatched selectors and the former 12 MHz fallback are fatal; modeled
+experimental Fmax failures are still permitted and remain visible.
+
+With these corrections, all 17 clock regressions, strict lint, 16 behavioral
+benches, 13 mapped benches, 15 real-rflasher tests, 64 native Rust tests and
+the Wasm library/browser build checks pass. Every intermediate PR's source
+clock contract was checked too. Fresh Gowin 1.9.11.03 builds use the corrected
+phase edges: the base retains its 210 setup/79 hold violated endpoints, while
+the complete stack reports zero under its stated coverage and exceptions.
+This does not supply the missing board I/O constraints or establish margin
+across placements/PVT; the OSS model still fails the system-frequency target.
+
+The new full-stack OSS image passed five distinct 64 KiB UART/SDRAM writes
+across the lower 32 MiB, followed by two complete read rounds: zero mismatches
+in 655,360 byte comparisons. Its SHA-256 is
+`0a16d834bef65fd9c5cc84984e2be4de4e4c49ba6ca32a9feec25d426a62b5d6`.
+The base OSS and both vendor configuration payloads are identical to their
+previously hardware-tested payloads (vendor file-header timestamps differ).
+No SPI master or separate FT245 transport was attached: this is bounded
+host/SDRAM functional evidence, not external SPI or 64 MiB qualification.
+Commands, frozen base sources, reports and payload comparisons are under
+`/tmp/norbert-stack-fixes-gtdY3l/` on the test host.
+
 **Historical phase caveat:** the reports below used the former half-VCO
 phase declarations (3.750/2.083333 ns). Those numbers describe the old SDC,
 not the actual PLL offsets. Retain the measurements as historical evidence,
