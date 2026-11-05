@@ -54,6 +54,9 @@ module spi_prefetch(
     input wire [15:0] first_row,     // Burst address bits [22:7]
     input wire first_read,           // Column known
     input wire [6:0] first_col,      // Burst address bits [6:0]
+    // Start word of the first burst, from the byte-address bits known
+    // together with the column (all of [2:1] for quad, [2] for dual).
+    input wire [1:0] first_word,
     input wire first_done,           // Single-lane address phase ended
     input wire addr_end,             // Array-read address phase ended
 
@@ -71,6 +74,9 @@ module spi_prefetch(
     // the controller accounts for it when a transaction starts.
     output reg ram_post_toggle = 0,
     output reg [22:0] ram_addr,
+    // SDRAM word the READ starts at; the burst wraps (critical word
+    // first). Bundled with the column bits of ram_addr.
+    output reg [1:0] ram_word = 0,
     // Second burst, fetched by the controller once ram_pair is seen.
     // ram_addr2 is set with the first burst's column and held until the
     // next transaction's; ram_pair is one level per transaction. It drops
@@ -176,6 +182,7 @@ module spi_prefetch(
                     ram_activate <= 1;
                     ram_read <= 1;
                     ram_addr <= next_burst;
+                    ram_word <= 0;
                     pair_skip <= 0;
                     posted_this_burst <= 1;
                     ram_post_toggle <= ~ram_post_toggle;
@@ -193,6 +200,7 @@ module spi_prefetch(
                 if (first_read) begin
                     ram_read <= 1;
                     ram_addr[6:0] <= first_col & addr_mask[6:0];
+                    ram_word <= first_word;
                     ram_addr2 <= ({ram_addr[22:7], first_col & addr_mask[6:0]} + 1'b1) &
                                  addr_mask;
                 end
