@@ -108,16 +108,31 @@ module sdram(
     // they size the counters; sized copies drive refresh arithmetic.
     localparam integer tINIT        = 100 * CLK_FREQ_MHZ;   // 100us init
     localparam integer tREFRESH     = (CLK_FREQ_MHZ * 32000) / 8192;  // ~468 cycles
+    // Refresh events alternate between the two chips, one chip per event,
+    // so an event is due every tREFRESH/2 cycles and each chip is still
+    // refreshed every tREFRESH. A single event stalls dispatch for one
+    // tRC instead of a back-to-back pair. If tREFRESH is odd the truncated
+    // event period refreshes slightly early, never late.
+    localparam integer tREFRESH_EVENT = tREFRESH / 2;
     // Inhibit is a latency hint, not permission to lose memory retention.
-    // Allow one interval of deferral, then service refresh at a safe boundary.
+    // Allow one per-chip interval of deferral past an event's due point,
+    // then service refresh at a safe boundary.
     localparam integer tREFRESH_MAX = 2 * tREFRESH;
     // Keep service-latency headroom above the hard deadline so elapsed
     // time is not lost while a row is closing or a burst is completing.
     localparam integer REFRESH_BITS = $clog2(tREFRESH_MAX + 64);
     localparam [REFRESH_BITS-1:0] REFRESH_PERIOD = tREFRESH[REFRESH_BITS-1:0];
-    localparam [REFRESH_BITS-1:0] REFRESH_SOFT_PRE = REFRESH_PERIOD - 1'b1;
-    localparam [REFRESH_BITS-1:0] REFRESH_HARD_PRE = (REFRESH_PERIOD << 1) - 1'b1;
-    localparam [REFRESH_BITS:0] REFRESH_BACKLOG_PRE = {1'b0, REFRESH_PERIOD} * 2'd3 - 1'b1;
+    localparam [REFRESH_BITS-1:0] REFRESH_EVENT = tREFRESH_EVENT[REFRESH_BITS-1:0];
+    // Increment-predicted thresholds: refresh_due rises on the edge where
+    // refreshcount reaches one event period, hard_refresh_due where it
+    // reaches an event period plus a full per-chip deferral interval.
+    localparam [REFRESH_BITS-1:0] REFRESH_SOFT_PRE = REFRESH_EVENT - 1'b1;
+    localparam [REFRESH_BITS-1:0] REFRESH_HARD_PRE = REFRESH_EVENT + REFRESH_PERIOD - 1'b1;
+    // Post-payment predicts, compared against the pre-dispatch count: after
+    // paying one event period the next event is already due / hard-due.
+    localparam [REFRESH_BITS-1:0] REFRESH_AGAIN_PRE = (REFRESH_EVENT << 1) - 1'b1;
+    localparam [REFRESH_BITS:0] REFRESH_BACKLOG_PRE =
+        {1'b0, REFRESH_EVENT} * 2'd2 + {1'b0, REFRESH_PERIOD} - 1'b1;
     localparam [4:0] tRP            = 5'd2;   // 16.7ns precharge (min 15ns for -6)
     localparam [4:0] tRC            = 5'd8;   // 66.7ns row cycle (min 60ns for -6)
     localparam [4:0] tMRD           = 5'd2;   // 2 cycles mode register set
@@ -154,7 +169,6 @@ module sdram(
         STA_INIT_PRECHARGE2 = 10,
         STA_INIT_REFRESH2      = 11,
         STA_SETMODE2           = 12,
-        STA_REFRESH2           = 13,  // Refresh second chip
         STA_SPI_ABORT_WAIT     = 14,  // Wait tRAS before closing an abandoned row
         STA_SPI_ABORT_PRECHARGE = 15; // Precharge row opened by an aborted SPI read
 
@@ -176,7 +190,8 @@ module sdram(
     reg cmd_wait;
     reg [REFRESH_BITS-1:0] refreshcount;
     
-    // Track which chip we're refreshing (alternate between chips)
+    // Chip refreshed by the next event; toggles at every refresh dispatch
+    // so events alternate strictly between the chips.
     reg refresh_chip;
     
     // Buffer control signals from SPI domain
@@ -231,7 +246,7 @@ module sdram(
     // SPI refresh window: while an array read inhibits refresh, a refresh
     // may still start after a lookahead READ was dispatched and until the
     // SPI side re-arms that post (see spi_prefetch). The next request is
-    // then at least the post's remaining burst away, so the refresh pair
+    // then at least the post's remaining burst away, so the refresh
     // cannot delay it by more than the clocks between re-arm and post.
     reg spi_read_continuation;
     wire spi_refresh_window = spi_cmd_read_ack && spi_cmd_read_buf[1] && spi_read_continuation;
@@ -612,35 +627,20 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
-                // Refresh sequence transitions.  Handled inside the main
-                // dispatcher (rather than a separate always-block hunk
-                // after it) so they take priority over any SPI fast-path
-                // or serial command dispatch that might otherwise fire in
-                // the same cycle.  If a post-dispatch hunk overrode the
-                // state back to REFRESH2, the command-side flags
-                // (spi_cmd_activate_ack / spi_activate_done) set by the
-                // overridden dispatch would persist, and the next
-                // cycle's READ would fire without a matching ACTIVATE --
-                // reading from a bank with no open row and returning all
-                // 0xff from the floating DQ bus for the rest of the SPI
-                // burst.
+                // Refresh completion.  Handled inside the main dispatcher
+                // (rather than a separate always-block hunk after it) so it
+                // takes priority over any SPI fast-path or serial command
+                // dispatch that might otherwise fire in the same cycle.  If
+                // a post-dispatch hunk overrode the state back to a refresh
+                // state, the command-side flags (spi_cmd_activate_ack /
+                // spi_activate_done) set by the overridden dispatch would
+                // persist, and the next cycle's READ would fire without a
+                // matching ACTIVATE -- reading from a bank with no open row
+                // and returning all 0xff from the floating DQ bus for the
+                // rest of the SPI burst.
                 else if (state == STA_REFRESH) begin
-                    // Chip 0 refreshed, now refresh chip 1.
-                    state <= STA_REFRESH2;
-                    cmdtarget <= tRC;
-                    cmd_wait <= tRC > 1;
-
-                    cs_o <= 1;       // Chip 1
-                    ras_o <= 0;
-                    cas_o <= 0;
-                    we_o <= 1;
-                    dqm_o <= 2'b11;
-
-                    refresh_chip <= 1;
-                end
-                else if (state == STA_REFRESH2) begin
-                    // Chip 1 refreshed, back to idle.
-                    refresh_chip <= 0;
+                    // One chip refreshed, back to idle. The other chip's
+                    // event is due one event period later.
                     state <= STA_IDLE;
                     cmdtarget <= 1;
                     cmd_wait <= 0;
@@ -706,10 +706,11 @@ module sdram(
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;
                     cmd_wait <= tRC > 1;
-                    refreshcount <= refreshcount - REFRESH_PERIOD + 1'b1;
-                    refresh_due <= refreshcount >= REFRESH_HARD_PRE;
+                    refreshcount <= refreshcount - REFRESH_EVENT + 1'b1;
+                    refresh_due <= refreshcount >= REFRESH_AGAIN_PRE;
                     hard_refresh_due <= {1'b0, refreshcount} >= REFRESH_BACKLOG_PRE;
-                    cs_o <= 0;
+                    cs_o <= refresh_chip;
+                    refresh_chip <= ~refresh_chip;
                     ras_o <= 0;
                     cas_o <= 0;
                     we_o <= 1;
@@ -842,14 +843,16 @@ module sdram(
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;
                     cmd_wait <= tRC > 1;
-                    // Pay one period, retaining overdue time. Resetting
-                    // here halves the nominal rate under sustained inhibit.
-                    refreshcount <= refreshcount - REFRESH_PERIOD + 1'b1;
-                    refresh_due <= refreshcount >= REFRESH_HARD_PRE;
+                    // Pay one event period, retaining overdue time.
+                    // Resetting here halves the nominal rate under
+                    // sustained inhibit.
+                    refreshcount <= refreshcount - REFRESH_EVENT + 1'b1;
+                    refresh_due <= refreshcount >= REFRESH_AGAIN_PRE;
                     hard_refresh_due <= {1'b0, refreshcount} >= REFRESH_BACKLOG_PRE;
 
                     // REFRESH command for current chip
                     cs_o <= refresh_chip;
+                    refresh_chip <= ~refresh_chip;
                     ras_o <= 0;
                     cas_o <= 0;
                     we_o <= 1;
@@ -866,10 +869,9 @@ module sdram(
                 end
             end
 
-            // REFRESH -> REFRESH2 -> IDLE transitions are now handled
-            // inside the main dispatcher (as STA_REFRESH / STA_REFRESH2
-            // cases) so they take priority over SPI and serial command
-            // dispatches in the same cycle.
+            // The REFRESH -> IDLE transition is handled inside the main
+            // dispatcher (as the STA_REFRESH case) so it takes priority
+            // over SPI and serial command dispatches in the same cycle.
             
             // Read data capture: each beat's bytes publish straight into
             // the target buffer (progressive publish, see layout note at the

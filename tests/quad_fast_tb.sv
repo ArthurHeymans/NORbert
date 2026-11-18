@@ -12,7 +12,7 @@
 //
 // Every documented limit is also swept against the refresh scheduler: the
 // refresh becomes due at each system-clock offset into the transaction,
-// so a refresh pair landing in front of a critical burst is exercised
+// so a refresh landing in front of a critical burst is exercised
 // rather than left to the phase a fixed sequence happens to hit. A bank
 // checker on the command bus fails any SDRAM protocol violation, including
 // in the exploratory (beyond-limit) cells, where underruns are allowed but
@@ -494,11 +494,12 @@ module quad_fast_tb;
     endtask
 
     // Make the next refresh due k system clocks after CS falls, for every k
-    // in one refresh period, with a sub-cycle SPI/system phase that also
+    // in one refresh event period (events alternate between chips at half
+    // the per-chip period), with a sub-cycle SPI/system phase that also
     // walks. Each transaction starts at a different offset in the burst.
-    localparam integer REFRESH_PERIOD = (120 * 32000) / 8192;
+    localparam integer REFRESH_PERIOD = ((120 * 32000) / 8192) / 2;
     reg refresh_seen = 0;
-    always @(negedge clk) if (!reset && {ras, cas, we} == 3'b001 && !cs_n) refresh_seen = 1;
+    always @(negedge clk) if (!reset && {ras, cas, we} == 3'b001) refresh_seen = 1;
     task refresh_sweep(input [8:0] opcode, input real half, input [31:0] base,
                        input bit must_pass = 1);
         integer fails_before, thin_before;
@@ -506,8 +507,8 @@ module quad_fast_tb;
         explore_mode = !must_pass;
         fails_before = explore_fails; thin_before = thin_hits;
         for (integer k = 0; k < REFRESH_PERIOD; k += 1) begin
-            // Start k clocks short of the next refresh: wait for a chip-0
-            // REFRESH (idle, so no debt is pending), then one period less k.
+            // Start k clocks short of the next refresh: wait for a REFRESH
+            // (idle, so no debt is pending), then one event period less k.
             refresh_seen = 0;
             while (!refresh_seen) @(negedge clk);
             repeat (REFRESH_PERIOD - 1 - k) @(negedge clk);
