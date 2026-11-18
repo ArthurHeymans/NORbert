@@ -5,7 +5,7 @@ module spi_flash_tb;
     reg clk = 0;
     always #4.167 clk = ~clk; // 120 MHz
     reg reset = 1, sck = 0, cs = 1, mosi = 0;
-    reg rx_strobe = 0;
+    reg rx_strobe = 0, tx_ready = 1;
     reg [7:0] rx_data = 0;
     wire running, miso, miso_oe, tx_strobe;
     wire [7:0] tx_data;
@@ -68,7 +68,7 @@ module spi_flash_tb;
     );
     glue dut (
         .clk(clk), .reset(reset), .rxd_strobe(rx_strobe), .rxd_data(rx_data),
-        .txd_ready(1'b1), .txd_strobe(tx_strobe), .txd_data(tx_data),
+        .txd_ready(tx_ready), .txd_strobe(tx_strobe), .txd_data(tx_data),
         .ft_rx_data_available(ft_rx_available), .ft_rx_data(ft_rx_byte),
         .ft_rx_pop(ft_rx_pop), .ft_txd_ready(1'b1),
         .ft_txd_strobe(ft_tx_strobe), .ft_txd_data(ft_tx_data),
@@ -562,6 +562,51 @@ module spi_flash_tb;
         deselect_spi;
     endtask
 
+    // Four real erase descriptors covering the configured 512 KiB, with
+    // an optional opcode collision in the final descriptor only. Keep
+    // its geometry valid so the opcode validator must catch the error.
+    task automatic check_profile_reply(input bit bad_fourth, input bit stall_tx);
+        integer waited;
+        host_byte(8'h3c);
+        for (integer i = 0; i < 127; i++) begin
+            case (i)
+                0: host_byte(2);    // Format 2
+                28: host_byte(8);   // Page shift
+                32: host_byte(8'h20);
+                56: host_byte(8'h52);
+                80: host_byte(8'hd8);
+                104: host_byte(8'h81);
+                105: host_byte(bad_fourth ? 8'h20 : 8'h00);
+                34, 37, 58, 61, 82, 85, 106, 109: host_byte(1);
+                36, 60, 84, 108: host_byte(19); // 1 x 512 KiB per descriptor
+                default: host_byte(0);
+            endcase
+        end
+        @(negedge clk);
+        last_reply = 0;
+        tx_ready = !stall_tx;
+        rx_data = 0;
+        rx_strobe = 1;
+        @(negedge clk); rx_strobe = 0;
+        if (stall_tx) begin
+            repeat (32) @(negedge clk);
+            if (last_reply) $fatal(1, "CHIPPROFILE ACK ignored TX backpressure");
+            tx_ready = 1;
+        end
+        waited = 0;
+        while (!last_reply && waited < 32) begin @(negedge clk); waited++; end
+        if (!last_reply || last_reply_byte !== (bad_fourth ? 8'h02 : 8'h01))
+            $fatal(1, "wrong CHIPPROFILE reply: invalid=%b stalled=%b byte=%h", bad_fourth, stall_tx, last_reply_byte);
+        // Match the original reply latency both from the final RX byte
+        // and from TX-ready after a stall (including the UART router).
+        if (waited != (stall_tx ? 3 : 16))
+            $fatal(1, "CHIPPROFILE ACK latency changed: stalled=%b cycles=%0d", stall_tx, waited);
+        host_byte(8'h34);
+        if (running == bad_fourth || last_reply_byte !== (bad_fourth ? 8'h02 : 8'h01))
+            $fatal(1, "START did not reflect profile validation: invalid=%b stalled=%b", bad_fourth, stall_tx);
+        if (!bad_fourth) host_byte(8'h35);
+    endtask
+
     initial begin
         for (integer i = 0; i < 1024; i++) memory[i] = '1;
         for (integer i = 0; i < 8192; i++) expected[i] = '1;
@@ -597,12 +642,11 @@ module spi_flash_tb;
         repeat (70000) @(negedge clk);
         host_byte(8'h34);
         if (running || last_reply_byte !== 8'h02) $fatal(1, "START accepted partial CHIPPROFILE");
-        host_byte(8'h3c); host_byte(2);
-        for (integer i = 1; i < 128; i++) host_byte(i == 28 ? 8 : 0);
-        repeat (40) @(negedge clk); // Wait for validated profile ACK.
-        host_byte(8'h34);
-        if (!running) $fatal(1, "START refused complete CHIPPROFILE");
-        host_byte(8'h35); configure_sfdp(2, 8'h84); host_byte(8'h34);
+        check_profile_reply(1'b1, 1'b0);
+        check_profile_reply(1'b0, 1'b0);
+        check_profile_reply(1'b1, 1'b1);
+        check_profile_reply(1'b0, 1'b1);
+        configure_sfdp(2, 8'h84); host_byte(8'h34);
 
         page_program('h1ff, 2, 8'ha5);  // Partial page wrapping at byte 255
         page_program('h106, 1, 8'h55);  // Preserve untouched bytes; NOR AND

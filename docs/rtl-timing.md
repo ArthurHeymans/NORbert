@@ -184,7 +184,20 @@ set_input_delay -clock sdram_clk -min SDRAM_TCO_MIN_PLUS_FLIGHT [get_ports {IO_s
   work together. Keep the previous CLI and bitstream available as a pair
   for rollback.
 
-### Burst-pair fix validation
+### Timing recovery after the burst-pair fix
+
+The host now fetches each erase descriptor one cycle ahead of its opcode
+check, beginning during the header check. Publication and ACK are unchanged:
+the same four descriptors are checked before the reply, at the same cycle
+with or without TX backpressure. The SDRAM command dispatcher factors its
+pair row-hit decision without changing command or data cycles; Yosys proved
+all 610 matched equivalence points at 120 MHz / BL4.
+
+Gowin 1.9.11.03 reports zero setup and hold violations on placement
+options 0, 1 and 2 with the existing constraints. This is internal STA,
+not board/master I/O sign-off.
+
+### Burst-pair fix validation (before timing recovery)
 
 With the burst-pair fix, Gowin 1.9.11.03 reports 18 setup-violated
 endpoints (worst slack −0.199 ns) at placement option 1 and 87 (worst

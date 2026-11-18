@@ -887,47 +887,43 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
-                else if (auto_go && auto_hit && !auto_bus_ready) begin
-                    // A cross-chip READ waits for the shared DQ bus; its
-                    // row may already be open or have been opened while the
-                    // first READ drained. Do not precharge that row or let
-                    // another client pass the pair.
-                    state <= STA_IDLE;
-                    cmdtarget <= 1;
-                    cmd_wait <= 0;
-                    ras_o <= 1;
-                    cas_o <= 1;
-                    we_o <= 1;
-                end
                 else if (auto_go && auto_hit) begin
-                    // Burst pair READ, row open: streams right behind the
-                    // first burst (no auto-precharge, like any SPI READ).
-                    state <= STA_READ;
-                    cmdtarget <= BURST_LEN;
-                    cmd_wait <= BURST_LEN > 1;
-                    read_busy <= 1;
-                    auto_pending <= 0;
-                    auto_ready <= 0;
-                    auto_opened <= 0;
-                    spi_pair_read_done <= spi_active_buf[1];
-                    rd_pipe[0] <= 1;
-                    rd_tag_b[0] <= fill_sel;
-                    rd_tag_serial[0] <= 0;
-                    last_read_chip <= auto_addr[22];
-                    fill_sel <= ~fill_sel;
-                    if (fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
-                    else begin read_valid_a <= 0; read_beats_a <= 0; end
-
-                    cs_o <= auto_addr[22];
+                    // The row hit owns this dispatch slot even while a
+                    // cross-chip READ waits for the shared DQ bus.
                     ras_o <= 1;
-                    cas_o <= 0;
                     we_o <= 1;
-                    ba_o <= auto_addr[8:7];
-                    a_o <= 0;
-                    a_o[8:0] <= {auto_addr[6:0], 2'b00};
-                    a_o[10] <= 0;
-                    dq_oe_o <= 0;
-                    dqm_o <= 2'b00;
+                    if (!auto_bus_ready) begin
+                        state <= STA_IDLE;
+                        cmdtarget <= 1;
+                        cmd_wait <= 0;
+                        cas_o <= 1;
+                    end else begin
+                        // Burst pair READ, row open, no auto-precharge.
+                        state <= STA_READ;
+                        cmdtarget <= BURST_LEN;
+                        cmd_wait <= BURST_LEN > 1;
+                        read_busy <= 1;
+                        auto_pending <= 0;
+                        auto_ready <= 0;
+                        auto_opened <= 0;
+                        spi_pair_read_done <= spi_active_buf[1];
+                        rd_pipe[0] <= 1;
+                        rd_tag_b[0] <= fill_sel;
+                        rd_tag_serial[0] <= 0;
+                        last_read_chip <= auto_addr[22];
+                        fill_sel <= ~fill_sel;
+                        if (fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
+                        else begin read_valid_a <= 0; read_beats_a <= 0; end
+
+                        cs_o <= auto_addr[22];
+                        cas_o <= 0;
+                        ba_o <= auto_addr[8:7];
+                        a_o <= 0;
+                        a_o[8:0] <= {auto_addr[6:0], 2'b00};
+                        a_o[10] <= 0;
+                        dq_oe_o <= 0;
+                        dqm_o <= 2'b00;
+                    end
                 end
                 else if (auto_go && open_valid[auto_idx]) begin
                     // Close a different row in the target bank. A pair's
