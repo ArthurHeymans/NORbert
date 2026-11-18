@@ -57,6 +57,7 @@ module sdram(
     
     // Control signals from spi_trx (directly from SPI clock domain)
     input wire spi_active,
+    input wire spi_activity_toggle, // Toggles on each SCK rising edge
     input wire spi_inhibit_refresh,
     input wire spi_cmd_activate,
     input wire spi_cmd_read,
@@ -211,6 +212,13 @@ module sdram(
     
     // Buffer control signals from SPI domain
     reg [2:0] spi_active_buf;
+    reg [2:0] spi_activity_sync;
+    reg [6:0] spi_quiet_cycles;
+    // Hard refresh may interrupt a stopped address phase, but give an
+    // actively clocked phase a chance to reach its READ first. The separate
+    // age limit below also bounds deferral when SCK never stops.
+    wire spi_address_quiet = &spi_quiet_cycles;
+    reg refresh_force_replay;
     reg [1:0] spi_inhibit_refresh_buf;
     reg [2:0] spi_cmd_activate_buf;
     reg [1:0] spi_cmd_read_buf;
@@ -474,6 +482,9 @@ module sdram(
             wrbuf_read_ptr <= 0;
             
             spi_active_buf <= 0;
+            spi_activity_sync <= 0;
+            spi_quiet_cycles <= 0;
+            refresh_force_replay <= 0;
             spi_inhibit_refresh_buf <= 0;
             spi_cmd_activate_buf <= 0;
             spi_cmd_read_buf <= 0;
@@ -527,6 +538,14 @@ module sdram(
             // a master that stops the clock while deasserting CS cannot leave
             // refresh inhibition or command requests asserted indefinitely.
             spi_active_buf <= {spi_active_buf[1:0], spi_active};
+            spi_activity_sync <= {spi_activity_sync[1:0], spi_activity_toggle};
+            if (!spi_active_buf[1] || spi_activity_sync[1] != spi_activity_sync[2])
+                spi_quiet_cycles <= 0;
+            else if (!spi_address_quiet)
+                spi_quiet_cycles <= spi_quiet_cycles + 1'b1;
+            // Leave 64 clocks of counter headroom for row closure and
+            // refresh dispatch, even if SCK keeps moving.
+            refresh_force_replay <= refreshcount >= {REFRESH_BITS{1'b1}} - 64;
             spi_inhibit_refresh_buf <= {spi_inhibit_refresh_buf[0],
                                         spi_inhibit_refresh && spi_active};
             spi_cmd_activate_buf <= {spi_cmd_activate_buf[1:0],
@@ -874,6 +893,7 @@ module sdram(
                     dqm_o <= 2'b11;
                 end
                 else if (hard_refresh_due && !serial_row_open && access_cmd == 0 &&
+                         (spi_address_quiet || refresh_force_replay) &&
                          spi_activate_done && !spi_cmd_read_ack && !spi_cmd_read_buf[1]) begin
                     // SCK may stop after ACTIVATE while CS remains low.
                     // Close the row, refresh, then replay the held ACTIVATE.

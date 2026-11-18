@@ -23,7 +23,7 @@ module sdram_protocol_tb;
     wire [63:0] read_buffer;
 
     sdram #(.CLK_FREQ_MHZ(120)) ram(.clk(clk), .aux_clk(clk), .reset(reset), .dq_io(dq),
-        .spi_active(spi_active), .spi_inhibit_refresh(spi_inhibit),
+        .spi_active(spi_active), .spi_activity_toggle(1'b0), .spi_inhibit_refresh(spi_inhibit),
         .spi_cmd_activate(spi_activate), .spi_cmd_read(spi_read),
         .spi_cmd_post_toggle(1'b0), .spi_addr(spi_addr),
         .spi_cmd_pair(spi_pair), .spi_addr2(spi_addr2),

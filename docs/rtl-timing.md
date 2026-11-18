@@ -98,8 +98,9 @@ This is an ordering budget, not a routed RAM-to-comparator timing guarantee.
 At 120 MHz the nominal per-chip period is 468 clocks (a conservative
 32 ms / 8192 schedule). Refresh events alternate between the chips, one
 chip per event, so an event is due every 234 clocks and stalls dispatch
-for a single tRC instead of a back-to-back pair. Deferral may reach twice
-the per-chip period, plus bounded safe-row-closure/access service time.
+for a single tRC instead of a back-to-back pair. The normal hard-refresh
+bound is twice the per-chip period plus bounded safe-row-closure/access
+service time. See the address-phase exception below.
 Each event pays only one event period of elapsed time; it does not discard
 overdue time. This preserves the nominal average rate even when SCK and CS
 stall indefinitely. The saturating counter has service-latency headroom
@@ -119,8 +120,15 @@ re-arm point. The next post is then at least the re-arm-to-post gap away,
 so a 9-clock refresh event overlaps it by only part of that gap, well
 inside the burst's margin. A refresh in the gap before a post would instead
 delay the post by the whole event. Stopped SCK outside a window falls back
-to the deadline (hard) refresh. `quad_fast_tb` sweeps the refresh due time
-across one full event period for every documented read limit.
+to the deadline (hard) refresh. If an early SPI ACTIVATE is waiting for
+its first READ, a hard refresh waits until SCK has been quiet for about
+1.1 µs or the age counter reaches 960 clocks at 120 MHz. This
+avoids tearing down a row while the master is still sending its address,
+without letting a stalled or noisy master starve refresh. SCK activity
+crosses into the system domain as a synchronized toggle, not a pulse.
+`quad_fast_tb` sweeps the refresh due time across one full event period
+for every documented read limit; `refresh_tb` tests a progressing address
+phase at the hard deadline and recovery after stopped SCK.
 
 Reads too short to post a lookahead burst, back to back with little
 deselect time (firmware fetching code in place), only get the pair's
@@ -164,6 +172,23 @@ set_input_delay -clock sdram_clk -min SDRAM_TCO_MIN_PLUS_FLIGHT [get_ports {IO_s
 ```
 
 ## Validation and remaining sign-off
+
+### CH32V307 single-lane bench
+
+The previous image corrupted the first bit on 6 of 600 short `0x13`
+reads with the bridge's former top setting (nominal 18 MHz). The
+address-phase refresh guard and the last-word-first ordering for
+no-dummy single-lane reads passed 6,000 short reads at nominal 36 MHz:
+`0x13` and `0x0C`, with and without a preceding address-only abort, and
+with starts on either side of and crossing the 32 MiB SDRAM boundary.
+There were no byte mismatches or prefetch flags. Three 1 MiB bulk SPI
+reads crossing the boundary and one UART readback also matched.
+Gowin placement option 1 has zero reported setup/hold violations with
+the checked-in constraints. The CH32V307 SPI2 `/2` setting (nominal
+72 MHz) failed JEDEC at this bench; `/4` was the fastest tested working
+setting. These rates are derived from the MCU clock configuration, not
+measured at the FPGA pins; no dual/quad or board-level timing sign-off
+is implied.
 
 ### Protocol 9 release checklist
 

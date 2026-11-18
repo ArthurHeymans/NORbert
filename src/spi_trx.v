@@ -336,9 +336,13 @@ module spi_trx(
         // Quad: the column clock is the last address clock and IO2/IO1
         // carry byte-address bits 2/1 (the SDRAM word). Dual: IO0 carries
         // bit 2, so start at the even word of that half; the byte-7 word
-        // then arrives second instead of last.
+        // then arrives second instead of last. For single-lane reads
+        // without dummy clocks, start with the final word: it has the
+        // earliest deadline at offsets 6/7. The other words wrap in
+        // order, and fast single-lane reads keep their original order.
         .first_word(addr_quad ? {spi_io2_in, spi_io1_in} :
-                    addr_dual ? {spi_io0_in, 1'b0} : 2'b00),
+                    addr_dual ? {spi_io0_in, 1'b0} :
+                    is_fast_read ? 2'b00 : 2'b11),
         .first_done(addr_read && addr_last && !addr_dual && !addr_quad),
         .addr_end(addr_read && addr_last),
         .drop((state == STA_MODE_MULTI && mode_count == 3) ||

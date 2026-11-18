@@ -25,6 +25,8 @@ module quad_fast_tb;
     always #4.167 clk = ~clk; // 120 MHz system clock
     reg reset = 1;
     reg sck = 0, cs = 1;
+    reg spi_activity_toggle = 0;
+    always @(posedge sck) spi_activity_toggle <= ~spi_activity_toggle;
     // Whether the emulated chip supports 4-byte addressing at all.
     reg cfg_4byte = 1'b0;
     reg [23:0] cfg_jedec_id = 24'h4125bf;
@@ -80,7 +82,7 @@ module quad_fast_tb;
         .clk(clk), .aux_clk(clk), .reset(reset),
         .ba_o(ba), .a_o(a), .cs_o(cs_n), .ras_o(ras), .cas_o(cas), .we_o(we),
         .dqm_o(dqm), .dq_io(dq),
-        .spi_active(!cs), .spi_inhibit_refresh(ram_inh),
+        .spi_active(!cs), .spi_activity_toggle(spi_activity_toggle), .spi_inhibit_refresh(ram_inh),
         .spi_cmd_activate(ram_act), .spi_cmd_read(ram_read), .spi_addr(ram_addr),
         .spi_cmd_post_toggle(post_toggle), .spi_cmd_continuation(ram_cont),
         .spi_word(ram_word), .spi_cmd_pair(ram_pair), .spi_addr2(ram_addr2),
