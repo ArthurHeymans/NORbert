@@ -165,7 +165,39 @@ set_input_delay -clock sdram_clk -min SDRAM_TCO_MIN_PLUS_FLIGHT [get_ports {IO_s
 
 ## Validation and remaining sign-off
 
-### Corrected-clock stack validation
+### Protocol 9 release checklist
+
+- Qualify the complete stack, not the controller-compatibility layer on its
+  own. Re-run `make test`, `make test-gate`, and `make test-rflasher` on the
+  release candidate. Route that exact revision with the board/master I/O
+  profile above; check actual exception coverage and both setup and hold.
+- On hardware, check byte-exact reads at the advertised per-command rates,
+  including short reads, CS release with stopped SCK, and the 32 MiB
+  SDRAM-chip boundary on a 64 MiB profile. Verify that refresh and host
+  reads resume after a deselect. An internal Fmax report alone does not
+  qualify 70 MHz on the board.
+- Upgrading the FPGA to protocol 9 requires a protocol-9-aware CLI or web
+  UI. The new UI retains legacy operations with protocol 7, but chip
+  selection is disabled. A `master` push updates Pages, not the `latest`
+  release bitstream. Once qualified, bump the CLI package version and tag
+  the same revision; verify that Pages and `releases/latest/download/spi_flash.fs`
+  work together. Keep the previous CLI and bitstream available as a pair
+  for rollback.
+
+### Burst-pair fix validation
+
+With the burst-pair fix, Gowin 1.9.11.03 reports 18 setup-violated
+endpoints (worst slack −0.199 ns) at placement option 1 and 87 (worst
+slack −0.422 ns) at option 0; option 2 reports 16 setup violations.
+All three builds report zero hold violations. These placements are not
+release candidates, even before adding the board/master I/O profile. The
+local OSS flow packs the bitstream but misses both the 120 MHz system
+and 70 MHz SPI targets in its experimental timing model. An isolated
+simulation of a cold four-byte quad-I/O read starting one byte before
+the SDRAM-chip boundary passes at 70 MHz with the fix; this is not a
+board timing measurement.
+
+### Corrected-clock stack validation (before the burst-pair fix)
 
 The controller-compatibility base and full performance stack were rebased
 onto the toolchain pins merged in #62. PLL parameter values, functional RTL
