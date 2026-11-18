@@ -2128,37 +2128,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "rflasher-chip-defs"
+version = "0.1.0"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=54c4a43981f68bd0ec498bb2471b107b3eb47266#54c4a43981f68bd0ec498bb2471b107b3eb47266"
+dependencies = [
+ "rflasher-chip-types",
+ "ron",
+ "serde",
+]
+
+[[package]]
 name = "rflasher-chip-types"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=1879f3819cb4f3d9fde76447198346cae3e2b40d#1879f3819cb4f3d9fde76447198346cae3e2b40d"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=54c4a43981f68bd0ec498bb2471b107b3eb47266#54c4a43981f68bd0ec498bb2471b107b3eb47266"
 dependencies = [
  "bitflags 2.13.1",
  "heapless",
+ "serde",
 ]
 
 [[package]]
 name = "rflasher-chips"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=1879f3819cb4f3d9fde76447198346cae3e2b40d#1879f3819cb4f3d9fde76447198346cae3e2b40d"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=54c4a43981f68bd0ec498bb2471b107b3eb47266#54c4a43981f68bd0ec498bb2471b107b3eb47266"
 dependencies = [
  "once_cell",
+ "rflasher-chip-defs",
  "rflasher-chip-types",
  "rflasher-chips-codegen",
  "ron",
- "serde",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "rflasher-chips-codegen"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=1879f3819cb4f3d9fde76447198346cae3e2b40d#1879f3819cb4f3d9fde76447198346cae3e2b40d"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=54c4a43981f68bd0ec498bb2471b107b3eb47266#54c4a43981f68bd0ec498bb2471b107b3eb47266"
 dependencies = [
  "prettyplease",
  "proc-macro2",
  "quote",
+ "rflasher-chip-defs",
  "ron",
- "serde",
  "syn 2.0.119",
 ]
 

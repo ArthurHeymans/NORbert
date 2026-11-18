@@ -13,10 +13,12 @@ cd "$(dirname "$0")/.."
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
 
-RTL="src/spi_trx.v src/spi_prefetch.v src/sdram.v src/glue.v src/spi_program.v src/host_protocol.v src/sdram_client_mux.v src/uart.v"
+RTL="src/spi_trx.v src/spi_prefetch.v src/sdram.v src/glue.v src/spi_program.v src/host_protocol.v src/chip_profile_store.v src/sdram_client_mux.v src/uart.v"
 RTL="$RTL src/ft245.v src/fifo.v src/logger.v src/util.v"
 
-CELLS_SIM="$(yosys-config --datdir)/gowin/cells_sim.v"
+# An override also permits checking a stock mapper with the repository's
+# pinned GW5A simulation models; upstream models may omit DPX9B/SDPX9B.
+CELLS_SIM=${CELLS_SIM:-"$(yosys-config --datdir)/gowin/cells_sim.v"}
 
 # synth <tb> <module> [keep wires] [chparam args]
 # Wires the testbench peeks at are kept so dead-register removal cannot
@@ -56,39 +58,43 @@ sim() {
     "$build/$tb/V${tb}_tb"
 }
 
+# Fast focused gate check while iterating on the dynamic profile decoder.
+if [ "${GATE_ONLY:-}" = chip_profile ]; then
+    synth chip_profile spi_trx
+    synth chip_profile chip_profile_store
+    sim chip_profile "$build/chip_profile.spi_trx.v" "$build/chip_profile.chip_profile_store.v"
+    exit 0
+fi
+
 synth fifo fifo "" "-set WIDTH 8 -set NUM 16 -set FREESPACE 1"
 sim fifo "$build/fifo.fifo.v"
 
 synth logger logger
 sim logger "$build/logger.logger.v"
 
-synth spi_flash glue
+# All these benches use the same unparameterized glue/spi_trx. Reuse their
+# mapped netlists; dynamic profile coverage does not need another synthesis.
+synth spi_flash glue "cmd_idle"
 synth spi_flash spi_trx
+synth chip_profile chip_profile_store
+sim chip_profile "$build/spi_flash.spi_trx.v" "$build/chip_profile.chip_profile_store.v"
 sim spi_flash "$build/spi_flash.glue.v" "$build/spi_flash.spi_trx.v"
 
-synth sdram_controller glue
 synth sdram_controller sdram
-sim sdram_controller "$build/sdram_controller.glue.v" "$build/sdram_controller.sdram.v"
+sim sdram_controller "$build/spi_flash.glue.v" "$build/sdram_controller.sdram.v"
 
-synth refresh glue
 synth refresh sdram "" "-set CLK_FREQ_MHZ 120"
-sim refresh "$build/refresh.glue.v" "$build/refresh.sdram.v"
+sim refresh "$build/spi_flash.glue.v" "$build/refresh.sdram.v"
 
 synth sdram_protocol sdram "serial_read_active refreshcount spi_activate_done serial_row_open" "-set CLK_FREQ_MHZ 120"
 sim sdram_protocol "$build/sdram_protocol.sdram.v"
 
-synth access_handshake glue
-sim access_handshake "$build/access_handshake.glue.v"
-
-synth write_completion spi_trx
-sim write_completion "$build/write_completion.spi_trx.v"
-
-synth prefetch_health spi_trx
-sim prefetch_health "$build/prefetch_health.spi_trx.v"
+sim access_handshake "$build/spi_flash.glue.v"
+sim write_completion "$build/spi_flash.spi_trx.v"
+sim prefetch_health "$build/spi_flash.spi_trx.v"
 
 synth quad_fast sdram "" "-set CLK_FREQ_MHZ 120 -set BURST_LEN 4"
-synth quad_fast spi_trx
-sim quad_fast "$build/quad_fast.sdram.v" "$build/quad_fast.spi_trx.v"
+sim quad_fast "$build/quad_fast.sdram.v" "$build/spi_flash.spi_trx.v"
 
 synth toctou top "spi_addr_latched refreshcount spi_cmd_read_ack trap_triggered
                   spi_cmd_read_buf spi_activate_done

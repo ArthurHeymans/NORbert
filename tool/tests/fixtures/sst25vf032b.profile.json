@@ -1,0 +1,11 @@
+{
+  "chip": "SST25VF032B",
+  "jedec": [
+    191,
+    37,
+    74
+  ],
+  "capacity_bytes": 4194304,
+  "profile_hex": "sst25vf032b.profile.hex",
+  "initial_state": "unprotected compatibility default"
+}

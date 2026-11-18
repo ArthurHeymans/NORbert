@@ -16,6 +16,7 @@ module spi_flash_tb;
     reg prefetch_underrun = 0, prefetch_thin = 0;
     // Whether the emulated chip advertises 4-byte addressing at all.
     reg cfg_4byte = 1'b0;
+    reg [22:0] cfg_chip_erase_bursts = 23'h7fffff;
     wire spi_reset = reset || !running;
     wire write_cmd, write_done, write_strobe, write_partial;
     wire [1:0] write_type;
@@ -61,7 +62,9 @@ module spi_flash_tb;
         .write_len(write_len), .write_partial(write_partial), .write_done(write_done),
         .write_buf_strobe(write_strobe), .write_buf_offset(write_offset),
         .write_buf_val(write_value), .cfg_jedec_id(24'h4125bf), .cfg_4byte(cfg_4byte),
-        .cfg_chip_erase_bursts(23'h7fffff), .sfdp_raddr(sfdp_addr), .sfdp_rdata(sfdp_data)
+        .cfg_profile(460'b0), .cfg_profile_valid(1'b0), .cfg_profile_epoch(32'b0),
+        .cfg_erase_wren(1'b0), .cfg_erase_waddr(5'b0), .cfg_erase_wdata(50'b0),
+        .cfg_chip_erase_bursts(cfg_chip_erase_bursts), .sfdp_raddr(sfdp_addr), .sfdp_rdata(sfdp_data)
     );
     glue dut (
         .clk(clk), .reset(reset), .rxd_strobe(rx_strobe), .rxd_data(rx_data),
@@ -123,9 +126,20 @@ module spi_flash_tb;
     end
 
     task host_byte(input [7:0] b);
+        integer waited;
+        reg await_start;
+        await_start = b == 8'h34 && dut.host_i.cmd_idle;
+        if (await_start) last_reply = 0;
         @(negedge clk); rx_data = b; rx_strobe = 1;
         @(negedge clk); rx_strobe = 0;
         repeat (10) @(negedge clk); // One byte per 12 system clocks
+        // STOP cancels/scrubs pending SPI page data; START may ACK later.
+        // Keep the explicit boot-time early-START timing check below.
+        if (await_start && !check_early_start) begin
+            waited = 0;
+            while (!last_reply && waited < 1024) begin @(negedge clk); waited++; end
+            if (!last_reply) $fatal(1, "START did not acknowledge page-buffer scrub");
+        end
     endtask
 
     // FT245 receive FIFO model (declared above): pop advances the head,
@@ -397,9 +411,27 @@ module spi_flash_tb;
         select_spi; send(8'h20); address('h1000); send_bits(8'hff, 5);
         deselect_spi; poll_done;
         check_memory;
+        // A valid erase ending on the address boundary must clear the
+        // prior partial flag even without another selected SCK edge.
+        command(8'h06);
+        select_spi; send(8'h20); address(0); deselect_spi; poll_done;
+        for (integer i = 0; i < 4096; i++) expected[i] = 8'hff;
+        check_memory;
         // A one-byte program at another offset of that page. Had the two
         // aborted bytes (0x00 at 0x1c0/0x1c1) survived, they would land too.
         page_program('h1d0, 1, 8'h0f);
+        // One quad byte plus a half-byte must discard the whole program,
+        // including its already captured byte, and scrub the page buffer.
+        command(8'h06);
+        select_spi; send(8'h32); address('h1c0); send_bits(8'h00, 3);
+        deselect_spi; poll_done; check_memory;
+        // The same stale-partial hazard at an opcode-only chip erase. Use
+        // the model's 8 KiB capacity for this focused operation.
+        cfg_chip_erase_bursts = 23'h3ff;
+        command(8'h06); command(8'hc7); poll_done;
+        for (integer i = 0; i < 8192; i++) expected[i] = 8'hff;
+        check_memory;
+        cfg_chip_erase_bursts = 23'h7fffff;
     endtask
 
     // The engine may only get SDRAM ownership after the master has already
@@ -557,7 +589,20 @@ module spi_flash_tb;
         read_sfdp(0, 130, 0, 0);
         host_byte(8'h35); configure_sfdp(128, 8'h84, 2);
         repeat (70000) @(negedge clk); // Incomplete host command times out
-        host_byte(8'h34); read_sfdp(0, 130, 2, 8'h84);
+        host_byte(8'h34);
+        if (running || last_reply_byte !== 8'h02) $fatal(1, "START accepted partial CHIPCONFIG");
+        configure_sfdp(2, 8'h84); host_byte(8'h34);
+        read_sfdp(0, 130, 2, 8'h84);
+        host_byte(8'h35); host_byte(8'h3c); host_byte(1);
+        repeat (70000) @(negedge clk);
+        host_byte(8'h34);
+        if (running || last_reply_byte !== 8'h02) $fatal(1, "START accepted partial CHIPPROFILE");
+        host_byte(8'h3c); host_byte(2);
+        for (integer i = 1; i < 128; i++) host_byte(i == 28 ? 8 : 0);
+        repeat (40) @(negedge clk); // Wait for validated profile ACK.
+        host_byte(8'h34);
+        if (!running) $fatal(1, "START refused complete CHIPPROFILE");
+        host_byte(8'h35); configure_sfdp(2, 8'h84); host_byte(8'h34);
 
         page_program('h1ff, 2, 8'ha5);  // Partial page wrapping at byte 255
         page_program('h106, 1, 8'h55);  // Preserve untouched bytes; NOR AND

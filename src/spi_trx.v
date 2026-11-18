@@ -71,6 +71,12 @@ module spi_trx(
     input wire [23:0] cfg_jedec_id,
     input wire cfg_4byte,
     input wire [22:0] cfg_chip_erase_bursts,
+    input wire [459:0] cfg_profile,
+    input wire cfg_erase_wren,
+    input wire [4:0] cfg_erase_waddr,
+    input wire [49:0] cfg_erase_wdata,
+    input wire cfg_profile_valid,
+    input wire [31:0] cfg_profile_epoch,
     
     // SFDP table read interface (memory in glue.v)
     output reg [6:0] sfdp_raddr,
@@ -165,10 +171,22 @@ module spi_trx(
         STA_MODE_MULTI      = 13,  // Mode+dummy phase for 0xBB/0xEB
         STA_WRITESTATUS     = 16,  // Receive status register write data
         STA_READSFDP        = 17,  // SFDP data output phase
-        STA_AAI_DATA        = 18;  // AAI data reception (2 bytes)
+        STA_AAI_DATA        = 18,  // AAI data reception (2 bytes)
+        STA_SECTORREAD      = 19,
+        STA_BPRREAD         = 20,
+        STA_BPRWRITE        = 21,
+        STA_REGWRITE        = 22,
+        STA_UID_DUMMY       = 23,
+        STA_UID_READ        = 24,
+        STA_CONFIGREAD      = 25,
+        STA_CONFIGWRITE     = 26,
+        STA_ANYWRITE        = 27,
+        STA_LEGACYID        = 28,
+        STA_IGNORE          = 31;
     
     reg [4:0] state;
-    reg [2:0] dummy_count = 0;
+    reg [4:0] dummy_count = 0;
+    reg [4:0] transaction_wait = 0;
     // dummy_count is loaded with the last dummy clock and counts down to 0,
     // so fast reads support 1..8 wait clocks. Verilog-2001 has no cast to
     // narrow the parameter expression, so the truncation is waived here and
@@ -179,7 +197,7 @@ module spi_trx(
     generate
         if (FAST_READ_DUMMY_CLKS < 1 || FAST_READ_DUMMY_CLKS > 8) begin : g_dummy_range
             // Deliberately undefined: elaboration fails if dummy_count
-            // cannot hold the configured fast-read wait.
+            // violates the legacy generic fast-read parameter contract.
             FAST_READ_DUMMY_CLKS_must_be_1_to_8 unsupported_dummy_clks();
         end
     endgenerate
@@ -190,21 +208,21 @@ module spi_trx(
     // 3 for dual and 1 for quad output (SPI clocks per byte - 1).
     reg [2:0] read_byte_top = 7;
     reg is_sfdp_read = 0;       // Set for CMD 0x5A (Read SFDP)
-    reg [2:0] mode_count = 0;   // Mode+dummy counter (4 for dual, 6 for quad)
+    reg [4:0] mode_count = 0;   // Includes configured multi-IO latency.
     
     // AAI (Auto Address Increment) state -- persists across CS cycles
     reg aai_active = 0;         // In AAI word program mode
     reg is_aai = 0;             // Current transaction is AAI (per-CS flag)
     reg [1:0] aai_bytes_left;   // Ignore data beyond the two-byte AAI word
 
-    // Continuous read mode (Winbond "Continuous Read Mode", Micron XIP):
-    // mode bits M5-4 = 10 after a 0xBB/0xEB address make the next
-    // transaction start directly with the address, without an opcode.
-    // Any other M5-4 (e.g. the FFh/FFFFh mode reset) leaves the mode.
-    // Persists across CS like AAI; cleared at power reset.
+    // Mode-byte continuous reads: M5-4 = 10 skips the next opcode.
+    // Micron profile BB/EB waits are dummy-only, not a mode byte.
+    // Persist the accepted address/latency framing across CS; reseed/reset
+    // clears the mode so it cannot leak into a different chip profile.
     reg cont_read = 0;
     reg cont_quad = 0;          // ...for 1-4-4 (else 1-2-2)
     reg cont_4b = 0;            // ...with a four-byte address
+    reg [4:0] cont_wait = 0;
     reg io_read_4b = 0;         // Current 1-2-2/1-4-4 read has a 4-byte address
     
     reg [31:0] addr;
@@ -213,12 +231,11 @@ module spi_trx(
 
     // STA_ADDR receives addr_lanes (1, 2 or 4) bits per clock, MSB first,
     // then continues according to addr_kind.
-    localparam [1:0]
-        ADDR_KIND_READ  = 2'd0,
-        ADDR_KIND_WRITE = 2'd1,
-        ADDR_KIND_ERASE = 2'd2;
+    localparam [2:0]
+        ADDR_KIND_READ=0, ADDR_KIND_WRITE=1, ADDR_KIND_ERASE=2,
+        ADDR_KIND_PROTECT=3, ADDR_KIND_CONFIG=4, ADDR_KIND_CONFIGWRITE=5, ADDR_KIND_ID=6;
     reg [2:0] addr_lanes = 1;
-    reg [1:0] addr_kind = ADDR_KIND_READ;
+    reg [2:0] addr_kind = ADDR_KIND_READ;
     wire addr_quad = addr_lanes[2];
     wire addr_dual = addr_lanes[1];
     // Address including the bits arriving on this clock. Commands clear
@@ -242,7 +259,7 @@ module spi_trx(
 
     // Status registers
     reg [7:0] status_reg = 8'b00000000;
-    reg [7:0] status_reg2 = 8'h02;     // QE bit (bit 1) default enabled
+    reg [7:0] status_reg2 = 8'h02;     // Legacy generic default; profiles reseed it.
     
     // Synchronize write_done from the system clock domain into spi_clk.
     // glue.v toggles write_done once per completed program/erase, so the
@@ -250,39 +267,21 @@ module spi_trx(
     reg [2:0] write_done_sync = 0;
     wire write_busy_clr = write_done_sync[1] ^ write_done_sync[2];
 
-    reg status_read_sel2 = 0;
+    `include "spi_chip_profile.vh"
 
     // SDRAM prefetch. Each strobe marks the clock on which the SPI
     // transaction reaches the corresponding point; spi_prefetch documents
     // what it does with it.
-    // Opcode completing on this clock (valid when bit_count_in == 0), and
-    // the same with everything but status reads masked while WIP is set.
-    // 8'h00 is not a decoded opcode.
-    wire [7:0] cmd_byte = {mosi_byte[7:1], spi_io0_in};
-    wire [7:0] cmd_accepted = (status_reg[0] && cmd_byte != CMD_READSTATUS &&
-                               cmd_byte != CMD_READSTATUS2) ? 8'h00 : cmd_byte;
     // The issuing transaction of a pending write command is still selected.
     reg write_open = 0;
 
-    // Opcodes the decoder below turns into an array read, with the same
-    // enable conditions. Kept next to the decoder's case labels: a read it
-    // misses would only lose the early refresh inhibit, not data.
-    function array_read_opcode;
-        input [7:0] op;
-        begin
-            case (op)
-            CMD_READ, CMD_FASTREAD, CMD_DUALREAD, CMD_DUALREAD_4B,
-            CMD_DUALIOREAD, CMD_DUALIOREAD_4B:
-                array_read_opcode = 1'b1;
-            CMD_READ_4B, CMD_FASTREAD_4B:
-                array_read_opcode = cfg_4byte;
-            CMD_QUADREAD, CMD_QUADREAD_4B, CMD_QUADIOREAD, CMD_QUADIOREAD_4B:
-                array_read_opcode = status_reg2[1];
-            default:
-                array_read_opcode = 1'b0;
-            endcase
-        end
-    endfunction
+    // Share descriptor admission with OP_READ, including completion on this
+    // edge, profile erase priority and the Atmel 3C register-read alias.
+    wire read_enabled = (!command_native || cfg_profile_valid || cfg_4byte) &&
+                        (command_data_lanes != 2 || quad_enabled);
+    wire array_read_accepted = can_mutate && operation == OP_READ && read_enabled &&
+                              !(cfg_profile_valid && profile_erase_match) &&
+                              !(is_atmel && received_byte == 8'h3c);
 
     wire addr_read = state == STA_ADDR && addr_kind == ADDR_KIND_READ && !is_sfdp_read;
     wire in_read = state == STA_READ;
@@ -296,7 +295,7 @@ module spi_trx(
         .in_read(in_read),
         .sample_missing(sample_missing),
         .release_inhibit(state == STA_CMD && bit_count_in == 0 &&
-                         !array_read_opcode(cmd_accepted)),
+                         !array_read_accepted),
         // Quad: IO3/IO2 carry byte-address bits 11/10 on this clock.
         .first_activate(addr_read && addr_count == (addr_quad ? 11 : 9)),
         .first_row(addr_quad ? {addr[13:0], spi_io3_in, spi_io2_in} : addr[15:0]),
@@ -370,8 +369,15 @@ module spi_trx(
                 is_sfdp_read <= 0;
                 is_aai <= 0;
                 aai_bytes_left <= 0;
-                status_read_sel2 <= 0;
+                status_read_index <= 0;
+                status_write_index <= 0;
+                erase_custom <= 0;
+                program_quad <= 0;
+                transaction_wait <= 0;
+                byte_programmed <= 0;
                 mode_count <= 0;
+                transaction_opcode <= 0;
+                register_index <= 0;
                 
                 log_cmd_valid <= 0;
                 log_addr_valid <= 0;
@@ -383,17 +389,40 @@ module spi_trx(
                 if (reset_power) begin
                     write_cmd <= 0;
                     status_reg[1:0] <= 2'b00;
-                    status_reg[6] <= 0;     // AAI bit
+                    if (!cfg_profile_valid || command_flags[3]) status_reg[6] <= 0;
                     addr_4byte <= 0;
+                    extended_address <= 0;
+                    reset_enabled <= 0;
                     aai_active <= 0;
                     cont_read <= 0;
                     addr <= 0;
                 end
-                else if (cont_read && !status_reg[0]) begin
+                if (cfg_profile_valid && (!profile_loaded || profile_epoch_seen != cfg_profile_epoch)) begin
+                    profile_loaded <= 1;
+                    profile_epoch_seen <= cfg_profile_epoch;
+                    status_reg <= profile_byte(12) & 8'hfc;
+                    status_reg2 <= profile_byte(13);
+                    status_reg3 <= profile_byte(14);
+                    nvcr <= 16'hffff; vcr <= 8'hfb; evcr <= 8'hff;
+                    config_reg3 <= 0; config_reg4 <= 0; config_reg5 <= 0;
+                    addr_4byte <= 0;
+                    extended_address <= 0;
+                    reset_enabled <= 0;
+                    aai_active <= 0;
+                    cont_read <= 0;
+                    addr <= 0;
+                end else if (!cfg_profile_valid) begin
+                    profile_loaded <= 0;
+                end
+                if (!reset_power &&
+                    !(cfg_profile_valid && (!profile_loaded || profile_epoch_seen != cfg_profile_epoch)) &&
+                    cont_read && can_mutate) begin
                     // Continuous read: this first clock already carries
                     // the address MSBs of an implied 0xBB/0xEB (or 4B).
                     state <= STA_ADDR;
                     addr_kind <= ADDR_KIND_READ;
+                    transaction_wait <= cont_wait;
+                    io_read_4b <= cont_4b;
                     log_cmd_valid <= 1;
                     if (cont_quad) begin
                         addr_lanes <= 4;
@@ -423,198 +452,103 @@ module spi_trx(
                 if (write_open)
                     write_partial <= bit_count_in != 0;
                 
-                mosi_byte[bit_count_in] <= spi_io0_in;
+                if (state == STA_WRITE && program_quad)
+                    mosi_byte <= {mosi_byte[3:0], spi_io3_in, spi_io2_in, spi_io1_in, spi_io0_in};
+                else mosi_byte[bit_count_in] <= spi_io0_in;
 
 
                 if ((state == STA_CMD) && (bit_count_in == 0)) begin
                     
-                    // While WIP is set only status reads are accepted, as
-                    // on a real part: no array reads, writes or WEL changes
-                    // can race the program engine or its page buffer.
-                    case (cmd_accepted)
+                    transaction_opcode <= received_byte;
+                    state <= STA_IGNORE; // extra bytes cannot become new commands within CS
+                    if (cfg_profile_valid && profile_erase_match) begin
+                        if (status_reg[1] && can_mutate && !aai_active) begin
+                            state <= STA_ADDR;
+                            addr <= {extended_address, 24'd0};
+                            addr_kind <= ADDR_KIND_ERASE;
+                            addr_count <= (profile_erase_native || addr_4byte) ? 31 : 23;
+                            erase_descriptor <= profile_erase_index;
+                            erase_custom <= 1;
+                        end
+                    end else if (can_mutate || operation == OP_SR1 || operation == OP_SR2 ||
+                                 operation == OP_SR3 || operation == OP_FLAG || operation == OP_CONFIGREAD) case (operation)
                         
-                    CMD_READSTATUS: begin
-                        state <= STA_READSTATUS;
-                        status_read_sel2 <= 0;
+                    OP_SR1, OP_SR2, OP_SR3, OP_BANKREAD, OP_FLAG: begin
+                        if (operation == OP_SR3 && cfg_profile_valid && command_flags[6]) begin
+                            state <= STA_READID; miso_byte <= cfg_jedec_id[7:0]; addr_count <= 1;
+                        end else begin
+                            state <= STA_READSTATUS;
+                            status_read_index <= operation == OP_SR2 || (operation == OP_SR3 && is_macronix) ? 1 : operation == OP_SR3 ? 2 : 0;
+                            miso_byte <= operation == OP_SR2 || (operation == OP_SR3 && is_macronix) ? status_reg2_value : operation == OP_SR3 ? status_reg3 :
+                                operation == OP_BANKREAD ? extended_address : operation == OP_FLAG ?
+                                (status_reg[0] ? 8'h00 : 8'h80) : status_value;
+                        end
                         spi_io1_oe_ff <= 1;
-                        miso_byte <= status_reg;
                     end
-                    
-                    CMD_READSTATUS2: begin
-                        state <= STA_READSTATUS;
-                        status_read_sel2 <= 1;
-                        spi_io1_oe_ff <= 1;
-                        miso_byte <= status_reg2;
-                    end
-                    
-                    CMD_WRITESTATUS: begin
-                        if (status_reg[1]) begin
-                            state <= STA_WRITESTATUS;
-                            addr_count <= 0;
+                    OP_WRSR, OP_WRSR2, OP_WRSR3: begin
+                        if ((cfg_profile_valid || status_reg[1]) && !aai_active) begin
+                            status_write_index <= operation == OP_WRSR2 ? 1 : operation == OP_WRSR3 ? 2 : 0;
+                            state <= STA_WRITESTATUS; addr_count <= 0;
                         end
                     end
                     
-                    CMD_WRITEDISABLE: begin
+                    OP_WRDI: begin
                         status_reg[1] <= 0;
-                        status_reg[6] <= 0;  // Clear AAI bit
+                        if (!cfg_profile_valid || command_flags[3]) status_reg[6] <= 0;
                         aai_active <= 0;
                     end
                     
-                    CMD_WRITEENABLE: begin
-                        status_reg[1] <= 1;
+                    OP_WREN: begin
+                        if (can_mutate && !aai_active) status_reg[1] <= 1;
                     end
                     
-                    CMD_EWSR: begin
-                        // SST Enable-Write-Status-Register: acts like WREN
-                        // for status register writes.  For emulation we just
-                        // set WEL; the distinction only matters for hardware
-                        // write protection which the emulator doesn't enforce.
-                        status_reg[1] <= 1;
-                    end
-                    
-                    CMD_4BYTEENABLE: begin
-                        if (cfg_4byte) addr_4byte <= 1;
-                    end
-                    
-                    CMD_4BYTEDISABLE: begin
-                        if (cfg_4byte) addr_4byte <= 0;
+                    OP_ENTER4, OP_EXIT4: begin
+                        if (cfg_profile_valid || cfg_4byte) addr_4byte <= operation == OP_ENTER4;
                     end
                         
-                    CMD_READ: begin
-                        state <= STA_ADDR;
-                        addr <= 0;
-                        addr_count <= addr_4byte ? 31 : 23;
-                    end
-                    
-                    CMD_READ_4B: begin
-                        if (cfg_4byte) begin
+                    OP_READ: begin
+                        if (read_enabled) begin
                             state <= STA_ADDR;
-                            addr <= 0;
-                            addr_count <= 31;
+                            addr <= {extended_address,24'd0};
+                            addr_count <= (command_native || addr_4byte) ? 31 : 23;
+                            addr_lanes <= command_address_lanes == 2 ? 4 : command_address_lanes == 1 ? 2 : 1;
+                            is_dual_read <= command_data_lanes == 1;
+                            is_quad_read <= command_data_lanes == 2;
+                            read_byte_top <= command_data_lanes == 2 ? 1 : command_data_lanes == 1 ? 3 : 7;
+                            is_fast_read <= command_wait != 0 && command_address_lanes == 0;
+                            transaction_wait <= selected_wait;
+                            io_read_4b <= command_native || addr_4byte;
+                            if (is_atmel && received_byte == 8'h3c) begin
+                                addr_kind <= ADDR_KIND_PROTECT; addr_count <= 23;
+                                is_fast_read <= 0; is_dual_read <= 0;
+                            end
                         end
                     end
-                    
-                    CMD_FASTREAD: begin
-                        state <= STA_ADDR;
-                        addr <= 0;
-                        addr_count <= addr_4byte ? 31 : 23;
-                        is_fast_read <= 1;
-                    end
-                    
-                    CMD_FASTREAD_4B: begin
-                        if (cfg_4byte) begin
-                            state <= STA_ADDR;
-                            addr <= 0;
-                            addr_count <= 31;
-                            is_fast_read <= 1;
+                    OP_ERASE: begin
+                        if (status_reg[1] && !aai_active) begin
+                            if (received_byte == 8'hc7 || received_byte == 8'h60 || received_byte == 8'h62) begin
+                                state <= STA_ERASE; write_cmd <= 1; write_type <= 2'd1;
+                                write_open <= 1; write_partial <= 0;
+                                write_addr <= 0; write_len <= cfg_chip_erase_bursts;
+                                status_reg[1:0] <= 2'b01;
+                            end else begin
+                                state <= STA_ADDR; addr <= {extended_address,24'd0};
+                                addr_kind <= ADDR_KIND_ERASE;
+                                addr_count <= (command_native || addr_4byte) ? 31 : 23;
+                                write_len <= command_erase_size == 0 ? 23'h001ff :
+                                    command_erase_size == 1 ? 23'h00fff : 23'h01fff;
+                            end
                         end
                     end
-                    
-                    // Dual Output Read (1-1-2): cmd(1), addr(1), 8 dummy, data(2)
-                    CMD_DUALREAD,
-                    CMD_DUALREAD_4B: begin
-                        state <= STA_ADDR;
-                        addr <= 0;
-                        addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_DUALREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
-                        is_fast_read <= 1;   // Uses same dummy phase
-                        is_dual_read <= 1;
-                        read_byte_top <= 3;
-                    end
-                    
-                    // Dual I/O Read (1-2-2): cmd(1), addr(2), mode+dummy(2), data(2)
-                    CMD_DUALIOREAD,
-                    CMD_DUALIOREAD_4B: begin
-                        state <= STA_ADDR;
-                        addr <= 0;
-                        addr_lanes <= 2;
-                        addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_DUALIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
-                        io_read_4b <= cmd_byte == CMD_DUALIOREAD_4B || addr_4byte;
-                        is_dual_read <= 1;
-                        read_byte_top <= 3;
-                    end
-                    
-                    // Quad Output Read (1-1-4): cmd(1), addr(1), 8 dummy, data(4)
-                    CMD_QUADREAD,
-                    CMD_QUADREAD_4B: begin
-                        if (status_reg2[1]) begin  // QE required
-                            state <= STA_ADDR;
-                            addr <= 0;
-                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
-                            is_fast_read <= 1;   // Uses same dummy phase
-                            is_quad_read <= 1;
-                            read_byte_top <= 1;
-                        end
-                    end
-                    
-                    // Quad I/O Read (1-4-4): cmd(1), addr(4), mode+dummy(4), data(4)
-                    CMD_QUADIOREAD,
-                    CMD_QUADIOREAD_4B: begin
-                        if (status_reg2[1]) begin  // QE required
-                            state <= STA_ADDR;
-                            addr <= 0;
-                            addr_lanes <= 4;
-                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_QUADIOREAD_4B) ? 31 : (addr_4byte ? 31 : 23);
-                            io_read_4b <= cmd_byte == CMD_QUADIOREAD_4B || addr_4byte;
-                            is_quad_read <= 1;
-                            read_byte_top <= 1;
-                        end
-                    end
-
-                    CMD_SECTORERASE_4K,
-                    CMD_SECTORERASE_4K_4B: begin
-                        if (status_reg[1]) begin
-                            state <= STA_ADDR;
-                            addr <= 0;
-                            addr_kind <= ADDR_KIND_ERASE;
-                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_SECTORERASE_4K_4B) ? 31 : (addr_4byte ? 31 : 23);
-                            write_len <= 23'h001FF; // 4KB = 512 × 8-byte bursts - 1
-                        end
-                    end
-                    
-                    CMD_BLOCKERASE_32K,
-                    CMD_BLOCKERASE_32K_4B: begin
-                        if (status_reg[1]) begin
-                            state <= STA_ADDR;
-                            addr <= 0;
-                            addr_kind <= ADDR_KIND_ERASE;
-                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_BLOCKERASE_32K_4B) ? 31 : (addr_4byte ? 31 : 23);
-                            write_len <= 23'h00FFF; // 32KB = 4096 × 8-byte bursts - 1
-                        end
-                    end
-                    
-                    CMD_BLOCKERASE_64K,
-                    CMD_BLOCKERASE_64K_4B: begin
-                        if (status_reg[1]) begin
-                            state <= STA_ADDR;
-                            addr <= 0;
-                            addr_kind <= ADDR_KIND_ERASE;
-                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_BLOCKERASE_64K_4B) ? 31 : (addr_4byte ? 31 : 23);
-                            write_len <= 23'h01FFF; // 64KB = 8192 × 8-byte bursts - 1
-                        end
-                    end
-                    
-                    CMD_CHIPERASE1,
-                    CMD_CHIPERASE2: begin
-                        if (status_reg[1]) begin
-                            state <= STA_ERASE;
-                            write_cmd <= 1;
-                            write_open <= 1;
-                            write_type <= 2'd1;
-                            write_addr <= 23'b0;
-                            write_len <= cfg_chip_erase_bursts;
-                            status_reg[1] <= 0;
-                            status_reg[0] <= 1;
-                        end
-                    end
-                    
-                    CMD_PAGEPROGRAM,
-                    CMD_PAGEPROGRAM_4B: begin
-                        if (status_reg[1]) begin
-                            state <= STA_ADDR;
-                            addr <= 0;
+                    OP_PROGRAM: begin
+                        if (status_reg[1] && !aai_active &&
+                            (received_byte != 8'h38 || cfg_jedec_id[7:0] == 8'hc2)) begin
+                            state <= STA_ADDR; addr <= {extended_address,24'd0};
                             addr_kind <= ADDR_KIND_WRITE;
-                            addr_count <= ({mosi_byte[7:1], spi_io0_in} == CMD_PAGEPROGRAM_4B) ? 31 : (addr_4byte ? 31 : 23);
-                            write_len <= 23'h0001F; // 256 byte page = 32 × 8-byte bursts - 1
+                            addr_count <= (command_native || addr_4byte) ? 31 : 23;
+                            addr_lanes <= command_address_lanes == 2 ? 4 : 1;
+                            program_quad <= command_data_lanes == 2;
+                            write_len <= 23'h0001f;
                         end
                     end
                     
@@ -632,7 +566,7 @@ module spi_trx(
                     // WRDI, matching the SST25VFxxx datasheet and what
                     // flashprog's spi_prettyprint_status_register_sst25
                     // reports.
-                    CMD_AAI_WORD: begin
+                    OP_AAI: begin
                         if (status_reg[1] || aai_active) begin
                             if (!aai_active) begin
                                 // First AAI: need address phase
@@ -650,6 +584,7 @@ module spi_trx(
                                 aai_bytes_left <= 2;
                                 write_cmd <= 1;
                                 write_open <= 1;
+                                write_partial <= 0;
                                 write_type <= 2'd2;
                                 write_addr <= wrap_burst_addr(addr[25:3]);
                                 write_len <= 0;
@@ -658,7 +593,7 @@ module spi_trx(
                         end
                     end
                     
-                    CMD_READSFDP: begin
+                    OP_SFDP: begin
                         state <= STA_ADDR;
                         addr <= 0;
                         addr_count <= 23;        // Always 3-byte address for SFDP
@@ -666,8 +601,58 @@ module spi_trx(
                         is_sfdp_read <= 1;
                     end
                     
-                    CMD_READID1,
-                    CMD_READID2: begin
+                    OP_SECTOR, OP_LOCKFF: begin
+                        state <= STA_ADDR; addr <= 0; addr_kind <= ADDR_KIND_PROTECT;
+                        addr_count <= addr_4byte ? 31 : 23;
+                        status_reg[1] <= 0;
+                    end
+                    OP_ZERO: begin
+                        state <= STA_BPRREAD; spi_io1_oe_ff <= 1; miso_byte <= 0;
+                    end
+                    OP_UNLOCK: status_reg[1] <= 0;
+                    OP_EWSR: if (!cfg_profile_valid) status_reg[1] <= 1;
+                    OP_BANKWRITE: state <= STA_REGWRITE;
+                    OP_CONFIGREAD: begin
+                        if (is_spansion && received_byte == 8'h65) begin
+                            state <= STA_ADDR; addr <= 0; addr_kind <= ADDR_KIND_CONFIG;
+                            addr_count <= addr_4byte ? 31 : 23;
+                        end else begin
+                            state <= STA_CONFIGREAD; register_index <= 0; spi_io1_oe_ff <= 1;
+                            miso_byte <= received_byte == 8'hb5 ? nvcr[7:0] : received_byte == 8'h85 ? vcr : evcr;
+                        end
+                    end
+                    OP_ANYWRITE: if (is_spansion) begin
+                        state <= STA_ADDR; addr <= 0; addr_kind <= ADDR_KIND_CONFIGWRITE;
+                        addr_count <= addr_4byte ? 31 : 23;
+                    end
+                    OP_LEGACYID: begin
+                        state <= STA_ADDR; addr <= 0; addr_kind <= ADDR_KIND_ID; addr_count <= 23;
+                    end
+                    OP_CONFIGWRITE: begin
+                        state <= STA_CONFIGWRITE; register_index <= 0;
+                    end
+                    OP_UID: begin
+                        state <= STA_UID_DUMMY;
+                        uid_dummy <= 31;
+                        register_index <= 0;
+                    end
+                    OP_RESET_ENABLE: reset_enabled <= 1;
+                    OP_RESET: begin
+                        if (reset_enabled) begin
+                            reset_enabled <= 0;
+                            extended_address <= 0;
+                            // NVCR survives soft reset and determines subsequent
+                            // address/dummy framing; no protection state exists.
+                            vcr <= is_micron ? {nvcr[15:12],4'hb} : 8'hfb; evcr <= 8'hff;
+                            addr_4byte <= is_micron ? !nvcr[0] : is_spansion ? status_reg3[7] : 1'b0;
+                            if (is_micron && !nvcr[1]) extended_address <= {6'b0,cfg_chip_erase_bursts[22:21]};
+                            aai_active <= 0;
+                            cont_read <= 0;
+                            status_reg[1:0] <= 0;
+                            if (command_flags[3]) status_reg[6] <= 0;
+                        end
+                    end
+                    OP_ID: begin
                         state <= STA_READID;
                         spi_io1_oe_ff <= 1;
                         miso_byte <= cfg_jedec_id[7:0];
@@ -675,13 +660,20 @@ module spi_trx(
                     end
                     
                     endcase
-                    
+                    // Seed EAR before shifting in the 24-bit address. In a
+                    // four-byte transaction it is shifted out naturally.
+                    if (!aai_active && (profile_erase_match || operation == OP_READ ||
+                        operation == OP_PROGRAM || operation == OP_ERASE || operation == OP_AAI))
+                        addr <= {24'd0, extended_address};
+                    if (received_byte != 8'h66 && received_byte != 8'h99) reset_enabled <= 0;
                     log_cmd_valid <= 1;
                     log_cmd_opcode <= {mosi_byte[7:1], spi_io0_in};
                     log_byte_count <= 0;
                 end
                 else if ((state == STA_READSTATUS) && (bit_count_in == 0)) begin
-                    miso_byte <= status_read_sel2 ? status_reg2 : status_reg;
+                    miso_byte <= transaction_opcode == 8'h70 ? (status_reg[0] ? 8'h00 : 8'h80) :
+                        (transaction_opcode == 8'hc8 || transaction_opcode == 8'h16) ? extended_address :
+                        status_read_index == 1 ? status_reg2_value : status_read_index == 2 ? status_reg3 : status_value;
                 end
                 // ---------------------------------------------------------
                 // Address phase for reads, programs and erases. Receives
@@ -703,16 +695,15 @@ module spi_trx(
                         case (addr_kind)
                         ADDR_KIND_READ: begin
                             if (addr_dual || addr_quad) begin
-                                // Mode+dummy phase: 4 clocks for 0xBB,
-                                // 6 (2 mode + 4 dummy) for 0xEB.
+                                // ROM default or register-selected latency;
+                                // the paired descriptor already chose lanes.
                                 state <= STA_MODE_MULTI;
-                                mode_count <= addr_quad ? QUAD_IO_MODE_CLKS + QUAD_IO_DUMMY_CLKS - 1
-                                                        : DUAL_IO_MODE_CLKS - 1;
+                                mode_count <= transaction_wait - 5'd1;
                             end
                             else begin
                                 if (is_fast_read) begin
                                     state <= STA_DUMMY;
-                                    dummy_count <= FAST_READ_DUMMY_LAST;
+                                    dummy_count <= is_sfdp_read || !cfg_profile_valid ? {2'b0,FAST_READ_DUMMY_LAST} : transaction_wait - 5'd1;
                                 end
                                 else begin
                                     state <= STA_READ;
@@ -723,24 +714,46 @@ module spi_trx(
                         end
 
                         ADDR_KIND_ERASE: begin
-                            state <= STA_ERASE;
-                            write_cmd <= 1;
-                            write_open <= 1;
-                            write_type <= 2'd1;
-
-                            // Align address based on erase size
-                            // write_addr is 23-bit burst address = byte_addr[25:3]
-                            if (write_len == 23'h01FFF)
-                                write_addr <= wrap_burst_addr({addr_next[25:16], 13'b0});  // 64KB aligned
-                            else if (write_len == 23'h00FFF)
-                                write_addr <= wrap_burst_addr({addr_next[25:15], 12'b0});  // 32KB aligned
-                            else
-                                write_addr <= wrap_burst_addr({addr_next[25:12], 9'b0});   // 4KB aligned
-
                             status_reg[1] <= 0;
-                            status_reg[0] <= 1;
+                            if (!erase_custom || erase_region_found) begin
+                                state <= STA_ERASE;
+                                write_cmd <= 1;
+                                write_open <= 1;
+                                write_partial <= 0;
+                                write_type <= 2'd1;
+                                write_addr <= wrap_burst_addr(selected_erase_base[25:3]);
+                                write_len <= selected_erase_mask;
+                                status_reg <= (status_reg & ~profile_byte(7) & 8'hfd) | 8'h01;
+                            end else begin
+                                state <= STA_IGNORE;
+                                status_reg <= (status_reg & 8'hfd) | profile_byte(7);
+                            end
+                        end
+                        ADDR_KIND_PROTECT: begin
+                            if (transaction_opcode == 8'h3c) begin
+                                state <= STA_SECTORREAD;
+                                spi_io1_oe_ff <= 1;
+                                miso_byte <= 8'h00;
+                            end else if (transaction_opcode == 8'he0 || transaction_opcode == 8'he2) begin
+                                state <= STA_SECTORREAD; spi_io1_oe_ff <= 1; miso_byte <= 8'hff;
+                            end else begin
+                                state <= STA_IGNORE; status_reg[1] <= 0;
+                            end
                         end
 
+                        ADDR_KIND_CONFIG: begin
+                            state <= STA_CONFIGREAD; register_index <= addr_next[4:0];
+                            spi_io1_oe_ff <= 1; miso_byte <= addressed_config(addr_next[4:0]);
+                        end
+                        ADDR_KIND_CONFIGWRITE: begin
+                            state <= STA_ANYWRITE; register_index <= addr_next[4:0];
+                        end
+                        ADDR_KIND_ID: begin
+                            state <= STA_LEGACYID; spi_io1_oe_ff <= 1;
+                            miso_byte <= transaction_opcode == 8'hab || addr_next[0] ?
+                                cfg_jedec_id[23:16]-8'd1 : cfg_jedec_id[7:0];
+                            register_index[0] <= !addr_next[0];
+                        end
                         default: begin // ADDR_KIND_WRITE
                             if (is_aai) begin
                                 // Don't clear WEL between AAI words.
@@ -748,6 +761,7 @@ module spi_trx(
                                 aai_bytes_left <= 2;
                                 write_cmd <= 1;
                                 write_open <= 1;
+                                write_partial <= 0;
                                 write_type <= 2'd2;
                                 write_addr <= wrap_burst_addr(addr_next[25:3]);
                                 write_len <= 0;
@@ -756,14 +770,14 @@ module spi_trx(
                                 state <= STA_WRITE;
                                 write_cmd <= 1;
                                 write_open <= 1;
+                                write_partial <= 0;
                                 write_type <= 2'd0;
 
                                 // Page-aligned address in 8-byte burst units
                                 // byte_addr[25:3] -> burst address, page = 256 bytes = 32 bursts
                                 write_addr <= wrap_burst_addr({addr_next[25:8], 5'b0});
 
-                                status_reg[1] <= 0;
-                                status_reg[0] <= 1;
+                                status_reg <= (status_reg & ~profile_byte(7) & 8'hfd) | 8'h01;
                             end
                         end
                         endcase
@@ -777,7 +791,7 @@ module spi_trx(
                             // so sfdp_rdata is valid now.
                             state <= STA_READSFDP;
                             spi_io1_oe_ff <= 1;
-                            miso_byte <= sfdp_rdata;
+                            miso_byte <= (!cfg_profile_valid || addr < 32'd128) ? sfdp_rdata : 8'hff;
                         end
                         else begin
                             state <= STA_READ;
@@ -825,7 +839,7 @@ module spi_trx(
                 end
                 else if (state == STA_READID) begin
                     if (bit_count_in == 0) begin
-                        if (addr_count < 3) begin
+                        if (addr_count < ((cfg_profile_valid && command_flags[6]) ? 2 : 3)) begin
                             miso_byte <= cfg_jedec_id[addr_count*8 +: 8];
                             addr_count <= addr_count + 1;
                         end
@@ -834,11 +848,14 @@ module spi_trx(
                     end
                 end
                 else if ((state == STA_WRITE) && (bit_count_in == 0)) begin
-                    write_buf_strobe <= 1;
-                    write_buf_offset <= addr[7:0];
-                    write_buf_val <= {mosi_byte[7:1], spi_io0_in};
-                    
-                    addr[7:0] <= addr[7:0] + 1;
+                    if (!cfg_profile_valid || !command_flags[4] || !byte_programmed) begin
+                        write_buf_strobe <= 1;
+                        write_buf_offset <= addr[7:0];
+                        write_buf_val <= program_byte;
+                        byte_programmed <= 1;
+                        addr[7:0] <= cfg_profile_valid ?
+                            ((addr[7:0] & ~page_mask) | ((addr[7:0] + 8'd1) & page_mask)) : addr[7:0] + 8'd1;
+                    end
                 end
                 // ---------------------------------------------------------
                 // AAI data reception (2 bytes per CS cycle)
@@ -858,18 +875,19 @@ module spi_trx(
                         addr <= addr + 2;
                 end
                 // ---------------------------------------------------------
-                // Mode+dummy phase for multi-IO reads (0xBB and 0xEB)
-                // Dual 0xBB: 4 clocks (mode byte M[7:0])
-                // Quad 0xEB: 6 clocks (2 mode + 4 dummy)
-                // spi_prefetch posts the second burst during this phase.
+                // Mode/dummy phase for multi-IO reads. Legacy defaults:
+                // BB has 4 mode clocks, EB has 2 mode + 4 dummy clocks.
+                // Profile registers can change the total wait; Micron has
+                // dummy-only waits. Prefetch posts during the final clocks.
                 // ---------------------------------------------------------
                 else if (state == STA_MODE_MULTI) begin
                     // M5-4 arrive on IO1:IO0: in the first mode clock for
                     // quad (M7-4 on IO3:IO0), the second for dual.
-                    if (mode_count == (is_quad_read ? 3'd5 : 3'd2)) begin
+                    if (!is_micron && mode_count == transaction_wait - (is_quad_read ? 5'd1 : 5'd2)) begin
                         cont_read <= {spi_io1_in, spi_io0_in} == 2'b10;
                         cont_quad <= is_quad_read;
                         cont_4b <= io_read_4b;
+                        cont_wait <= transaction_wait;
                     end
                     if (mode_count == 0) begin
                         state <= STA_READ;
@@ -898,7 +916,9 @@ module spi_trx(
                         sfdp_raddr <= addr[6:0] + 1;
                     end
                     else if (bit_count_in == 0) begin
-                        miso_byte <= sfdp_rdata;
+                        // Compatibility profiles must not alias the header when
+                        // the 7-bit table RAM address wraps at byte 128.
+                        miso_byte <= (!cfg_profile_valid || addr < 32'd127) ? sfdp_rdata : 8'hff;
                         addr <= addr + 1;
                         log_byte_count <= log_byte_count + 1;
                     end
@@ -908,17 +928,77 @@ module spi_trx(
                 // Receives 1 byte (SR1) or 2 bytes (SR1 + SR2).
                 // ---------------------------------------------------------
                 else if (state == STA_WRITESTATUS && bit_count_in == 0) begin
+                    status_reg[1] <= 0;
                     if (addr_count == 0) begin
-                        // First byte: SR1 (preserve WEL/BUSY)
-                        status_reg[7:2] <= mosi_byte[7:2];
-                        status_reg[1] <= 0;  // Clear WEL after write
+                        case (status_write_index)
+                            0: status_reg[7:2] <= received_byte[7:2];
+                            1: status_reg2 <= received_byte;
+                            2: status_reg3 <= received_byte;
+                            default: ;
+                        endcase
                         addr_count <= 1;
+                        if (status_write_index != 0) state <= STA_IGNORE;
+                    end else if (addr_count == 1) begin
+                        status_reg2 <= received_byte; addr_count <= 2;
+                    end else if (addr_count == 2) begin
+                        status_reg3 <= received_byte; state <= STA_IGNORE;
                     end
-                    else if (addr_count == 1) begin
-                        // Second byte: SR2
-                        status_reg2 <= {mosi_byte[7:1], spi_io0_in};
-                        addr_count <= 2;
+                end
+                else if (state == STA_ANYWRITE && bit_count_in == 0) begin
+                    case (register_index)
+                        0: status_reg[7:2] <= received_byte[7:2];
+                        2: status_reg2 <= received_byte;
+                        3: begin status_reg3 <= received_byte; addr_4byte <= received_byte[7]; end
+                        4: config_reg3 <= received_byte;
+                        5: config_reg4 <= received_byte;
+                        6: config_reg5 <= received_byte;
+                        default: ;
+                    endcase
+                    status_reg[1] <= 0; state <= STA_IGNORE;
+                end
+                else if (state == STA_LEGACYID && bit_count_in == 0) begin
+                    miso_byte <= transaction_opcode == 8'hab || register_index[0] ?
+                        cfg_jedec_id[23:16]-8'd1 : cfg_jedec_id[7:0];
+                    register_index[0] <= !register_index[0];
+                end
+                else if (state == STA_CONFIGREAD && bit_count_in == 0) begin
+                    if (transaction_opcode == 8'hb5) begin
+                        miso_byte <= register_index[0] ? nvcr[7:0] : nvcr[15:8];
+                        register_index[0] <= !register_index[0];
+                    end else miso_byte <= config_byte;
+                end
+                else if (state == STA_CONFIGWRITE && bit_count_in == 0) begin
+                    status_reg[1] <= 0;
+                    if (transaction_opcode == 8'hb1) begin
+                        if (register_index[0]) begin
+                            nvcr[15:8] <= received_byte; state <= STA_IGNORE;
+                        end else begin nvcr[7:0] <= received_byte; register_index[0] <= 1; end
+                    end else begin
+                        if (transaction_opcode == 8'h81) vcr <= received_byte;
+                        else evcr <= received_byte;
+                        state <= STA_IGNORE;
                     end
+                end
+                else if (state == STA_REGWRITE && bit_count_in == 0) begin
+                    extended_address <= received_byte;
+                    if (address_flags[2] && ((transaction_opcode == 8'hc5 && address_flags[3]) ||
+                        (transaction_opcode == 8'h17 && address_flags[4]))) addr_4byte <= received_byte[7];
+                    status_reg[1] <= 0;
+                    state <= STA_IGNORE;
+                end
+                else if (state == STA_UID_DUMMY) begin
+                    if (uid_dummy == 0) begin
+                        state <= STA_UID_READ;
+                        spi_io1_oe_ff <= 1;
+                        miso_byte <= profile_byte(16);
+                        register_index <= 1;
+                    end else uid_dummy <= uid_dummy - 1'b1;
+                end
+                else if (state == STA_UID_READ && bit_count_in == 0) begin
+                    if (register_index < 8) begin
+                        miso_byte <= profile_uid[register_index[2:0]*8 +: 8];
+                        register_index <= register_index + 1'b1;
+                    end else miso_byte <= 8'hff;
                 end
                 
                 // ---------------------------------------------------------
@@ -931,8 +1011,10 @@ module spi_trx(
                     (state == STA_DUMMY && dummy_count == 0) ||
                     (state == STA_MODE_MULTI && mode_count == 0))
                     bit_count_in <= read_byte_top;
-                else
-                    bit_count_in <= bit_count_in - 1;
+                else if ((state == STA_WRITE && bit_count_in == 0) ||
+                         (state == STA_ADDR && addr_last && addr_kind == ADDR_KIND_WRITE && !is_aai))
+                    bit_count_in <= program_byte_top;
+                else bit_count_in <= bit_count_in - 1;
             end
         end
     end

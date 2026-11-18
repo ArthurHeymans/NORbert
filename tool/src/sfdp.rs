@@ -8,7 +8,8 @@
 //!   0x08..0x0F  Parameter Header 0 / BFPT (8 bytes)
 //!   0x10..0x4F  Basic Flash Parameter Table (16 DWORDs = 64 bytes)
 
-use crate::chip::{FlashChip, FlashChipExt, erase_block_size};
+use crate::chip::{Features, FlashChip, FlashChipExt, erase_block_size};
+use crate::profile::{ChipProfile, ChipState};
 use anyhow::{Result, bail};
 
 /// Size of the generated SFDP table in bytes.
@@ -19,8 +20,8 @@ const BFPT_DWORDS: u8 = 16; // JESD216A/B
 
 /// Generate the full SFDP table for a given chip.
 ///
-/// Chips that do not implement SFDP in real hardware (the SST25 AAI parts,
-/// see [`FlashChipExt::supports_sfdp`]) get an all-0xFF table.  A valid SFDP response would mislead
+/// Parts without explicit or known SFDP support, or with nonuniform addressed erasers,
+/// get an all-0xFF table (see [`FlashChipExt::supports_sfdp`]).  A valid SFDP response would mislead
 /// tools like flashprog that probe SFDP before consulting their chip
 /// table -- they would parse a fabricated signature and potentially
 /// override the correct hardcoded behavior.  Returning 0xFF (erased
@@ -50,6 +51,12 @@ pub fn generate_sfdp(chip: &FlashChip) -> Result<[u8; SFDP_TABLE_SIZE]> {
         }
     }
 
+    // A valid signature must never advertise geometry or framing that
+    // controller-compatible configuration cannot represent.
+    ChipProfile::build(chip, ChipState::default())?;
+    if chip.sector_erase_ops().len() > 4 {
+        bail!("SFDP supports at most four erase types");
+    }
     write_sfdp_header(&mut table);
     write_param_header(&mut table);
     write_bfpt(chip, &mut table);
@@ -101,11 +108,11 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     let has_4k_erase = chip
         .erase_blocks
         .iter()
-        .any(|erase| erase_block_size(erase) == Some(4096));
+        .any(|erase| !erase.is_chip_erase() && erase_block_size(erase) == Some(4096));
     let erase_4k_opcode = chip
         .erase_blocks
         .iter()
-        .find(|erase| erase_block_size(erase) == Some(4096))
+        .find(|erase| !erase.is_chip_erase() && erase_block_size(erase) == Some(4096))
         .map(|erase| erase.opcode)
         .unwrap_or(0xFF);
 
@@ -126,22 +133,26 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     if large_buffer {
         dw1 |= 1 << 2;
     }
-    // [3] WREN required for volatile SR write
-    dw1 |= 1 << 3;
-    // [4] WREN opcode: 1 = use 0x06 (standard)
-    dw1 |= 1 << 4;
+    // [3] SR is volatile-only; [4] its write-enable mechanism is WREN.
+    if chip.features.contains(Features::WRSR_VOLATILE_WREN) {
+        dw1 |= (1 << 3) | (1 << 4);
+    } else if chip.features.contains(Features::WRSR_EWSR)
+        && !chip.features.contains(Features::WRSR_WREN)
+    {
+        dw1 |= 1 << 3;
+    }
     // [7:5] Reserved = 111
     dw1 |= 0x07 << 5;
     // [15:8] 4KB erase opcode
     dw1 |= (erase_4k_opcode as u32) << 8;
-    // [17:16] Address bytes: 00=3-byte only, 01=3 or 4 byte
-    if chip.supports_4byte() {
-        dw1 |= 0x01 << 16;
+    // [18:17] Address bytes: 00=3-byte only, 01=3 or 4 byte
+    if chip.features.supports_4ba_mode_switch() {
+        dw1 |= 0x01 << 17;
     }
-    // [18] DTR: not supported
-    // [19] 1-1-2 Fast Read
+    // [19] DTR: not supported
+    // [16] 1-1-2 Fast Read
     if chip.supports_dual() {
-        dw1 |= 1 << 19;
+        dw1 |= 1 << 16;
     }
     // [20] 1-2-2 Fast Read
     if chip.supports_dual() {
@@ -174,9 +185,13 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     // 3rd DWORD: 1-4-4 and 1-1-4 Fast Read parameters
     // ------------------------------------------------------------------
     let dw3 = if chip.supports_quad() {
-        // 1-4-4 (0xEB): 4 dummy clocks after 2 mode clocks
-        let wait_144: u32 = 4; // dummy clocks
-        let mode_144: u32 = 2; // mode clocks
+        // Static default 1-4-4 (EB): Micron uses 10 dummy/no mode clocks;
+        // other families (including Macronix Config=0) use 4 dummy+2 mode.
+        let (wait_144, mode_144): (u32, u32) = if chip.jedec_manufacturer == 0x20 {
+            (10, 0)
+        } else {
+            (4, 2)
+        };
         let op_144: u32 = 0xEB;
         // 1-1-4 (0x6B): 8 dummy clocks, 0 mode clocks
         let wait_114: u32 = 8;
@@ -194,23 +209,27 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     put_dword(table, base + 8, dw3);
 
     // ------------------------------------------------------------------
-    // 4th DWORD: 1-2-2 and 1-1-2 Fast Read parameters
+    // 4th DWORD: 1-1-2 (low) and 1-2-2 (high) Fast Read parameters
     // ------------------------------------------------------------------
     let dw4 = if chip.supports_dual() {
-        // 1-2-2 (0xBB): 0 dummy clocks, 4 mode clocks
-        let wait_122: u32 = 0;
-        let mode_122: u32 = 4;
+        // Static default 1-2-2 (BB): Micron uses 8 dummy/no mode clocks;
+        // other families use 4 mode/no dummy clocks.
+        let (wait_122, mode_122): (u32, u32) = if chip.jedec_manufacturer == 0x20 {
+            (8, 0)
+        } else {
+            (0, 4)
+        };
         let op_122: u32 = 0xBB;
         // 1-1-2 (0x3B): 8 dummy clocks, 0 mode clocks
         let wait_112: u32 = 8;
         let mode_112: u32 = 0;
         let op_112: u32 = 0x3B;
-        (wait_122 & 0x1F)
-            | ((mode_122 & 0x07) << 5)
-            | (op_122 << 8)
-            | ((wait_112 & 0x1F) << 16)
-            | ((mode_112 & 0x07) << 21)
-            | (op_112 << 24)
+        (wait_112 & 0x1F)
+            | ((mode_112 & 0x07) << 5)
+            | (op_112 << 8)
+            | ((wait_122 & 0x1F) << 16)
+            | ((mode_122 & 0x07) << 21)
+            | (op_122 << 24)
     } else {
         0
     };
@@ -304,46 +323,32 @@ fn write_bfpt(chip: &FlashChip, table: &mut [u8; SFDP_TABLE_SIZE]) {
     // ------------------------------------------------------------------
     put_dword(table, base + 48, 0);
 
-    // ------------------------------------------------------------------
-    // 14th DWORD: Hold/Reset, Quad Enable requirements
-    //
-    // [3:0]  Hold/Reset disable (0 = not supported)
-    // [6:4]  Quad Enable Requirements:
-    //   000 = no QE bit (device has no quad)
-    //   001 = QE is bit 1 of SR2, set via 0x01 with 2 data bytes
-    //   010 = QE is bit 6 of SR1
-    //   011 = QE is bit 7 of SR2, set via 0x3E
-    //   100 = QE is bit 1 of SR2, set via 0x31
-    //   101 = QE is bit 1 of SR2, set via 0x01 with 2 data bytes (Winbond)
-    // [31:7] Reserved
-    // ------------------------------------------------------------------
-    let dw14 = if chip.supports_quad() {
-        // Use method 5 (0b101): QE = SR2 bit 1, write via 0x01 with 2 bytes
-        // This matches Winbond W25Q and many other common chips
-        0x05 << 4
-    } else {
-        0
-    };
-    put_dword(table, base + 52, dw14);
+    // DWORD14 does not contain QER. No HOLD/reset policy is advertised.
+    put_dword(table, base + 52, 0);
 
-    // ------------------------------------------------------------------
-    // 15th DWORD: 4-byte address mode entry/exit methods
-    //
-    // [7:0]  Entry methods (bitfield):
-    //   bit 1: issue 0xB7 to enter 4-byte mode
-    // [31:8] Exit methods
-    // ------------------------------------------------------------------
-    let dw15 = if chip.supports_4byte() {
-        0x02 // Enter via 0xB7 (EN4B)
-    } else {
-        0
-    };
-    put_dword(table, base + 56, dw15);
+    // DWORD15[22:20]: QER=0. The compatibility engine accepts SDR quad
+    // commands without gating on a physical chip's QE/protection policy.
+    put_dword(table, base + 56, 0);
 
-    // ------------------------------------------------------------------
-    // 16th DWORD: 4-byte address instruction support (0 = use mode switch)
-    // ------------------------------------------------------------------
-    put_dword(table, base + 60, 0);
+    // DWORD16: EN4B methods[31:24], EX4B[18:14] (JESD216/Linux).
+    // Native opcodes require a separate 4BAIT, which this BFPT does not emit.
+    let f = chip.features;
+    let mut dw16 = 0;
+    if f.contains(Features::FOUR_BYTE_ENTER) {
+        dw16 |= (1 << 24) | (1 << 14);
+    }
+    if f.contains(Features::FOUR_BYTE_ENTER_WREN) {
+        dw16 |= (1 << 25) | (1 << 15);
+    }
+    if f.contains(Features::FOUR_BYTE_ENTER_EAR7) {
+        if f.contains(Features::EXT_ADDR_REG_1716) {
+            dw16 |= (1 << 27) | (1 << 17);
+        }
+        if f.contains(Features::EXT_ADDR_REG_C5C8) {
+            dw16 |= (1 << 26) | (1 << 16);
+        }
+    }
+    put_dword(table, base + 60, dw16);
 }
 
 #[cfg(test)]
@@ -352,11 +357,189 @@ mod tests {
     use crate::chip::{ChipDatabase, find_chip_by_name};
 
     #[test]
-    fn sfdp_is_generated_unless_the_chip_predates_it() {
+    fn sfdp_signature_requires_conservative_presence() {
         let db = ChipDatabase::new();
         let signature =
             |name| generate_sfdp(find_chip_by_name(&db, name).unwrap()).unwrap()[..4].to_vec();
-        assert_eq!(signature("W25Q64JV-.Q"), b"SFDP");
+        assert_eq!(signature("W25Q128.V"), b"SFDP");
         assert_eq!(signature("SST25VF080B"), [0xFF; 4]);
+        assert_eq!(signature("AT25DF321"), [0xFF; 4]);
+        assert_eq!(signature("SST26VF032B(A)"), [0xFF; 4]);
+        assert_eq!(signature("AT25F512"), [0xFF; 4]);
+    }
+    // Field extraction intentionally follows Linux sfdp_bfpt_reads / JESD216,
+    // not generator helpers or the RTL's interpretation of BFPT positions.
+    fn dword(table: &[u8], number: usize) -> u32 {
+        let offset = 16 + (number - 1) * 4;
+        u32::from_le_bytes(table[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn winbond_bfpt_matches_known_independently_encoded_fixture() {
+        let db = ChipDatabase::new();
+        let chip = find_chip_by_name(&db, "W25Q128.V").unwrap();
+        let generated = generate_sfdp(chip).unwrap();
+        let fixture = include_bytes!("../tests/fixtures/w25q128-v.sfdp");
+        assert_eq!(&generated, fixture);
+        assert_eq!(&generated[..4], b"SFDP");
+        assert_eq!((dword(&generated, 1) >> 17) & 3, 0); // 3-byte only
+        assert_ne!(dword(&generated, 1) & (1 << 16), 0); // 1-1-2
+        assert_eq!(dword(&generated, 1) & (1 << 19), 0); // NO DTR
+        assert_eq!(dword(&generated, 2) + 1, chip.total_size * 8);
+        let dw4 = dword(&generated, 4);
+        assert_eq!((dw4 >> 8) & 255, 0x3b); // 112 low half
+        assert_eq!(dw4 & 31, 8);
+        assert_eq!((dw4 >> 24) & 255, 0xbb); // 122 high half
+        assert_eq!((dw4 >> 21) & 7, 4);
+        assert_eq!((dword(&generated, 11) >> 4) & 15, 8); // 256-byte pages
+        assert_eq!(dword(&generated, 14), 0); // QER is NOT DWORD14
+        assert_eq!((dword(&generated, 15) >> 20) & 7, 0);
+        assert_eq!(dword(&generated, 16), 0);
+    }
+
+    #[test]
+    fn micron_default_sdr_latency_is_parsed_independently_of_macronix_config() {
+        let db = ChipDatabase::new();
+        let mut chip = find_chip_by_name(&db, "W25Q128.V").unwrap().clone();
+        chip.total_size = 1024 * 1024;
+        chip.erase_blocks = vec![crate::chip::EraseBlock::with_count(0x20, 4096, 256)];
+        chip.features =
+            Features::SFDP | Features::FAST_READ | Features::DUAL_IO | Features::QUAD_IO;
+        // JESD216 BFPT read halfword: wait[4:0], mode[7:5], opcode[15:8].
+        // Parse output fields, not a regenerated golden or generator helper.
+        let read = |word: u32, upper: bool| {
+            let half = word >> if upper { 16 } else { 0 };
+            ((half >> 8) & 255, (half >> 5) & 7, half & 31)
+        };
+        for (manufacturer, expected_dual, expected_quad) in [
+            (0x20, (0xbb, 0, 8), (0xeb, 0, 10)),
+            (0xc2, (0xbb, 4, 0), (0xeb, 2, 4)),
+        ] {
+            chip.jedec_manufacturer = manufacturer;
+            let table = generate_sfdp(&chip).unwrap();
+            assert_eq!(&table[..4], b"SFDP"); // Small, uniform explicit-SFDP geometry.
+            assert_eq!(read(dword(&table, 4), true), expected_dual);
+            assert_eq!(read(dword(&table, 3), false), expected_quad);
+            assert_eq!(read(dword(&table, 4), false), (0x3b, 0, 8));
+            assert_eq!(read(dword(&table, 3), true), (0x6b, 0, 8));
+            if manufacturer == 0xc2 {
+                let profile = ChipProfile::build(
+                    &chip,
+                    ChipState {
+                        sr2: Some(0x47),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(profile.as_bytes()[13], 0x47);
+                // SFDP stays static default QuadIO=6, not Config47's runtime=4.
+                let (_, mode, wait) = read(dword(&table, 3), false);
+                assert_eq!(mode + wait, 6);
+            }
+        }
+    }
+
+    #[test]
+    fn address_methods_use_dword16_not_the_qer_word() {
+        let db = ChipDatabase::new();
+        let mut chip = find_chip_by_name(&db, "AT25DF321").unwrap().clone();
+        chip.unlock = rflasher_chips::Unlock::None;
+        chip.total_size = 32 * 1024 * 1024;
+        chip.erase_blocks = vec![crate::chip::EraseBlock::with_count(0x20, 4096, 8192)];
+        for (flag, expected) in [
+            (Features::FOUR_BYTE_ENTER, 0x01004000),
+            (Features::FOUR_BYTE_ENTER_WREN, 0x02008000),
+            (
+                Features::FOUR_BYTE_ENTER_EAR7 | Features::EXT_ADDR_REG_1716,
+                0x08020000,
+            ),
+            (
+                Features::FOUR_BYTE_ENTER_EAR7 | Features::EXT_ADDR_REG_C5C8,
+                0x04010000,
+            ),
+        ] {
+            chip.features = Features::SFDP | Features::FOUR_BYTE_ADDR | flag;
+            let generated = generate_sfdp(&chip).unwrap();
+            assert_eq!((dword(&generated, 1) >> 17) & 3, 1);
+            assert_eq!(dword(&generated, 1) & ((1 << 16) | (1 << 19)), 0);
+            assert_eq!(dword(&generated, 15), 0);
+            assert_eq!(dword(&generated, 16), expected);
+        }
+    }
+
+    #[test]
+    fn broad_catalog_sfdp_remains_conservative_and_reports_sdr_geometry() {
+        let db = ChipDatabase::new();
+        for name in [
+            "N25Q256",
+            "MX25L12833F",
+            "GD25Q128",
+            "S25FL128L",
+            "IS25LP128",
+        ] {
+            let mut chip = find_chip_by_name(&db, name).unwrap().clone();
+            // Explicit metadata permits synthesis; catalog absence is not guessed.
+            chip.features |= Features::SFDP;
+            let table = generate_sfdp(&chip).unwrap();
+            assert_eq!(&table[..4], b"SFDP", "{name}");
+            assert_eq!(dword(&table, 2) + 1, chip.total_size * 8);
+            assert_eq!(
+                (dword(&table, 11) >> 4) & 15,
+                chip.page_size.trailing_zeros()
+            );
+            assert_eq!(dword(&table, 1) & (1 << 19), 0); // No DTR.
+            assert_eq!(dword(&table, 5), 0); // No QPI/command-lane modes.
+            assert_eq!(dword(&table, 15), 0); // No QE gating.
+        }
+        let mut chip = find_chip_by_name(&db, "N25Q256").unwrap().clone();
+        chip.features |= Features::SFDP;
+        let table = generate_sfdp(&chip).unwrap();
+        assert_eq!((dword(&table, 1) >> 17) & 3, 1);
+        assert_eq!(dword(&table, 16), 0x02008000); // WREN+B7/E9, not native 4BAIT.
+        chip.page_size = 512;
+        assert!(generate_sfdp(&chip).is_err());
+        chip.page_size = 256;
+        chip.features.remove(
+            Features::FOUR_BYTE_ENTER
+                | Features::FOUR_BYTE_ENTER_WREN
+                | Features::FOUR_BYTE_ENTER_EAR7,
+        );
+        assert_eq!(generate_sfdp(&chip).unwrap(), [0xff; SFDP_TABLE_SIZE]);
+    }
+
+    #[test]
+    fn byte_granularity_metadata_does_not_advertise_page_buffer_programming() {
+        let db = ChipDatabase::new();
+        let mut chip = find_chip_by_name(&db, "W25Q128.V").unwrap().clone();
+        assert!(!chip.features.contains(Features::WRITE_BYTE));
+        chip.write_granularity = rflasher_chips::WriteGranularity::Byte;
+        let table = generate_sfdp(&chip).unwrap();
+        assert_eq!(dword(&table, 1) & (1 << 2), 0);
+        chip.write_granularity = rflasher_chips::WriteGranularity::Page;
+        let table = generate_sfdp(&chip).unwrap();
+        assert_ne!(dword(&table, 1) & (1 << 2), 0);
+    }
+
+    #[test]
+    fn nonuniform_erasers_never_get_a_fabricated_uniform_bfpt() {
+        let db = ChipDatabase::new();
+        let mut chip = find_chip_by_name(&db, "SST26VF032B(A)").unwrap().clone();
+        chip.features |= Features::SFDP;
+        assert_eq!(generate_sfdp(&chip).unwrap(), [0xff; SFDP_TABLE_SIZE]);
+        assert!(crate::chip::erase_block_size(&chip.erase_blocks[1]).is_none());
+        assert_eq!(chip.sector_erase_ops().len(), 2); // retain boot eraser for profile
+    }
+    #[test]
+    fn chip_erase_is_never_advertised_as_addressed_4k_erase() {
+        let db = ChipDatabase::new();
+        let mut chip = find_chip_by_name(&db, "AT25DF321").unwrap().clone();
+        chip.unlock = rflasher_chips::Unlock::None;
+        chip.features = Features::SFDP;
+        chip.total_size = 4096;
+        chip.erase_blocks = vec![crate::chip::EraseBlock::new(0xc7, 4096)];
+        let table = generate_sfdp(&chip).unwrap();
+        assert_eq!(dword(&table, 1) & 3, 3);
+        assert_eq!((dword(&table, 1) >> 8) & 255, 255);
+        assert_eq!(dword(&table, 8), 0);
     }
 }

@@ -1,0 +1,7 @@
+{
+  "chip": "SST26VF032B(A)",
+  "jedec": [191, 38, 66],
+  "capacity_bytes": 4194304,
+  "profile_hex": "sst26vf032b.profile.hex",
+  "initial_state": "unprotected compatibility default"
+}

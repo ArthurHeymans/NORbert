@@ -250,7 +250,12 @@ fn cmd_dump(cli: &Cli, file: &Path, address: u32, length: u32) -> Result<()> {
     cmd_read(cli, address, length, Some(file.to_path_buf()))
 }
 
-fn cmd_configure(cli: &Cli, chip_db_path: Option<&Path>, chip_name: &str) -> Result<()> {
+fn cmd_configure(
+    cli: &Cli,
+    chip_db_path: Option<&Path>,
+    chip_name: &str,
+    state: crate::profile::ChipState,
+) -> Result<()> {
     let chip_db_path = chip_db_path.map(|path| {
         let path_string = path.to_string_lossy();
         if let Some(stripped) = path_string.strip_prefix("~/") {
@@ -303,9 +308,8 @@ fn cmd_configure(cli: &Cli, chip_db_path: Option<&Path>, chip_name: &str) -> Res
         }
     }
 
-    // Generate SFDP table.  For chips that predate SFDP (the SST25 AAI
-    // parts), the table is all-0xFF so SFDP probes see no valid signature,
-    // matching the real part.
+    // Reject unsupported geometry/state before opening a hardware connection.
+    crate::profile::ChipProfile::build(chip, state)?;
     let sfdp_table = sfdp::generate_sfdp(chip).context("Failed to generate SFDP table")?;
     if chip.supports_sfdp() {
         eprintln!("  SFDP table: {} bytes (valid)", sfdp_table.len());
@@ -319,12 +323,7 @@ fn cmd_configure(cli: &Cli, chip_db_path: Option<&Path>, chip_name: &str) -> Res
     // Send to FPGA.  Must be stopped while CHIPCONFIG is processed,
     // otherwise spi_trx could read inconsistent cfg_* values mid-transfer.
     let mut device = open_device(cli)?;
-    device.configure(
-        chip.jedec_id_bytes(),
-        chip.total_size,
-        chip.supports_4byte(),
-        &sfdp_table,
-    )?;
+    device.configure_chip(chip, state)?;
 
     eprintln!("Configuration applied successfully.");
     Ok(())
@@ -480,7 +479,21 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
             address,
             length,
         } => cmd_dump(cli, file, *address, *length),
-        Commands::Configure { chip_db, chip } => cmd_configure(cli, chip_db.as_deref(), chip),
+        Commands::Configure {
+            chip_db,
+            chip,
+            protected,
+            uid,
+        } => cmd_configure(
+            cli,
+            chip_db.as_deref(),
+            chip,
+            crate::profile::ChipState {
+                protected: *protected,
+                uid: *uid,
+                ..Default::default()
+            },
+        ),
         Commands::Hold { state } => cmd_hold(cli, *state),
         Commands::Monitor => cmd_monitor(cli),
         Commands::Toctou { action } => cmd_toctou(cli, action),
