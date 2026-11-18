@@ -598,7 +598,27 @@ module quad_fast_tb;
         repeat (4) @(negedge clk); reset = 0;
         repeat (13000) @(negedge clk); // SDRAM init (both chips)
 
-        // Sanity: slow read at 30MHz, aligned.
+        // Abort quad I/O after the last address nibble, before SCK resumes.
+        // Starting at a bank's last byte forces the pair to open a different
+        // bank. Sweep CS phase across its ACTIVATE-to-READ interval.
+        cfg_4byte = 1;
+        sclk_half = 7.143;
+        for (integer delay_ns = 1; delay_ns <= 40; delay_ns++) begin
+            automatic logic [31:0] crossing = 32'h3ff + 32'(delay_ns) * 32'h1000;
+            select_spi;
+            send_byte(8'hec);
+            for (integer i = 28; i >= 0; i -= 4) send_quad_nibble(crossing[i +: 4]);
+            /* verilator lint_off ZERODLY */
+            #(delay_ns); cs = 1;
+            /* verilator lint_on ZERODLY */
+            #1000;
+        end
+        cfg_4byte = 0;
+        ref_before = refreshes;
+        #8000;
+        if (refreshes == ref_before) $fatal(1, "no refresh after CS aborted a burst pair");
+
+        // The next SPI read must work without a controller reset.
         sclk_half = 16.667;
         read_check(9'h03, 32'h001000, 16);
 

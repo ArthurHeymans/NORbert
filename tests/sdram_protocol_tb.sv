@@ -12,7 +12,8 @@ module sdram_protocol_tb;
     always #4.167 clk = ~clk;
     reg reset = 1;
     reg spi_active = 0, spi_inhibit = 0, spi_activate = 0, spi_read = 0;
-    reg [22:0] spi_addr = 0;
+    reg spi_pair = 0;
+    reg [22:0] spi_addr = 0, spi_addr2 = 0;
     reg [1:0] access_cmd = 0;
     reg [24:0] access_addr = 0;
     wire ras, cas, we, chip, busy, accept, read_busy;
@@ -25,7 +26,7 @@ module sdram_protocol_tb;
         .spi_active(spi_active), .spi_inhibit_refresh(spi_inhibit),
         .spi_cmd_activate(spi_activate), .spi_cmd_read(spi_read),
         .spi_cmd_post_toggle(1'b0), .spi_addr(spi_addr),
-        .spi_cmd_pair(1'b0), .spi_addr2(23'h0),
+        .spi_cmd_pair(spi_pair), .spi_addr2(spi_addr2),
         .access_cmd(access_cmd), .access_addr(access_addr), .inhibit_refresh(1'b0),
         .cmd_busy(busy), .access_accept(accept), .read_buffer(read_buffer),
         .read_busy(read_busy), .write_buffer(64'h0),
@@ -38,16 +39,24 @@ module sdram_protocol_tb;
     // Command trace, so ordering between the two clients can be asserted.
     integer cycle = 0, last_spi_activate = -1, last_spi_read = -1;
     integer last_serial_access = -1, last_precharge = -1;
+    integer last_pair_read = -1, last_pair_activate = -1, last_pair_precharge = -1;
+    wire pair_bank = {chip, bank} == {spi_addr2[22], spi_addr2[8:7]};
     always @(negedge clk) begin
         cycle++;
         case ({ras, cas, we})
-            3'b011: if (a == spi_addr[21:9] && bank == spi_addr[8:7]) last_spi_activate = cycle;
-            // A serial READ sets serial_read_active at dispatch; an SPI
-            // READ clears it. WRITEs are serial only.
+            3'b011: begin
+                if (a == spi_addr[21:9] && bank == spi_addr[8:7]) last_spi_activate = cycle;
+                if (pair_bank && a == spi_addr2[21:9] && last_pair_activate < 0)
+                    last_pair_activate = cycle;
+            end
             3'b101: if (ram.serial_read_active) last_serial_access = cycle;
+                    else if (pair_bank && a[8:2] == spi_addr2[6:0]) last_pair_read = cycle;
                     else last_spi_read = cycle;
             3'b100: last_serial_access = cycle;
-            3'b010: last_precharge = cycle;
+            3'b010: begin
+                last_precharge = cycle;
+                if (chip == spi_addr2[22] && (pair_bank || a[10])) last_pair_precharge = cycle;
+            end
             default: ;
         endcase
     end
@@ -67,7 +76,7 @@ module sdram_protocol_tb;
     endtask
 
     task spi_idle;
-        spi_activate = 0; spi_read = 0; spi_inhibit = 0; spi_active = 0;
+        spi_activate = 0; spi_read = 0; spi_pair = 0; spi_inhibit = 0; spi_active = 0;
         tick(40);
     endtask
 
@@ -151,7 +160,44 @@ module sdram_protocol_tb;
             $fatal(1, "serial access was not ordered after the SPI READ");
         spi_idle;
 
-        $display("PASS SDRAM PROTOCOL: withdrawn SPI rows closed, SPI/serial row interlock (%0d ACT, %0d PRE, %0d REF)",
+        // 5. The pair is already ready when the first READ dispatches,
+        //    as can happen after a delayed READ. At a chip boundary its
+        //    ACTIVATE used to be followed by a premature PRECHARGE when
+        //    the pair READ had to wait for the first chip's data.
+        quiet;
+        spi_addr = 23'h3fffff;
+        spi_addr2 = 23'h400000;
+        last_spi_read = -1; last_pair_read = -1; last_pair_activate = -1; last_pair_precharge = -1;
+        spi_select; spi_inhibit = 1; spi_activate = 1; spi_pair = 1;
+        tick(16); spi_read = 1;
+        tick(30);
+        if (last_spi_read < 0 || last_pair_activate <= last_spi_read ||
+            last_pair_read <= last_pair_activate || last_pair_read - last_spi_read < 7)
+            $fatal(1, "cross-chip pair READ must wait for the first BL4/CAS2 READ to drain");
+        if (last_pair_precharge > last_pair_activate)
+            $fatal(1, "cross-chip pair precharged its own row while waiting for DQ");
+        spi_idle;
+
+        // 6. A serial ACTIVATE wins before the pair is ready. The pair
+        //    targets the same bank but must not close the serial row.
+        quiet;
+        spi_addr = {1'b0, 13'h0710, 2'd0, 7'h7f};
+        spi_addr2 = 23'(spi_addr + 1);
+        last_spi_read = -1; last_pair_read = -1; last_pair_activate = -1;
+        spi_select; spi_inhibit = 1; spi_activate = 1; spi_read = 1;
+        while (last_spi_read < 0) @(negedge clk);
+        serial_post(2'b11, {1'b0, 13'h0711, 2'd1, 9'h100});
+        spi_pair = 1;
+        tick(20);
+        if (last_pair_read >= 0 || last_pair_activate >= 0)
+            $fatal(1, "SPI pair dispatched under an open serial row");
+        serial_post(2'b01, {1'b0, 13'h0711, 2'd1, 9'h100});
+        tick(30);
+        if (last_pair_activate <= last_serial_access || last_pair_read <= last_pair_activate)
+            $fatal(1, "SPI burst pair did not resume after serial access");
+        spi_idle;
+
+        $display("PASS SDRAM PROTOCOL: withdrawn rows closed, SPI/serial interlock, burst pairs (%0d ACT, %0d PRE, %0d REF)",
                  banks.activates, banks.precharges, banks.refreshes);
         $finish;
     end

@@ -334,7 +334,11 @@ module sdram(
     reg auto_hit_fresh;      // auto_hit already reflects auto_addr
     reg auto_opened;         // Pair ACTIVATE issued, its READ not yet
     wire [2:0] auto_idx = {auto_addr[22], auto_addr[8:7]};
-    wire auto_go = auto_ready && auto_hit_fresh && spi_txn_read_done;
+    // Once ACTIVATE has issued, finish the pair even if CS goes high.
+    // Otherwise cancel on the deselect edge before accepting a new pair
+    // command. A serial ACTIVATE owns its row until its own access.
+    wire auto_go = auto_ready && auto_hit_fresh && !serial_row_open &&
+                   (auto_opened || (spi_txn_read_done && !spi_deselect_event));
 
     // A refresh may dispatch (modulo closing open rows first) under the
     // same conditions as the hard/soft dispatch branches below, except
@@ -390,6 +394,7 @@ module sdram(
     // after a READ: a PRECHARGE there never truncates the burst.
     wire rd_inflight = |rd_pipe[RD_STAGES-2:0];
     reg last_read_chip;
+    wire auto_bus_ready = !rd_inflight || last_read_chip == auto_addr[22];
     wire [3:0] beat_stage = rd_pipe[RD_BEAT0 +: 4];
     wire beat_any = |beat_stage;
     wire [1:0] beat_k = beat_stage[0] ? 2'd0 : beat_stage[1] ? 2'd1 :
@@ -860,8 +865,19 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
-                else if (auto_go && auto_hit &&
-                         (!rd_inflight || last_read_chip == auto_addr[22])) begin
+                else if (auto_go && auto_hit && !auto_bus_ready) begin
+                    // A cross-chip READ waits for the shared DQ bus; its
+                    // row may already be open or have been opened while the
+                    // first READ drained. Do not precharge that row or let
+                    // another client pass the pair.
+                    state <= STA_IDLE;
+                    cmdtarget <= 1;
+                    cmd_wait <= 0;
+                    ras_o <= 1;
+                    cas_o <= 1;
+                    we_o <= 1;
+                end
+                else if (auto_go && auto_hit) begin
                     // Burst pair READ, row open: streams right behind the
                     // first burst (no auto-precharge, like any SPI READ).
                     state <= STA_READ;
@@ -871,7 +887,7 @@ module sdram(
                     auto_pending <= 0;
                     auto_ready <= 0;
                     auto_opened <= 0;
-                    spi_pair_read_done <= 1;
+                    spi_pair_read_done <= spi_active_buf[1];
                     rd_pipe[0] <= 1;
                     rd_tag_b[0] <= fill_sel;
                     rd_tag_serial[0] <= 0;
@@ -892,10 +908,9 @@ module sdram(
                     dqm_o <= 2'b00;
                 end
                 else if (auto_go && open_valid[auto_idx]) begin
-                    // Pair burst in a bank holding another row: close it.
-                    // That row was opened before the first burst's READ
-                    // dispatched, so tRAS is met, and a PRECHARGE BURST_LEN
-                    // after a READ never truncates its data.
+                    // Close a different row in the target bank. A pair's
+                    // own ACTIVATE hits above; never precharge it while
+                    // its READ waits for the bus.
                     state <= STA_ROW_PRECHARGE;
                     cmdtarget <= tRP;
                     cmd_wait <= tRP > 1;
