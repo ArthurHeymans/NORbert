@@ -169,6 +169,7 @@ module sdram(
         STA_INIT_PRECHARGE2 = 10,
         STA_INIT_REFRESH2      = 11,
         STA_SETMODE2           = 12,
+        STA_ROW_PRECHARGE      = 13,  // Wait tRP after closing an open row
         STA_SPI_ABORT_WAIT     = 14,  // Wait tRAS before closing an abandoned row
         STA_SPI_ABORT_PRECHARGE = 15; // Precharge row opened by an aborted SPI read
 
@@ -256,13 +257,42 @@ module sdram(
     // the command/read-buffer dispatch path. Predict the increment so the
     // flags describe the same elapsed time as refreshcount after each edge.
     reg refresh_due, hard_refresh_due;
-    // At most one client may hold a row between its ACTIVATE and the
-    // auto-precharged READ/WRITE. The SPI fast path outranks serial
-    // requests, so both directions are interlocked explicitly: an SPI
-    // post cannot open a bank under a serial pair, and a serial request
-    // or refresh cannot run while an SPI row waits for its READ.
+    // At most one client may hold a row between its ACTIVATE and its
+    // READ/WRITE dispatch. The SPI fast path outranks serial requests,
+    // so both directions are interlocked explicitly: an SPI post cannot
+    // open a bank under a serial pair, and a serial request or refresh
+    // cannot run while an SPI row waits for its READ.
     reg serial_row_open;
     wire spi_row_idle;
+
+    // Open-row tracking: SPI READs leave their row open (no
+    // auto-precharge), so a following burst in the same row skips
+    // ACTIVATE and tRCD entirely. One row per bank is tracked, indexed
+    // {chip, bank}. With the address map below a sequential stream stays
+    // in one bank row for 1KB, so it misses once per bank switch.
+    // Serial accesses and refresh close what they need first (one bank,
+    // or precharge-all for refresh). Serial READ/WRITE keep
+    // auto-precharge and clear their bank's record at dispatch.
+    reg [12:0] open_rows [0:7];
+    reg [7:0] open_valid;
+    wire [2:0] spi_open_idx = {spi_addr[22], spi_addr[8:7]};
+    // The SPI ACTIVATE decision uses registered row lookups, keeping the
+    // redirect mux and the row compare out of the dispatch path. spi_addr
+    // is valid one system clock before its synchronized post arrives
+    // (bundled-data contract). A redirect decision changes it, so posts
+    // also wait out the clock after redirect_pending; and every command
+    // that changes the open-row records waits >= 2 clocks, so the lookup
+    // is current whenever dispatch evaluates.
+    reg spi_row_hit, spi_bank_open, spi_redirect_settle;
+    wire [3:0] refresh_open = refresh_chip ? open_valid[7:4] : open_valid[3:0];
+    // A refresh may dispatch (modulo closing open rows first) under the
+    // same conditions as the hard/soft dispatch branches below.
+    // An open serial row is never closed for refresh, independent of the
+    // client's inhibit hint (its READ/WRITE auto-precharges it).
+    wire refresh_wanted = !serial_row_open && (
+        (hard_refresh_due && access_cmd == 0 &&
+         (!spi_activate_done || spi_cmd_read_ack)) ||
+        (refresh_due && !do_inhibit_refresh && spi_row_idle));
     
     // Address decoding for MT48LC16M16A2 (2 × 32MB = 64MB)
     // SPI path: 23-bit burst address
@@ -330,6 +360,10 @@ module sdram(
             hard_refresh_due <= 0;
             refresh_chip <= 0;
             serial_row_open <= 0;
+            open_valid <= 0;
+            spi_row_hit <= 0;
+            spi_bank_open <= 0;
+            spi_redirect_settle <= 0;
             
             read_buffer <= 0;
             read_buffer_b <= 0;
@@ -418,6 +452,10 @@ module sdram(
             // A post always precedes its fill by ~10 sysclks, so
             // invalidating here can never clobber a completed fill.
             spi_post_sync <= {spi_post_sync[1:0], spi_cmd_post_toggle};
+            spi_row_hit <= open_valid[spi_open_idx] &&
+                           open_rows[spi_open_idx] == spi_addr[21:9];
+            spi_bank_open <= open_valid[spi_open_idx];
+            spi_redirect_settle <= spi_redirect_pending;
             if (spi_post_sync[1] ^ spi_post_sync[2]) begin
                 if (post_fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
                 else begin read_valid_a <= 0; read_beats_a <= 0; end
@@ -656,6 +694,7 @@ module sdram(
                     cmdtarget <= tRP;
                     cmd_wait <= tRP > 1;
                     spi_activate_done <= 0;
+                    open_valid[{spi_chip_sel, spi_bank}] <= 0;
 
                     cs_o <= spi_chip_sel;
                     ras_o <= 0;
@@ -666,7 +705,7 @@ module sdram(
                     a_o[10] <= 0;
                     dqm_o <= 2'b11;
                 end
-                else if (state == STA_SPI_ABORT_PRECHARGE) begin
+                else if (state == STA_SPI_ABORT_PRECHARGE || state == STA_ROW_PRECHARGE) begin
                     state <= STA_IDLE;
                     cmdtarget <= 1;
                     cmd_wait <= 0;
@@ -701,8 +740,29 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
+                else if (refresh_wanted && refresh_open != 0) begin
+                    // Refresh needs every bank of its chip closed; close
+                    // them with one precharge-all and let refresh dispatch
+                    // after tRP. refresh_wanted excludes a row still
+                    // between ACTIVATE and READ (the replay branch above
+                    // owns that case), and dispatch only runs after the
+                    // previous burst completed, so tRAS is satisfied.
+                    state <= STA_ROW_PRECHARGE;
+                    cmdtarget <= tRP;
+                    cmd_wait <= tRP > 1;
+                    if (refresh_chip) open_valid[7:4] <= 0;
+                    else open_valid[3:0] <= 0;
+                    cs_o <= refresh_chip;
+                    ras_o <= 0;
+                    cas_o <= 1;
+                    we_o <= 0;
+                    ba_o <= 0;
+                    a_o <= 0;
+                    a_o[10] <= 1;
+                    dqm_o <= 2'b11;
+                end
                 else if (hard_refresh_due && !serial_row_open && access_cmd == 0 &&
-                         (!spi_activate_done || spi_cmd_read_ack)) begin
+                         (!spi_activate_done || spi_cmd_read_ack) && refresh_open == 0) begin
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;
                     cmd_wait <= tRC > 1;
@@ -717,7 +777,54 @@ module sdram(
                     dqm_o <= 2'b11;
                 end
                 else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
-                         !serial_row_open && !spi_redirect_pending) begin
+                         !serial_row_open && !spi_redirect_pending && !spi_redirect_settle &&
+                         spi_row_hit) begin
+                    // SPI fast-path activate, row already open: acknowledge
+                    // without issuing ACTIVATE; READ may dispatch next cycle
+                    // (saves the ACTIVATE command and tRCD).
+                    state <= STA_IDLE;
+                    cmdtarget <= 1;
+                    cmd_wait <= 0;
+                    spi_cmd_activate_ack <= 1;
+                    spi_activate_done <= 1;
+                    spi_addr_latched <= spi_addr;
+                    spi_act_armed <= 0;
+                    if (fill_reset_armed) begin
+                        fill_sel <= 0;
+                        post_fill_sel <= 1;
+                        read_valid_a <= 0;
+                        read_valid_b <= 0;
+                        read_beats_a <= 0;
+                        read_beats_b <= 0;
+                        fill_reset_armed <= 0;
+                    end
+                    ras_o <= 1;
+                    cas_o <= 1;
+                    we_o <= 1;
+                    dqm_o <= 2'b11;
+                end
+                else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
+                         !serial_row_open && !spi_redirect_pending && !spi_redirect_settle &&
+                         spi_bank_open) begin
+                    // A different row is open in this bank: close it first.
+                    // Not an acceptance: the post levels stay up and
+                    // ACTIVATE dispatches after tRP. The previous burst
+                    // completed before this dispatch point, so tRAS is met.
+                    state <= STA_ROW_PRECHARGE;
+                    cmdtarget <= tRP;
+                    cmd_wait <= tRP > 1;
+                    open_valid[spi_open_idx] <= 0;
+                    cs_o <= spi_addr[22];
+                    ras_o <= 0;
+                    cas_o <= 1;
+                    we_o <= 0;
+                    ba_o <= spi_addr[8:7];
+                    a_o <= 0;
+                    a_o[10] <= 0;
+                    dqm_o <= 2'b11;
+                end
+                else if (spi_cmd_activate_buf[1] && !spi_cmd_activate_ack && spi_act_armed &&
+                         !serial_row_open && !spi_redirect_pending && !spi_redirect_settle) begin
                     // SPI fast-path activate
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
@@ -726,6 +833,8 @@ module sdram(
                     spi_activate_done <= 1;
                     spi_addr_latched <= spi_addr;
                     spi_act_armed <= 0;
+                    open_rows[spi_open_idx] <= spi_addr[21:9];
+                    open_valid[spi_open_idx] <= 1;
                     if (fill_reset_armed) begin
                         fill_sel <= 0;
                         post_fill_sel <= 1;
@@ -761,7 +870,8 @@ module sdram(
                     if (fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
                     else begin read_valid_a <= 0; read_beats_a <= 0; end
 
-                    // READ command with auto-precharge
+                    // READ command, no auto-precharge: the row stays open
+                    // for the next burst (see open-row tracking above).
                     cs_o <= spi_chip_sel;
                     ras_o <= 1;
                     cas_o <= 0;
@@ -769,14 +879,34 @@ module sdram(
                     ba_o <= spi_bank;
                     a_o <= 0;
                     a_o[8:0] <= spi_col;     // 9-bit column, burst-4 aligned
-                    a_o[10] <= 1;            // Auto precharge
+                    a_o[10] <= 0;
                     dq_oe_o <= 0;
                     dqm_o <= 2'b00;
+                end
+                else if (access_cmd == 2'b11 && spi_row_idle &&
+                         open_valid[{access_chip_sel, access_bank}]) begin
+                    // Close the row left open in the serial target bank
+                    // first; not an acceptance (the client holds its
+                    // request until the ACTIVATE below dispatches).
+                    state <= STA_ROW_PRECHARGE;
+                    cmdtarget <= tRP;
+                    cmd_wait <= tRP > 1;
+                    open_valid[{access_chip_sel, access_bank}] <= 0;
+                    cs_o <= access_chip_sel;
+                    ras_o <= 0;
+                    cas_o <= 1;
+                    we_o <= 0;
+                    ba_o <= access_bank;
+                    a_o <= 0;
+                    a_o[10] <= 0;
+                    dqm_o <= 2'b11;
                 end
                 else if (access_cmd == 2'b11 && spi_row_idle) begin
                     // Serial path activate
                     access_accept <= 1;
                     serial_row_open <= 1;
+                    open_rows[{access_chip_sel, access_bank}] <= access_row;
+                    open_valid[{access_chip_sel, access_bank}] <= 1;
                     state <= STA_ACTIVATE;
                     cmdtarget <= tRCD;
                     cmd_wait <= tRCD > 1;
@@ -791,9 +921,10 @@ module sdram(
                     a_o <= access_row;
                 end
                 else if (access_cmd == 2'b01 && spi_row_idle) begin
-                    // Serial path read
+                    // Serial path read (auto-precharge closes its row)
                     access_accept <= 1;
                     serial_row_open <= 0;
+                    open_valid[{access_chip_sel, access_bank}] <= 0;
                     state <= STA_READ;
                     cmdtarget <= tREAD + 2;
                     cmd_wait <= (tREAD + 5'd2) > 1;
@@ -815,9 +946,10 @@ module sdram(
                     dqm_o <= 2'b00;
                 end
                 else if (access_cmd == 2'b10 && spi_row_idle) begin
-                    // Serial path write
+                    // Serial path write (auto-precharge closes its row)
                     access_accept <= 1;
                     serial_row_open <= 0;
+                    open_valid[{access_chip_sel, access_bank}] <= 0;
                     state <= STA_WRITE;
                     cmdtarget <= tWRITE;
                     cmd_wait <= tWRITE > 1;
@@ -838,7 +970,7 @@ module sdram(
                     dq_o <= write_buffer[15:0];
                     dqm_o <= 2'b00;
                 end
-                else if (refresh_due && !do_inhibit_refresh && spi_row_idle) begin
+                else if (refresh_due && !do_inhibit_refresh && spi_row_idle && refresh_open == 0) begin
                     // Auto refresh - alternate between chips
                     state <= STA_REFRESH;
                     cmdtarget <= tRC;

@@ -15,6 +15,7 @@ module refresh_tb;
     reg spi_active = 0, spi_inhibit = 0, spi_activate = 0, spi_read = 0;
     wire ras, cas, we, chip;
     wire [1:0] bank;
+    wire [12:0] addr_bus;
     wire [15:0] dq;
     assign dq = 16'ha55a;
 
@@ -38,7 +39,7 @@ module refresh_tb;
         .access_cmd(access), .access_addr(address), .inhibit_refresh(inhibit),
         .cmd_busy(busy), .access_accept(accept), .read_buffer(read_buffer), .read_busy(read_busy),
         .write_buffer(write_buffer), .ras_o(ras), .cas_o(cas), .we_o(we),
-        .cs_o(chip), .ba_o(bank));
+        .cs_o(chip), .ba_o(bank), .a_o(addr_bus));
 
     integer cycles = 0, refreshes = 0, last_refresh [0:1];
     integer replies = 0, activates = 0, reads = 0, refresh_before;
@@ -47,7 +48,8 @@ module refresh_tb;
     always @(negedge clk) begin
         cycles++;
         if (checking) begin
-            // Auto-precharged accesses complete before the next dispatch.
+            // Accesses complete before the next dispatch; only an
+            // auto-precharged access (A10) closes its bank.
             case ({ras, cas, we})
                 3'b011: begin
                     if (row_open[chip][bank]) $fatal(1, "ACTIVATE to open bank");
@@ -56,10 +58,14 @@ module refresh_tb;
                 end
                 3'b101, 3'b100: begin
                     if (!row_open[chip][bank]) $fatal(1, "Access without ACTIVATE");
-                    row_open[chip][bank] = 0;
+                    if (addr_bus[10]) row_open[chip][bank] = 0;
                     reads++;
                 end
-                3'b010: row_open[chip][bank] = 0;
+                3'b010: begin
+                    if (addr_bus[10]) begin
+                        for (integer b = 0; b < 4; b++) row_open[chip][b] = 0;
+                    end else row_open[chip][bank] = 0;
+                end
                 3'b001: begin
                     for (integer b = 0; b < 4; b++)
                         if (row_open[chip][b]) $fatal(1, "REFRESH with open bank");
