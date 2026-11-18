@@ -36,6 +36,8 @@ module spi_trx(
     output wire ram_continuation,
     output wire ram_post_toggle,
     output wire [22:0] ram_addr,       // 23-bit burst address for 64MB
+    output wire ram_pair,              // Address done: fetch ram_addr2 too
+    output wire [22:0] ram_addr2,      // Second burst of an array read
     input wire [63:0] ram_read_buffer,
     input wire [63:0] ram_read_buffer_b,
     input wire ram_read_valid_a,
@@ -323,12 +325,9 @@ module spi_trx(
         .first_read(addr_read && addr_count == 3),
         .first_col({addr[5:0], addr_lane_msb}),
         .first_done(addr_read && addr_last && !addr_dual && !addr_quad),
-        .post_lookahead((state == STA_DUMMY && dummy_count == 5 && !is_sfdp_read) ||
-                        (state == STA_MODE_MULTI && mode_count == 1)),
+        .addr_end(addr_read && addr_last),
         .drop((state == STA_MODE_MULTI && mode_count == 3) ||
               (in_read && addr[2:0] == 6 && bit_count_in == 0)),
-        .mode_end(state == STA_MODE_MULTI && mode_count == 0),
-        .fallback(in_read && addr[2:0] == 7 && bit_count_in == read_byte_top),
         .burst_end(in_read && addr[2:0] == 7 && bit_count_in == 0),
         .ram_inhibit_refresh(ram_inhibit_refresh),
         .ram_activate(ram_activate),
@@ -336,6 +335,8 @@ module spi_trx(
         .ram_continuation(ram_continuation),
         .ram_post_toggle(ram_post_toggle),
         .ram_addr(ram_addr),
+        .ram_pair(ram_pair),
+        .ram_addr2(ram_addr2),
         .ram_read_buffer(ram_read_buffer),
         .ram_read_buffer_b(ram_read_buffer_b),
         .ram_read_valid_a(ram_read_valid_a),

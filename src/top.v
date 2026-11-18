@@ -228,6 +228,8 @@ module top(
     wire spi_ram_continuation;
     wire spi_ram_post_toggle;
     wire [22:0] spi_ram_addr;    // 23-bit for 64MB addressing
+    wire spi_ram_pair;
+    wire [22:0] spi_ram_addr2;   // Second burst, fetched by the controller
     
     wire spi_write_cmd;
     wire [1:0] spi_write_type;  // 00=page program, 01=erase, 10=AAI RMW
@@ -292,6 +294,8 @@ module top(
         .ram_post_toggle(spi_ram_post_toggle),
         
         .ram_addr(spi_ram_addr),
+        .ram_pair(spi_ram_pair),
+        .ram_addr2(spi_ram_addr2),
         .ram_read_buffer(sdram_read_buffer),
         .ram_read_buffer_b(sdram_read_buffer_b),
         .ram_read_valid_a(sdram_read_valid_a),
@@ -389,6 +393,11 @@ module top(
     wire [22:0] spi_ram_addr_final = (redirect_active && spi_ram_continuation) ?
         ((redirect_base & redirect_mask) | (spi_ram_addr & ~redirect_mask)) :
         spi_ram_addr;
+    // The pair burst is always a subsequent burst. The controller holds it
+    // while redirect_pending, like a lookahead ACTIVATE.
+    wire [22:0] spi_ram_addr2_final = redirect_active ?
+        ((redirect_base & redirect_mask) | (spi_ram_addr2 & ~redirect_mask)) :
+        spi_ram_addr2;
     
     // -----------------------------------------------------------
     // SDRAM Controller
@@ -426,6 +435,8 @@ module top(
         .spi_addr(spi_ram_addr_final),
         .spi_cmd_post_toggle(spi_ram_post_toggle),
         .spi_cmd_continuation(spi_ram_continuation),
+        .spi_cmd_pair(spi_ram_pair),
+        .spi_addr2(spi_ram_addr2_final),
         .spi_redirect_pending(redirect_pending),
         
         // Serial path control

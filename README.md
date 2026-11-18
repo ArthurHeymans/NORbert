@@ -9,7 +9,7 @@ NORbert uses a [Sipeed Tang Primer 25K](https://wiki.sipeed.com/hardware/en/tang
 - **SPI NOR flash emulation** with full command support: read, fast read, page program, sector/block/chip erase, JEDEC ID, status registers, SFDP. As on a real part, only status reads are accepted while a program/erase is in progress, and a program/erase is not executed if CS rises mid-byte
 - **Configurable chip identity** at runtime -- load any chip definition from [rflasher](https://github.com/benpye/rflasher)'s RON database to set JEDEC ID, size, and SFDP parameters (defaults to Winbond W25Q64FV)
 - **Multi-I/O modes**: 1-1-1, 1-1-2, 1-2-2, 1-1-4, and 1-4-4 SPI read modes, including continuous read (XIP) mode for 1-2-2/1-4-4 (mode bits `Axh`; `FFh`/`FFFFh` mode reset)
-- **Fast SPI reads**: one-burst lookahead with ping-pong SDRAM buffers supports 40 MHz dummy-less/quad-I/O reads and 50-70 MHz dummy-assisted reads in simulation (see limits below)
+- **Fast SPI reads**: one-burst lookahead with ping-pong SDRAM buffers supports 40 MHz dummy-less reads and 60-70 MHz dual/quad and dummy-assisted reads in simulation (see limits below)
 - **64MB backing store** using two SDRAM chips with byte-serial burst layout for minimal first-byte latency
 - **Pipelined prefetch**: SDRAM reads are issued during SPI address/dummy phases so data is ready on the first clock edge
 - **2 Mbaud UART** interface for loading and dumping images from a host PC
@@ -394,6 +394,9 @@ one burst in flight at all times (one-burst lookahead with ping-pong buffers),
 so the limit is throughput (one burst per ~12 sysclks), not single-burst
 latency. SDRAM runs at CAS latency 2 (in spec to 133 MHz for the W9825G6KH-6)
 with a byte-serial burst layout, so the first beat already completes bytes 0-1.
+The second burst of a read is fetched by the SDRAM controller itself as soon
+as the address phase ends, streaming right behind the first burst, so a read
+starting at byte 7 does not wait for a second SPI-side request.
 
 Validated by simulation (`make test`, `tests/quad_fast_tb.sv`: all start
 offsets 0-7, row/bank crossings, and a refresh that becomes due at every
@@ -416,7 +419,7 @@ Configured framing checks are not a 40 MHz promise for every register setting.
 | 0x3B Dual Output | 1-1-2 | 50 MHz (spot) | 8 dummy clocks |
 | 0xBB Dual I/O | 1-2-2 | 60 MHz | 4 mode clocks |
 | 0x6B Quad Output | 1-1-4 | 70 MHz | 8 dummy clocks |
-| 0xEB Quad I/O | 1-4-4 | 40 MHz | 6 mode clocks; offset 7 is limiting |
+| 0xEB Quad I/O | 1-4-4 | 70 MHz | 6 mode clocks |
 
 The matrix requires both correct data and ready beats at the output edges.
 Earlier 50 MHz claims for 0x03/0xEB relied on an eventual burst-valid flag
@@ -426,18 +429,22 @@ short reads. The same limits apply to the corresponding four-byte opcodes.
 
 Known corners detected by the simulated prefetch fault checks:
 
-- **Quad-I/O offset 7 at 50 MHz and above** can need the second burst before
-  it is ready. Use <= 40 MHz for all offsets, or validate a narrower range.
 - **Slow reads above 40 MHz** can run out of their 3.5-clock first-burst
   window, particularly at high offsets. Real NOR flashes likewise impose a
   lower clock limit on 0x03 than on dummy-assisted reads.
-- **70 MHz dual-I/O reads** can underrun; 60 MHz is the all-offset limit.
+- **70 MHz dual-I/O reads** can underrun at offsets 6-7 (the first burst's
+  last SDRAM word); 60 MHz is the all-offset limit.
+
+Beyond 70 MHz the SPI clock domain of the routed design becomes the limit
+rather than the SDRAM pipeline: constrained for 100 MHz, Gowin closes it at
+77-85 MHz, limited by the half-period falling-edge output path. Quad reads
+still pass every offset at 80 MHz in simulation.
 
 Sequential bursts keep their SDRAM row open (per bank), so same-row
 bursts skip ACTIVATE and tRCD entirely; a sequential stream pays them once
 per 1KB, when it moves on to the next bank.
 If you need more: the remaining lever is master-configured extra dummy
-clocks for 0xEB/0xBB, not a faster SDRAM clock.
+clocks for 0xBB, not a faster SDRAM clock.
 
 ### Checking the prefetch path
 
