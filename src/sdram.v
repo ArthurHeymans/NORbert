@@ -57,6 +57,7 @@ module sdram(
     
     // Control signals from spi_trx (directly from SPI clock domain)
     input wire spi_active,
+    input wire spi_activity_toggle, // Toggles on each SCK rising edge
     input wire spi_inhibit_refresh,
     input wire spi_cmd_activate,
     input wire spi_cmd_read,
@@ -211,6 +212,13 @@ module sdram(
     
     // Buffer control signals from SPI domain
     reg [2:0] spi_active_buf;
+    reg [2:0] spi_activity_sync;
+    reg [6:0] spi_quiet_cycles;
+    // Hard refresh may interrupt a stopped address phase, but give an
+    // actively clocked phase a chance to reach its READ first. The separate
+    // age limit below also bounds deferral when SCK never stops.
+    wire spi_address_quiet = &spi_quiet_cycles;
+    reg refresh_force_replay;
     reg [1:0] spi_inhibit_refresh_buf;
     reg [2:0] spi_cmd_activate_buf;
     reg [1:0] spi_cmd_read_buf;
@@ -474,6 +482,9 @@ module sdram(
             wrbuf_read_ptr <= 0;
             
             spi_active_buf <= 0;
+            spi_activity_sync <= 0;
+            spi_quiet_cycles <= 0;
+            refresh_force_replay <= 0;
             spi_inhibit_refresh_buf <= 0;
             spi_cmd_activate_buf <= 0;
             spi_cmd_read_buf <= 0;
@@ -527,6 +538,14 @@ module sdram(
             // a master that stops the clock while deasserting CS cannot leave
             // refresh inhibition or command requests asserted indefinitely.
             spi_active_buf <= {spi_active_buf[1:0], spi_active};
+            spi_activity_sync <= {spi_activity_sync[1:0], spi_activity_toggle};
+            if (!spi_active_buf[1] || spi_activity_sync[1] != spi_activity_sync[2])
+                spi_quiet_cycles <= 0;
+            else if (!spi_address_quiet)
+                spi_quiet_cycles <= spi_quiet_cycles + 1'b1;
+            // Leave 64 clocks of counter headroom for row closure and
+            // refresh dispatch, even if SCK keeps moving.
+            refresh_force_replay <= refreshcount >= {REFRESH_BITS{1'b1}} - 64;
             spi_inhibit_refresh_buf <= {spi_inhibit_refresh_buf[0],
                                         spi_inhibit_refresh && spi_active};
             spi_cmd_activate_buf <= {spi_cmd_activate_buf[1:0],
@@ -874,6 +893,7 @@ module sdram(
                     dqm_o <= 2'b11;
                 end
                 else if (hard_refresh_due && !serial_row_open && access_cmd == 0 &&
+                         (spi_address_quiet || refresh_force_replay) &&
                          spi_activate_done && !spi_cmd_read_ack && !spi_cmd_read_buf[1]) begin
                     // SCK may stop after ACTIVATE while CS remains low.
                     // Close the row, refresh, then replay the held ACTIVATE.
@@ -887,47 +907,43 @@ module sdram(
                     we_o <= 1;
                     dqm_o <= 2'b11;
                 end
-                else if (auto_go && auto_hit && !auto_bus_ready) begin
-                    // A cross-chip READ waits for the shared DQ bus; its
-                    // row may already be open or have been opened while the
-                    // first READ drained. Do not precharge that row or let
-                    // another client pass the pair.
-                    state <= STA_IDLE;
-                    cmdtarget <= 1;
-                    cmd_wait <= 0;
-                    ras_o <= 1;
-                    cas_o <= 1;
-                    we_o <= 1;
-                end
                 else if (auto_go && auto_hit) begin
-                    // Burst pair READ, row open: streams right behind the
-                    // first burst (no auto-precharge, like any SPI READ).
-                    state <= STA_READ;
-                    cmdtarget <= BURST_LEN;
-                    cmd_wait <= BURST_LEN > 1;
-                    read_busy <= 1;
-                    auto_pending <= 0;
-                    auto_ready <= 0;
-                    auto_opened <= 0;
-                    spi_pair_read_done <= spi_active_buf[1];
-                    rd_pipe[0] <= 1;
-                    rd_tag_b[0] <= fill_sel;
-                    rd_tag_serial[0] <= 0;
-                    last_read_chip <= auto_addr[22];
-                    fill_sel <= ~fill_sel;
-                    if (fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
-                    else begin read_valid_a <= 0; read_beats_a <= 0; end
-
-                    cs_o <= auto_addr[22];
+                    // The row hit owns this dispatch slot even while a
+                    // cross-chip READ waits for the shared DQ bus.
                     ras_o <= 1;
-                    cas_o <= 0;
                     we_o <= 1;
-                    ba_o <= auto_addr[8:7];
-                    a_o <= 0;
-                    a_o[8:0] <= {auto_addr[6:0], 2'b00};
-                    a_o[10] <= 0;
-                    dq_oe_o <= 0;
-                    dqm_o <= 2'b00;
+                    if (!auto_bus_ready) begin
+                        state <= STA_IDLE;
+                        cmdtarget <= 1;
+                        cmd_wait <= 0;
+                        cas_o <= 1;
+                    end else begin
+                        // Burst pair READ, row open, no auto-precharge.
+                        state <= STA_READ;
+                        cmdtarget <= BURST_LEN;
+                        cmd_wait <= BURST_LEN > 1;
+                        read_busy <= 1;
+                        auto_pending <= 0;
+                        auto_ready <= 0;
+                        auto_opened <= 0;
+                        spi_pair_read_done <= spi_active_buf[1];
+                        rd_pipe[0] <= 1;
+                        rd_tag_b[0] <= fill_sel;
+                        rd_tag_serial[0] <= 0;
+                        last_read_chip <= auto_addr[22];
+                        fill_sel <= ~fill_sel;
+                        if (fill_sel) begin read_valid_b <= 0; read_beats_b <= 0; end
+                        else begin read_valid_a <= 0; read_beats_a <= 0; end
+
+                        cs_o <= auto_addr[22];
+                        cas_o <= 0;
+                        ba_o <= auto_addr[8:7];
+                        a_o <= 0;
+                        a_o[8:0] <= {auto_addr[6:0], 2'b00};
+                        a_o[10] <= 0;
+                        dq_oe_o <= 0;
+                        dqm_o <= 2'b00;
+                    end
                 end
                 else if (auto_go && open_valid[auto_idx]) begin
                     // Close a different row in the target bank. A pair's

@@ -371,24 +371,26 @@ module host_protocol(
                 (profile_capacity & (profile_capacity - 1'b1)) == 0;
         end
     endfunction
-    // Select fixed slices explicitly. Multiplying a variable descriptor
-    // index by three for the count slice inferred a DSP on the ACK path.
-    reg [18:0] profile_check_descriptor;
-    reg [2:0] profile_previous_mask;
+    // Fetch the first descriptor while checking the header, then fetch
+    // each next descriptor while validating the current one. Registering
+    // the fixed slices separates the mux from opcode validation without
+    // adding a cycle before publication or ACK.
+    reg [18:0] profile_check_descriptor, profile_descriptor_q;
+    reg [2:0] profile_previous_mask, profile_previous_mask_q;
     always @* begin
         profile_check_descriptor = 0;
         profile_previous_mask = 0;
         case (profile_check_index)
-            1: profile_check_descriptor = {cfg_profile[322:320],cfg_profile[271:256]};
-            2: begin
+            0: profile_check_descriptor = {cfg_profile[322:320],cfg_profile[271:256]};
+            1: begin
                 profile_check_descriptor = {cfg_profile[325:323],cfg_profile[287:272]};
                 profile_previous_mask = 3'b001;
             end
-            3: begin
+            2: begin
                 profile_check_descriptor = {cfg_profile[328:326],cfg_profile[303:288]};
                 profile_previous_mask = 3'b011;
             end
-            4: begin
+            3: begin
                 profile_check_descriptor = {cfg_profile[331:329],cfg_profile[319:304]};
                 profile_previous_mask = 3'b111;
             end
@@ -602,12 +604,16 @@ module host_protocol(
             // completing. Publish only after geometry and header validation.
             if (!profile_check_active) profile_check_index <= 0;
             else if (profile_done) begin
+                if (profile_check_index < 4) begin
+                    profile_descriptor_q <= profile_check_descriptor;
+                    profile_previous_mask_q <= profile_previous_mask;
+                end
                 if (profile_check_index == 0) begin
                     profile_header_good <= profile_header_valid(cfg_profile);
                     profile_check_index <= 1;
                 end else if (profile_check_index < 5) begin
                     profile_header_good <= profile_header_good &&
-                        profile_descriptor_valid(profile_check_descriptor,cfg_profile[319:256],profile_previous_mask);
+                        profile_descriptor_valid(profile_descriptor_q,cfg_profile[319:256],profile_previous_mask_q);
                     profile_check_index <= profile_check_index + 1'b1;
                 end else if (can_send) begin
                     cfg_profile_valid <= !profile_bad && profile_header_good;

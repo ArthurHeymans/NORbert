@@ -411,6 +411,12 @@ module top(
     wire sdram_cmd_busy;
     wire sdram_access_accept;
     
+    // One transition per SCK period: the 120 MHz system clock can
+    // observe it even when both SCK half-periods are shorter than a cycle.
+    reg spi_activity_toggle = 0;
+    always @(posedge spi_clk_in)
+        spi_activity_toggle <= ~spi_activity_toggle;
+
     sdram #(
         .CLK_FREQ_MHZ(120),
         .BURST_LEN(4)
@@ -431,6 +437,7 @@ module top(
         
         // SPI fast-path control (address passes through TOCTOU redirect mux)
         .spi_active(spi_active),
+        .spi_activity_toggle(spi_activity_toggle),
         .spi_inhibit_refresh(spi_ram_inhibit_refresh),
         .spi_cmd_activate(spi_ram_activate),
         .spi_cmd_read(spi_ram_read),

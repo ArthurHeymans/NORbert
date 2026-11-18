@@ -98,8 +98,9 @@ This is an ordering budget, not a routed RAM-to-comparator timing guarantee.
 At 120 MHz the nominal per-chip period is 468 clocks (a conservative
 32 ms / 8192 schedule). Refresh events alternate between the chips, one
 chip per event, so an event is due every 234 clocks and stalls dispatch
-for a single tRC instead of a back-to-back pair. Deferral may reach twice
-the per-chip period, plus bounded safe-row-closure/access service time.
+for a single tRC instead of a back-to-back pair. The normal hard-refresh
+bound is twice the per-chip period plus bounded safe-row-closure/access
+service time. See the address-phase exception below.
 Each event pays only one event period of elapsed time; it does not discard
 overdue time. This preserves the nominal average rate even when SCK and CS
 stall indefinitely. The saturating counter has service-latency headroom
@@ -119,8 +120,15 @@ re-arm point. The next post is then at least the re-arm-to-post gap away,
 so a 9-clock refresh event overlaps it by only part of that gap, well
 inside the burst's margin. A refresh in the gap before a post would instead
 delay the post by the whole event. Stopped SCK outside a window falls back
-to the deadline (hard) refresh. `quad_fast_tb` sweeps the refresh due time
-across one full event period for every documented read limit.
+to the deadline (hard) refresh. If an early SPI ACTIVATE is waiting for
+its first READ, a hard refresh waits until SCK has been quiet for about
+1.1 µs or the age counter reaches 960 clocks at 120 MHz. This
+avoids tearing down a row while the master is still sending its address,
+without letting a stalled or noisy master starve refresh. SCK activity
+crosses into the system domain as a synchronized toggle, not a pulse.
+`quad_fast_tb` sweeps the refresh due time across one full event period
+for every documented read limit; `refresh_tb` tests a progressing address
+phase at the hard deadline and recovery after stopped SCK.
 
 Reads too short to post a lookahead burst, back to back with little
 deselect time (firmware fetching code in place), only get the pair's
@@ -165,6 +173,99 @@ set_input_delay -clock sdram_clk -min SDRAM_TCO_MIN_PLUS_FLIGHT [get_ports {IO_s
 
 ## Validation and remaining sign-off
 
+### CH32V307 single-lane bench
+
+The previous image corrupted the first bit on 6 of 600 short `0x13`
+reads with the bridge's former top setting (nominal 18 MHz). The
+address-phase refresh guard and the last-word-first ordering for
+no-dummy single-lane reads passed 6,000 short reads at nominal 36 MHz:
+`0x13` and `0x0C`, with and without a preceding address-only abort, and
+with starts on either side of and crossing the 32 MiB SDRAM boundary.
+There were no byte mismatches or prefetch flags. Three 1 MiB bulk SPI
+reads crossing the boundary and one UART readback also matched.
+Gowin placement option 1 has zero reported setup/hold violations with
+the checked-in constraints. The CH32V307 SPI2 `/2` setting (nominal
+72 MHz) failed JEDEC at this bench; `/4` was the fastest tested working
+setting. These rates are derived from the MCU clock configuration, not
+measured at the FPGA pins; no dual/quad or board-level timing sign-off
+is implied.
+
+### Protocol 9 release checklist
+
+- Qualify the complete stack, not the controller-compatibility layer on its
+  own. Re-run `make test`, `make test-gate`, and `make test-rflasher` on the
+  release candidate. Route that exact revision with the board/master I/O
+  profile above; check actual exception coverage and both setup and hold.
+- On hardware, check byte-exact reads at the advertised per-command rates,
+  including short reads, CS release with stopped SCK, and the 32 MiB
+  SDRAM-chip boundary on a 64 MiB profile. Verify that refresh and host
+  reads resume after a deselect. An internal Fmax report alone does not
+  qualify 70 MHz on the board.
+- Upgrading the FPGA to protocol 9 requires a protocol-9-aware CLI or web
+  UI. The new UI retains legacy operations with protocol 7, but chip
+  selection is disabled. A `master` push updates Pages, not the `latest`
+  release bitstream. Once qualified, bump the CLI package version and tag
+  the same revision; verify that Pages and `releases/latest/download/spi_flash.fs`
+  work together. Keep the previous CLI and bitstream available as a pair
+  for rollback.
+
+### Timing recovery after the burst-pair fix
+
+The host now fetches each erase descriptor one cycle ahead of its opcode
+check, beginning during the header check. Publication and ACK are unchanged:
+the same four descriptors are checked before the reply, at the same cycle
+with or without TX backpressure. The SDRAM command dispatcher factors its
+pair row-hit decision without changing command or data cycles; Yosys proved
+all 610 matched equivalence points at 120 MHz / BL4.
+
+Gowin 1.9.11.03 reports zero setup and hold violations on placement
+options 0, 1 and 2 with the existing constraints. This is internal STA,
+not board/master I/O sign-off.
+
+### Burst-pair fix validation (before timing recovery)
+
+With the burst-pair fix, Gowin 1.9.11.03 reports 18 setup-violated
+endpoints (worst slack −0.199 ns) at placement option 1 and 87 (worst
+slack −0.422 ns) at option 0; option 2 reports 16 setup violations.
+All three builds report zero hold violations. These placements are not
+release candidates, even before adding the board/master I/O profile. The
+local OSS flow packs the bitstream but misses both the 120 MHz system
+and 70 MHz SPI targets in its experimental timing model. An isolated
+simulation of a cold four-byte quad-I/O read starting one byte before
+the SDRAM-chip boundary passes at 70 MHz with the fix; this is not a
+board timing measurement.
+
+### Corrected-clock stack validation (before the burst-pair fix)
+
+The controller-compatibility base and full performance stack were rebased
+onto the toolchain pins merged in #62. PLL parameter values, functional RTL
+and operating frequencies are unchanged; the vendor constraints now use
+324/180 degrees, and the OSS input-port constraint survives packing.
+`tests/check_clocks.py` verifies both the source contract and nextpnr's actual
+system/SPI target frequencies before packing a bitstream. Missing clocks,
+unmatched selectors and the former 12 MHz fallback are fatal; modeled
+experimental Fmax failures are still permitted and remain visible.
+
+With these corrections, all 17 clock regressions, strict lint, 16 behavioral
+benches, 13 mapped benches, 15 real-rflasher tests, 64 native Rust tests and
+the Wasm library/browser build checks pass. Every intermediate PR's source
+clock contract was checked too. Fresh Gowin 1.9.11.03 builds use the corrected
+phase edges: the base retains its 210 setup/79 hold violated endpoints, while
+the complete stack reports zero under its stated coverage and exceptions.
+This does not supply the missing board I/O constraints or establish margin
+across placements/PVT; the OSS model still fails the system-frequency target.
+
+The new full-stack OSS image passed five distinct 64 KiB UART/SDRAM writes
+across the lower 32 MiB, followed by two complete read rounds: zero mismatches
+in 655,360 byte comparisons. Its SHA-256 is
+`0a16d834bef65fd9c5cc84984e2be4de4e4c49ba6ca32a9feec25d426a62b5d6`.
+The base OSS and both vendor configuration payloads are identical to their
+previously hardware-tested payloads (vendor file-header timestamps differ).
+No SPI master or separate FT245 transport was attached: this is bounded
+host/SDRAM functional evidence, not external SPI or 64 MiB qualification.
+Commands, frozen base sources, reports and payload comparisons are under
+`/tmp/norbert-stack-fixes-gtdY3l/` on the test host.
+
 **Historical phase caveat:** the reports below used the former half-VCO
 phase declarations (3.750/2.083333 ns). Those numbers describe the old SDC,
 not the actual PLL offsets. Retain the measurements as historical evidence,
@@ -204,9 +305,13 @@ system and 100 MHz SPI clocks, with three placement algorithms each:
 | Critical word first | 79.0-83.5 MHz | 125.2-130.1 MHz |
 
 The system clock has a few percent of real headroom. The SPI clock domain
-closes near 80 MHz, limited by the half-period falling-edge output path
-(`addr`/`consume_sel` to the `spi_ioN_out` flops); that path, not the SDRAM
-pipeline, bounds reads above that. No board was tested.
+closed near 80 MHz, limited by the half-period falling-edge output path
+(`addr`/`consume_sel` through the fresh-byte mux to the `spi_ioN_out`
+flops). The fresh byte now comes from an AND-OR of both buffers with a
+one-hot select registered when the burst starts; constrained for 100 MHz,
+the SPI clock closes at 90.5-98.5 MHz (previously 76.0-84.9 MHz with the
+same placement options), still limited by that half-period path and by
+full-period command decode. No board was tested.
 
 With the SPI clock constrained at 70 MHz and the explicit exceptions for
 held configuration, run control, the logger payload and the two

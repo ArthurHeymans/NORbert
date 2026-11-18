@@ -13,6 +13,7 @@ module refresh_tb;
     wire busy, read_busy, inhibit, accept;
     wire [63:0] read_buffer, write_buffer;
     reg spi_active = 0, spi_inhibit = 0, spi_activate = 0, spi_read = 0;
+    reg spi_activity_toggle = 0;
     wire ras, cas, we, chip;
     wire [1:0] bank;
     wire [12:0] addr_bus;
@@ -33,7 +34,7 @@ module refresh_tb;
         .log_fifo_read_data(8'b0), .log_addr_valid_sync(1'b0), .log_addr_sync(24'b0),
         .spi_active_sync(1'b0), .prefetch_underrun(1'b0), .prefetch_thin(1'b0));
     sdram #(.CLK_FREQ_MHZ(120)) ram(.clk(clk), .aux_clk(clk), .reset(reset), .dq_io(dq),
-        .spi_active(spi_active), .spi_inhibit_refresh(spi_inhibit),
+        .spi_active(spi_active), .spi_activity_toggle(spi_activity_toggle), .spi_inhibit_refresh(spi_inhibit),
         .spi_cmd_activate(spi_activate), .spi_cmd_read(spi_read),
         .spi_cmd_post_toggle(1'b0), .spi_addr(23'h001234),
         .spi_cmd_pair(1'b0), .spi_addr2(23'h0),
@@ -44,6 +45,7 @@ module refresh_tb;
 
     integer cycles = 0, refreshes = 0, last_refresh [0:1];
     integer replies = 0, activates = 0, reads = 0, refresh_before;
+    integer refresh_gap_limit = 1100;
     bit checking = 0;
     bit row_open [0:1][0:3];
     always @(negedge clk) begin
@@ -70,7 +72,7 @@ module refresh_tb;
                 3'b001: begin
                     for (integer b = 0; b < 4; b++)
                         if (row_open[chip][b]) $fatal(1, "REFRESH with open bank");
-                    if (cycles - last_refresh[chip] > 1100)
+                    if (cycles - last_refresh[chip] > refresh_gap_limit)
                         $fatal(1, "refresh deadline missed: %0d clocks", cycles-last_refresh[chip]);
                     last_refresh[chip] = cycles;
                     refreshes++;
@@ -78,7 +80,7 @@ module refresh_tb;
                 default: ;
             endcase
             for (integer c = 0; c < 2; c++)
-                if (cycles - last_refresh[c] > 1100) $fatal(1, "refresh starvation");
+                if (cycles - last_refresh[c] > refresh_gap_limit) $fatal(1, "refresh starvation");
         end
     end
     always @(posedge clk) if (tx_strobe) begin
@@ -115,6 +117,34 @@ module refresh_tb;
         spi_read = 1; tick(100);
         if (reads != 3) $fatal(1, "resumed SPI READ was lost or duplicated: %0d", reads);
         spi_active = 0; spi_activate = 0; spi_read = 0; tick(1200);
+
+        // Put the open address phase across the hard refresh deadline
+        // (event period + per-chip interval = 702 clocks), but continue
+        // clocking. A replay would interrupt the approaching first READ.
+        refresh_before = refreshes;
+        wait (refreshes != refresh_before);
+        @(negedge clk);
+        spi_active = 1; spi_inhibit = 1;
+        repeat (174) begin tick(4); spi_activity_toggle = ~spi_activity_toggle; end
+        spi_activate = 1;
+        repeat (12) begin tick(4); spi_activity_toggle = ~spi_activity_toggle; end
+        if (refreshes != refresh_before + 1)
+            $fatal(1, "hard refresh interrupted a progressing address phase");
+        spi_read = 1;
+        tick(100);
+        if (reads != 4) $fatal(1, "READ after active address grace did not dispatch");
+        spi_active = 0; spi_activate = 0; spi_read = 0; tick(1200);
+
+        // Continuous edges without a READ can push the replay up to 960
+        // clocks. Allow the other chip's event interval (234 clocks)
+        // and bounded row closure, but still check both chips and rate.
+        refresh_gap_limit = 1250;
+        refresh_before = refreshes;
+        spi_active = 1; spi_inhibit = 1; tick(8); spi_activate = 1;
+        repeat (1250) begin tick(4); spi_activity_toggle = ~spi_activity_toggle; end
+        if (refreshes - refresh_before < 18)
+            $fatal(1, "activity bypassed the absolute refresh bound");
+        spi_active = 0; spi_activate = 0; tick(1200);
         $display("PASS REFRESH: TX stalls, stopped SCK, row closure/replay, resumed data (%0d refreshes)", refreshes);
         $finish;
     end
