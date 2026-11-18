@@ -228,6 +228,7 @@ module top(
     wire spi_ram_continuation;
     wire spi_ram_post_toggle;
     wire [22:0] spi_ram_addr;    // 23-bit for 64MB addressing
+    wire [1:0] spi_ram_word;
     wire spi_ram_pair;
     wire [22:0] spi_ram_addr2;   // Second burst, fetched by the controller
     
@@ -294,6 +295,7 @@ module top(
         .ram_post_toggle(spi_ram_post_toggle),
         
         .ram_addr(spi_ram_addr),
+        .ram_word(spi_ram_word),
         .ram_pair(spi_ram_pair),
         .ram_addr2(spi_ram_addr2),
         .ram_read_buffer(sdram_read_buffer),
@@ -435,6 +437,7 @@ module top(
         .spi_addr(spi_ram_addr_final),
         .spi_cmd_post_toggle(spi_ram_post_toggle),
         .spi_cmd_continuation(spi_ram_continuation),
+        .spi_word(spi_ram_word),
         .spi_cmd_pair(spi_ram_pair),
         .spi_addr2(spi_ram_addr2_final),
         .spi_redirect_pending(redirect_pending),
