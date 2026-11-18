@@ -1,0 +1,2 @@
+// nextpnr only: register MISO data at the pad; keep output enable independent.
+IO_PORT "spi_miso_pin" OREG_IN_IOB=ON;

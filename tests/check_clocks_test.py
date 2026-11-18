@@ -35,16 +35,16 @@ class ClockContractTests(unittest.TestCase):
 
     def test_half_vco_aux_phase_rejected(self):
         with self.assertRaisesRegex(ValueError, "aux_clk phase"):
-            check_sources(self.pll, self.vendor.replace("-phase 180", "-phase 90"), self.oss)
+            check_sources(self.pll, self.vendor.replace("-phase 216", "-phase 108"), self.oss)
 
     def test_stale_pll_phase_rejected(self):
-        pll = self.pll.replace("CLKOUT2_PE_COARSE = 5;", "CLKOUT2_PE_COARSE = 6;")
+        pll = self.pll.replace("CLKOUT2_PE_COARSE = 6;", "CLKOUT2_PE_COARSE = 5;")
         with self.assertRaisesRegex(ValueError, "aux_clk phase"):
             check_sources(pll, self.vendor, self.oss)
 
     def test_fine_phase_uses_eighth_of_full_vco_period(self):
         pll = self.pll.replace("CLKOUT2_PE_FINE = 0;", "CLKOUT2_PE_FINE = 4;")
-        check_sources(pll, self.vendor.replace("-phase 180", "-phase 198"), self.oss)
+        check_sources(pll, self.vendor.replace("-phase 216", "-phase 234"), self.oss)
 
     def test_frequency_drift_rejected(self):
         with self.assertRaisesRegex(ValueError, "sys_clk period"):

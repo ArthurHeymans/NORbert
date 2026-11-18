@@ -77,11 +77,11 @@
     "nextpnr-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1793694681,
-        "narHash": "sha256-++ki9jzXqq9Z4KmUI7IvS3bcNigjcN6JUpsBBWPjYfI=",
+        "lastModified": 1795076287,
+        "narHash": "sha256-D0eRWK+YoyR4gWnr9m0uwsnoGDnSqfsYYrGI0bWj9v8=",
         "ref": "norbert-experimental",
-        "rev": "35111d1d156fd7434b0fec50ddd9951461e4723b",
-        "revCount": 5303,
+        "rev": "c583d902b5c4d28e6622aa3331d52fb47119fc1e",
+        "revCount": 5304,
         "submodules": true,
         "type": "git",
         "url": "https://github.com/ArthurHeymans/nextpnr"

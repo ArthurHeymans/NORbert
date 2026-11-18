@@ -31,6 +31,17 @@ To deliberately update the toolchain pins:
 nix flake update yosys-src nextpnr-src apicula-src
 ```
 
+## Tang Primer 25K
+
+```sh
+nix develop .#oss --command make build-oss-tuned
+```
+
+The bitstream is `impl/oss-tuned/spi_flash.fs`. The tuned build packs the
+MISO output register into the I/O block at the usual 8 mA drive. It passed
+single-lane SPI tests at nominal 36 MHz with a CH32V307 master. Gowin
+remains the release build; the OSS timing report does not cover board I/O.
+
 ## Topic branches
 
 Integration merges are for NORbert, not upstream PRs. The smaller topic branches

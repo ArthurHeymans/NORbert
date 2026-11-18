@@ -8,7 +8,7 @@
 // logic clock. This design uses PLL phase steps, not an IODELAY:
 //   clkout0 = main logic clock, 0ns
 //   clkout1 = SDRAM pin clock, +7.5ns
-//   clkout2 = read capture clock, +4.166667ns
+//   clkout2 = read capture clock, +5ns
 // tangprimer25k.sdc must track these relationships; see docs/rtl-timing.md.
 //
 // GW5A uses PLLA primitive (not rPLL - that's for GW1N/GW2A series)
@@ -24,14 +24,14 @@
 //   MDIV = 24 -> VCO = 50 * 24 / 1 = 1200MHz (valid: 700-1400MHz)
 //   ODIV0 = 10 -> CLKOUT0 = 1200 / 10 = 120MHz (main clock, PE_COARSE=0)
 //   ODIV1 = 10 -> CLKOUT1 = 1200 / 10 = 120MHz (SDRAM clock, PE_COARSE=9)
-//   ODIV2 = 10 -> CLKOUT2 = 1200 / 10 = 120MHz (aux clock, PE_COARSE=5)
+//   ODIV2 = 10 -> CLKOUT2 = 1200 / 10 = 120MHz (aux clock, PE_COARSE=6)
 //   UART: 120MHz / 60 = 2.0 Mbaud
 //   CRITICAL: DIVISOR must be divisible by 4 (uart_rx uses DIVISOR/4)
 //
 // SDRAM read capture timing:
 //   UG306 section 5.1: phase = (COARSE + FINE/8) / ODIV * 360 degrees.
 //   PE_COARSE step = T_VCO = 0.833333ns (for VCO=1200MHz).
-//   PE_COARSE=5 -> 4.166667ns phase shift (180 degrees).
+//   PE_COARSE=6 -> 5ns phase shift (216 degrees).
 //   These are ideal PLL offsets, not measured DQ/pin arrival times.
 //   Measured on hardware with the Gowin IDE build: reads are clean from
 //   PE_COARSE=3 to 7 plus 4 PE_FINE steps and fail at 2 plus 4 PE_FINE
@@ -138,7 +138,7 @@ module pll(
     defparam pll_inst.CLKOUT0_PE_FINE = 0;
     defparam pll_inst.CLKOUT1_PE_COARSE = 9;     // SDRAM clock: ideal +7.5ns (324 degrees)
     defparam pll_inst.CLKOUT1_PE_FINE = 0;
-    defparam pll_inst.CLKOUT2_PE_COARSE = 5;     // Aux clock: ideal +4.166667ns (180 degrees)
+    defparam pll_inst.CLKOUT2_PE_COARSE = 6;     // Aux clock: ideal +5ns (216 degrees)
     defparam pll_inst.CLKOUT2_PE_FINE = 0;
     defparam pll_inst.CLKOUT3_PE_COARSE = 0;
     defparam pll_inst.CLKOUT3_PE_FINE = 0;
