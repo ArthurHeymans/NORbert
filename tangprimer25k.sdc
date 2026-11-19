@@ -1,11 +1,11 @@
 // Gowin clock/CDC constraints. See docs/rtl-timing.md before signing off.
 // PLL: 50 MHz -> 120 MHz, VCO 1200 MHz, coarse phase step 0.833333 ns.
 // UG306 section 5.1: phase = (COARSE + FINE/8) / ODIV * 360 degrees.
-// CLKOUT0: 0 steps; CLKOUT1: 9 steps (7.5 ns); CLKOUT2: 5 steps (4.166667 ns).
+// CLKOUT0: 0 steps; CLKOUT1: 9 steps (7.5 ns); CLKOUT2: 6 steps (5 ns).
 create_clock -name osc_clk -period 20.000 [get_ports {clk_50mhz}]
 create_generated_clock -name sys_clk -source [get_ports {clk_50mhz}] -multiply_by 12 -divide_by 5 [get_nets {clk_133}]
 create_generated_clock -name sdram_clk -source [get_ports {clk_50mhz}] -multiply_by 12 -divide_by 5 -phase 324 [get_ports {O_sdram_clk}]
-create_generated_clock -name aux_clk -source [get_ports {clk_50mhz}] -multiply_by 12 -divide_by 5 -phase 180 [get_nets {aux_clk}]
+create_generated_clock -name aux_clk -source [get_ports {clk_50mhz}] -multiply_by 12 -divide_by 5 -phase 216 [get_nets {aux_clk}]
 
 // Fastest documented read mode (70 MHz, see README). 0x03 is limited to
 // 40 MHz by its first-burst budget, not by this clock domain.

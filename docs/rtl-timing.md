@@ -13,7 +13,7 @@ have divider 10 and zero fine phase:
 |---|---:|---:|---:|
 | Main/system (`CLKOUT0`) | 120 MHz | 0 | 0 ns |
 | SDRAM pin (`CLKOUT1`) | 120 MHz | 9 | +7.500 ns / 324 degrees |
-| DQ capture (`CLKOUT2`) | 120 MHz | 5 | +4.166667 ns / 180 degrees |
+| DQ capture (`CLKOUT2`) | 120 MHz | 6 | +5.000 ns / 216 degrees |
 
 Gowin UG306-1.0.4E section 5.1 (page 46) specifies
 `phase = (COARSE + FINE/8) / ODIV * 360`: a coarse step is a **full**

@@ -24,8 +24,8 @@
 //     Board/pin setup and hold require separate I/O timing analysis.
 //   - IODELAY does NOT work for clock outputs on this device; PLL phase
 //     shift is used instead.
-//   - Read data is captured using aux_clk (CLKOUT2 with PE_COARSE=5,
-//     ideal +4.166667ns / 180 degrees; see src/pll.v and the vendor SDC).
+//   - Read data is captured using aux_clk (CLKOUT2, ideal +5ns / 216
+//     degrees; see src/pll.v and the vendor SDC).
 //   - With the separate forwarded clock and CAS=2, read data arrives
 //     ~3 logic clock cycles after the READ command. RD_PIPELINE_DELAY=0
 //     with beats publishing from read pipeline stage tCAS+1 matches this

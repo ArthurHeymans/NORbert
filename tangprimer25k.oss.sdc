@@ -6,7 +6,7 @@
 # timing, so the SDRAM capture and SPI pin timing are not analysed.
 # This is a frequency-only placement target, NOT the Gowin sign-off model;
 # never copy these independent clocks into a phase-aware STA flow.
-# Ideal PLL offsets are SDRAM +7.5 ns, aux +4.166667 ns from clk;
+# Ideal PLL offsets are SDRAM +7.5 ns, aux +5 ns from clk;
 # these are not measured board/pin arrival times.
 # See docs/rtl-timing.md for CDC contracts and missing board I/O budgets.
 create_clock -name clk -period 8.333 [get_nets {clk}]

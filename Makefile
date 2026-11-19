@@ -42,6 +42,10 @@ BITSTREAM = impl/pnr/spi_flash.fs
 OSS_DIR = impl/oss
 OSS_BITSTREAM = $(OSS_DIR)/spi_flash.fs
 OSS_SDC = tangprimer25k.oss.sdc
+OSS_CST = $(CST_FILE)
+OSS_SOURCES = $(VERILOG_FILES)
+OSS_SYNTH_FLAGS = -nolutram -nowidelut
+OSS_PNR_FLAGS =
 
 # Open-source lint tools use Yosys' GW5A primitive declarations so the
 # generated PLL wrapper can be elaborated without the proprietary simulator.
@@ -64,24 +68,44 @@ test-clocks: check-clocks
 $(BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) tangprimer25k.sdc build.tcl | check-clocks
 	gw_sh build.tcl
 
-# Open-source build. Keep shadow SRAM disabled (-nolutram) until the
-# experimental database and RAM16 support have fresh hardware validation.
-# Keep plain LUT4s (-nowidelut) for comparability with earlier experimental
-# builds; the fork fixes wide-LUT costing but broader benchmarks remain.
+# The baseline build does not use shadow SRAM. The tuned build opts into
+# RAM16 and independent register packing with the pinned fork tools.
 # The dual-purpose pins are released as GPIO like in build.tcl: without
 # i2c_as_gpio, IO_sdram_dq[12] on the I2C SDA pin always reads 1.
 # Timing failures are reported but not fatal: the GW5A delays are largely
 # borrowed from GW2A, so the Gowin build stays the reference.
 build-oss: $(OSS_BITSTREAM)
 
-$(OSS_BITSTREAM): $(VERILOG_FILES) $(VERILOG_HEADERS) $(CST_FILE) $(OSS_SDC) tests/check_clocks.py | check-clocks
+.PHONY: build-oss-tuned
+build-oss-tuned:
+	$(MAKE) build-oss OSS_DIR=impl/oss-tuned OSS_CST=impl/oss-tuned/tangprimer25k.cst \
+		OSS_SOURCES='$(sort $(VERILOG_FILES))' \
+		OSS_SYNTH_FLAGS='-nowidelut -abc9-flow2-resyn -abc9-wire-delay 150 -alu-min-width 7 -prefer-bram' \
+		OSS_PNR_FLAGS='--vopt independent_ff --vopt pack_alu_ff --placer-heap-timingweight 60 --seed 2'
+
+# Only nextpnr understands the output-register packing directive.
+impl/oss-tuned/tangprimer25k.cst: $(CST_FILE) tangprimer25k.oss-tuned.cst
+	mkdir -p "$(@D)"
+	cat "$<" tangprimer25k.oss-tuned.cst > "$@"
+
+# Make does not track command-line variable changes. Record the selected
+# inputs and flags without touching the stamp on an unchanged build.
+oss_quote = '$(subst ','"'"',$(1))'
+.PHONY: oss-config-force
+$(OSS_DIR)/build-config: oss-config-force
+	mkdir -p "$(@D)"
+	printf '%s\n' $(foreach var,DEVICE OSS_SOURCES OSS_CST OSS_SDC OSS_SYNTH_FLAGS OSS_PNR_FLAGS,$(call oss_quote,$(var)=$($(var)))) > "$@.tmp"
+	cmp -s "$@.tmp" "$@" || mv "$@.tmp" "$@"
+	rm -f "$@.tmp"
+
+$(OSS_BITSTREAM): $(OSS_SOURCES) $(VERILOG_HEADERS) $(OSS_CST) $(OSS_SDC) tests/check_clocks.py Makefile flake.lock $(OSS_DIR)/build-config | check-clocks
 	mkdir -p $(OSS_DIR)
 	yosys -q -l $(OSS_DIR)/yosys.log \
-		-p "read_verilog -Isrc $(VERILOG_FILES); synth_gowin -family gw5a -nolutram -nowidelut -top top -json $(OSS_DIR)/top.json"
+		-p "read_verilog -Isrc $(OSS_SOURCES); synth_gowin -family gw5a $(OSS_SYNTH_FLAGS) -top top -json $(OSS_DIR)/top.json"
 	nextpnr-himbaechel --json $(OSS_DIR)/top.json --write $(OSS_DIR)/pnr.json \
-		--device $(DEVICE) --vopt family=GW5A-25A --vopt cst=$(CST_FILE) \
+		--device $(DEVICE) --vopt family=GW5A-25A --vopt cst=$(OSS_CST) \
 		--vopt i2c_as_gpio --vopt sspi_as_gpio \
-		--sdc $(OSS_SDC) --timing-allow-fail -l $(OSS_DIR)/nextpnr.log --report $(OSS_DIR)/timing.json
+		--sdc $(OSS_SDC) $(OSS_PNR_FLAGS) --timing-allow-fail -l $(OSS_DIR)/nextpnr.log --report $(OSS_DIR)/timing.json
 	python3 tests/check_clocks.py --oss-sdc $(OSS_SDC) --report $(OSS_DIR)/timing.json --log $(OSS_DIR)/nextpnr.log
 	gowin_pack -d GW5A-25A --i2c_as_gpio --sspi_as_gpio --mspi_as_gpio \
 		--ready_as_gpio --done_as_gpio --cpu_as_gpio -o $@ $(OSS_DIR)/pnr.json
@@ -172,6 +196,7 @@ help:
 	@echo ""
 	@echo "  make build   - Synthesize + PnR (default, requires gw_sh)"
 	@echo "  make build-oss - Experimental open-source build (yosys/nextpnr/apicula)"
+	@echo "  make build-oss-tuned - Tuned Tang Primer 25K open-source build"
 	@echo "  make prog-oss  - Program the open-source bitstream (volatile)"
 	@echo "  make prog    - Program FPGA (volatile)"
 	@echo "  make flash   - Program to flash (persistent)"
