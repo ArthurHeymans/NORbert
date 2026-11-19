@@ -88,7 +88,17 @@ impl/oss-tuned/tangprimer25k.cst: $(CST_FILE) tangprimer25k.oss-tuned.cst
 	mkdir -p "$(@D)"
 	cat "$<" tangprimer25k.oss-tuned.cst > "$@"
 
-$(OSS_BITSTREAM): $(OSS_SOURCES) $(VERILOG_HEADERS) $(OSS_CST) $(OSS_SDC) tests/check_clocks.py Makefile flake.lock | check-clocks
+# Make does not track command-line variable changes. Record the selected
+# inputs and flags without touching the stamp on an unchanged build.
+oss_quote = '$(subst ','"'"',$(1))'
+.PHONY: oss-config-force
+$(OSS_DIR)/build-config: oss-config-force
+	mkdir -p "$(@D)"
+	printf '%s\n' $(foreach var,DEVICE OSS_SOURCES OSS_CST OSS_SDC OSS_SYNTH_FLAGS OSS_PNR_FLAGS,$(call oss_quote,$(var)=$($(var)))) > "$@.tmp"
+	cmp -s "$@.tmp" "$@" || mv "$@.tmp" "$@"
+	rm -f "$@.tmp"
+
+$(OSS_BITSTREAM): $(OSS_SOURCES) $(VERILOG_HEADERS) $(OSS_CST) $(OSS_SDC) tests/check_clocks.py Makefile flake.lock $(OSS_DIR)/build-config | check-clocks
 	mkdir -p $(OSS_DIR)
 	yosys -q -l $(OSS_DIR)/yosys.log \
 		-p "read_verilog -Isrc $(OSS_SOURCES); synth_gowin -family gw5a $(OSS_SYNTH_FLAGS) -top top -json $(OSS_DIR)/top.json"
