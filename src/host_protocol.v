@@ -146,16 +146,21 @@ module host_protocol(
 
     reg [7:0] cmd;
     reg [7:0] in_count;
+    reg profile_check_active;
     
-    // Idle timeout: reset the parser if no byte arrives for a while in the
-    // middle of a multi-byte command. Handles spurious bytes from the
-    // USB-UART bridge on port open/close. Headers time out after 2^16
-    // cycles (~546us). A RAMWRITE payload gets 2^22 cycles (~35ms): after
-    // a timeout the remaining payload bytes would be parsed as commands,
-    // so a USB stall inside a block must not trigger it. Hosts wait longer
-    // than that before resynchronizing (tool/src/protocol.rs).
+    // Idle timeout: reset the parser if no byte arrives while waiting for
+    // the next input byte of a multi-byte command. Handles spurious bytes
+    // from the USB-UART bridge on port open/close. Headers time out after
+    // 2^16 cycles (~546us). Incoming payloads (RAMWRITE, CHIPCONFIG SFDP,
+    // and CHIPPROFILE) get 2^22 cycles (~35ms): after a timeout the
+    // remaining payload bytes would be parsed as commands, so a USB stall
+    // inside a block must not trigger it. Hosts wait longer than that
+    // before resynchronizing (tool/src/protocol.rs).
     reg [22:0] serial_idle_count;
-    wire serial_idle_expired = (cmd == CMD_RAMWRITE && in_count > 8'd5) ?
+    wire serial_payload_timeout = (cmd == CMD_RAMWRITE && in_count > 8'd5) ||
+                                  (cmd == CMD_CHIPCONFIG && in_count == 8'd9) ||
+                                  (cmd == CMD_CHIPPROFILE && !profile_check_active);
+    wire serial_idle_expired = serial_payload_timeout ?
                                serial_idle_count[22] : serial_idle_count[16];
 
     reg [22:0] addr;       // 23-bit burst address
@@ -185,8 +190,7 @@ module host_protocol(
     wire sdram_busy = (sdram_access_cmd != 0) || sdram_cmd_busy || sdram_read_busy;
     
     reg [63:0] write_buffer;
-    reg write_strobe;
-    reg write_strobe_r;  // delayed copy for rising-edge detection
+    reg write_buf_full;  // One complete RAMWRITE burst owned until SDRAM retirement
     
     
     reg [1:0] spi_csel_buf;
@@ -223,9 +227,10 @@ module host_protocol(
     reg active_port;
 
     reg stop_ack_pending;
-    wire cmd_idle = !stop_ack_pending && (cmd == CMD_NOP) && (in_count == 0) &&
+    wire cmd_idle = !stop_ack_pending && !profile_check_active &&
+                    (cmd == CMD_NOP) && (in_count == 0) &&
                     (read_state == 3'd0) && (write_state == 3'd0) &&
-                    (log_poll_state == 0);
+                    !write_buf_full && (log_poll_state == 0);
     wire mux_txd_ready = active_port ? ft_txd_ready : txd_ready;
 
     // SDRAM/configuration commands wait while SPI or accepted program work
@@ -264,14 +269,21 @@ module host_protocol(
 
     // Pull arbitration. Between commands either port may start one; during
     // a command only its port is read, and nothing is read while LOGPOLL
-    // drains or a RAMREAD response streams. A byte is popped only if it
+    // drains, a RAMREAD response streams, a RAMWRITE burst is owned by
+    // SDRAM, or CHIPPROFILE validates/replies. A byte is popped only if it
     // will be processed: the next one opens or continues an ungated
     // command, or the SDRAM gate is open. Both FIFOs pop with registered
     // strobes, so rx_hold spaces pops two cycles apart (well within the
     // FT245's ~22-cycle byte delivery).
     reg rx_hold;
     wire cmd_ungated = cmd == CMD_HOLDCTL || cmd == CMD_LOGCTL || cmd == CMD_TOCTOU;
-    wire rx_parser_ready = !rx_hold && (cmd_idle || (in_count != 0 && read_state == 0));
+    wire rx_expecting_data = (in_count != 0) &&
+                             (read_state == 3'd0) &&
+                             (write_state == 3'd0) &&
+                             !write_buf_full &&
+                             !profile_check_active &&
+                             (log_poll_state == 2'd0);
+    wire rx_parser_ready = !rx_hold && (cmd_idle || rx_expecting_data);
     wire ft_rx_take = rx_parser_ready && ft_rx_data_available &&
                       (cmd_idle || active_port) &&
                       (serial_gate || (cmd_idle ? ungated_opcode(ft_rx_data) : cmd_ungated));
@@ -305,8 +317,9 @@ module host_protocol(
     // A program command can take ownership only between host commands: a
     // multi-byte command's remaining bytes must not wait behind it.
     assign program_allowed = spi_csel_buf[1] && in_count == 0 &&
+                             !profile_check_active &&
                              read_state == 0 && write_state == 0 &&
-                             !write_strobe && host_access_cmd == 0 &&
+                             !write_buf_full && host_access_cmd == 0 &&
                              !sdram_cmd_busy && !sdram_read_busy;
     assign sdram_access_cmd = host_access_cmd;
     assign sdram_access_addr = host_access_addr;
@@ -326,10 +339,13 @@ module host_protocol(
     assign sfdp_rdata = sfdp_read_valid ? sfdp_read_byte : 8'hFF;
     
     // CHIPCONFIG state
+    reg [23:0] cfg_jedec_buf;
+    reg cfg_4byte_buf;
+    reg [22:0] cfg_erase_buf;
+    reg cfg_sfdp_reject;
     reg [6:0] sfdp_wr_pos;
     reg [7:0] cfg_sfdp_remaining;
     reg profile_incomplete;
-    reg profile_check_active;
     reg [2:0] profile_check_index = 0;
     reg profile_header_good;
     reg profile_start, profile_byte_valid;
@@ -481,8 +497,7 @@ module host_protocol(
             host_access_cmd <= 0;
             sdram_inhibit_refresh <= 0;
 
-            write_strobe <= 0;
-            write_strobe_r <= 0;
+            write_buf_full <= 0;
 
             txd_strobe_buf <= 0;
             txd_data_buf <= 0;
@@ -523,6 +538,10 @@ module host_protocol(
             
             cfg_jedec_id <= {8'h17, 8'h40, 8'hEF};  // Default: W25Q64FV (EF 40 17)
             cfg_4byte <= 0;
+            cfg_jedec_buf <= 0;
+            cfg_4byte_buf <= 0;
+            cfg_erase_buf <= 0;
+            cfg_sfdp_reject <= 0;
             profile_start <= 0; profile_byte_valid <= 0; profile_byte_data <= 0;
             cfg_profile_valid <= 0;
             cfg_profile_epoch <= 0;
@@ -630,23 +649,6 @@ module host_protocol(
                 sfdp_mem[sfdp_waddr] <= sfdp_wdata;
 
             host_access_addr <= addr_to_access;
-            // Snapshot write_buffer into sdram_write_buffer.
-            //
-            // Problem: FT245 delivers bytes ~12 cycles apart.  After byte 7
-            // sets write_strobe, byte 0 of the NEXT burst can arrive and
-            // overwrite write_buffer[0] before the SDRAM controller reads
-            // sdram_write_buffer.  Continuous mirroring would propagate the
-            // corruption.
-            //
-            // Solution: detect the rising edge of write_strobe (one cycle
-            // after byte 7 arrives, so write_buffer has all 8 bytes) and
-            // do one final mirror.  After that, freeze until both
-            // write_strobe and write_state are clear (write complete).
-            // The separate program engine owns its own write payload.
-            write_strobe_r <= write_strobe;
-            if ((write_strobe && !write_strobe_r) ||
-                (!write_strobe && (write_state == 3'd0)))
-                host_write_data <= write_buffer;
             
             // Protect only the ACTIVATE -> READ/WRITE pair. Once the
             // auto-precharged burst completes, transport backpressure and
@@ -729,17 +731,20 @@ module host_protocol(
             if (!spi_active_sync)
                 redirect_active <= 0;
                 
-            // Serial protocol idle timeout: reset parser if stuck in
-            // multi-byte command header with no data for ~137us.
-            // Exclude active read/write operations: during reads the
-            // host sends nothing (waiting for response data), so the
-            // idle counter would fire and kill the transfer.
-            if (in_count != 0 && !rxd_strobe_buf &&
-                (read_state == 3'd0) && (write_state == 3'd0)) begin
+            // Serial protocol idle timeout: reset parser if stuck waiting
+            // for host input bytes (~546us in headers, ~35ms in incoming
+            // payloads). Only runs while expecting input bytes, never while
+            // draining SDRAM, validating CHIPPROFILE, or waiting for TX,
+            // and never on a cycle a new byte is already being popped.
+            if (rx_expecting_data && !rxd_strobe_buf && !rx_hold &&
+                !ft_rx_take && !uart_rx_take) begin
                 serial_idle_count <= serial_idle_count + 1;
                 if (serial_idle_expired) begin
                     in_count <= 0;
                     cmd <= CMD_NOP;
+                    write_pos <= 0;
+                    cfg_sfdp_remaining <= 0;
+                    cfg_sfdp_reject <= 0;
                     if (cmd == CMD_CHIPPROFILE) begin
                         profile_check_active <= 0; cfg_profile_valid <= 0;
                         profile_incomplete <= 1;
@@ -912,10 +917,12 @@ module host_protocol(
 
                                 write_state <= 0;
                                 write_pos <= 0;
+                                write_buf_full <= 0;
                             end
                             else if (rxd_data_buf == CMD_CHIPCONFIG) begin
                                 cmd <= CMD_CHIPCONFIG;
                                 in_count <= 1;
+                                cfg_sfdp_reject <= 0;
                                 cfg_profile_valid <= 0;
                                 profile_incomplete <= 1;
                             end
@@ -947,64 +954,98 @@ module host_protocol(
                         //   Byte 5-7: Chip erase burst count (23-bit MSB)
                         //   Byte 8:   SFDP table length (0-128)
                         //   Byte 9+:  SFDP table data
-                        // Response: 0x01
+                        // Response: 0x01 on success, 0x02 if SFDP length > 128
                         // -----------------------------------------------
                         
-                        // Store header bytes into config registers.
-                        // JEDEC ID is packed as {device_lo, device_hi, manufacturer}
-                        // so that READID outputs [7:0]=manufacturer first, matching
-                        // the SPI RDID response order (manufacturer, type, capacity).
-                        if (in_count == 8'd1)
-                            cfg_jedec_id[7:0] <= rxd_data_buf;   // manufacturer
-                        else if (in_count == 8'd2)
-                            cfg_jedec_id[15:8] <= rxd_data_buf;  // device high (type)
-                        else if (in_count == 8'd3)
-                            cfg_jedec_id[23:16] <= rxd_data_buf; // device low (capacity)
-                        else if (in_count == 8'd4)
-                            cfg_4byte <= rxd_data_buf[0];
-                        else if (in_count == 8'd5)
-                            cfg_chip_erase_bursts[22:16] <= rxd_data_buf[6:0];
-                        else if (in_count == 8'd6)
-                            cfg_chip_erase_bursts[15:8] <= rxd_data_buf;
-                        else if (in_count == 8'd7)
-                            cfg_chip_erase_bursts[7:0] <= rxd_data_buf;
+                        // Stage header bytes and commit only when SFDP length
+                        // is valid (<= 128). Hold in_count at 9 while draining
+                        // SFDP bytes so lengths 248-255 cannot wrap in_count
+                        // back to 0 and reinterpret payload bytes as opcodes.
+                        if (in_count == 8'd1) begin
+                            cfg_jedec_buf[7:0] <= rxd_data_buf;   // manufacturer
+                            in_count <= 8'd2;
+                        end
+                        else if (in_count == 8'd2) begin
+                            cfg_jedec_buf[15:8] <= rxd_data_buf;  // device high (type)
+                            in_count <= 8'd3;
+                        end
+                        else if (in_count == 8'd3) begin
+                            cfg_jedec_buf[23:16] <= rxd_data_buf; // device low (capacity)
+                            in_count <= 8'd4;
+                        end
+                        else if (in_count == 8'd4) begin
+                            cfg_4byte_buf <= rxd_data_buf[0];
+                            in_count <= 8'd5;
+                        end
+                        else if (in_count == 8'd5) begin
+                            cfg_erase_buf[22:16] <= rxd_data_buf[6:0];
+                            in_count <= 8'd6;
+                        end
+                        else if (in_count == 8'd6) begin
+                            cfg_erase_buf[15:8] <= rxd_data_buf;
+                            in_count <= 8'd7;
+                        end
+                        else if (in_count == 8'd7) begin
+                            cfg_erase_buf[7:0] <= rxd_data_buf;
+                            in_count <= 8'd8;
+                        end
                         else if (in_count == 8'd8) begin
-                            cfg_sfdp_remaining <= rxd_data_buf;
                             sfdp_valid_len <= 0;
                             sfdp_wr_pos <= 0;
+                            if (rxd_data_buf == 8'd0) begin
+                                cfg_jedec_id <= cfg_jedec_buf;
+                                cfg_4byte <= cfg_4byte_buf;
+                                cfg_chip_erase_bursts <= cfg_erase_buf;
+                                cfg_sfdp_remaining <= 0;
+                                cfg_sfdp_reject <= 0;
+                                profile_incomplete <= 0;
+                                txd_strobe_buf <= 1;
+                                txd_data_buf <= 8'h01;
+                                in_count <= 0;
+                                cmd <= CMD_NOP;
+                            end
+                            else if (rxd_data_buf <= 8'd128) begin
+                                cfg_jedec_id <= cfg_jedec_buf;
+                                cfg_4byte <= cfg_4byte_buf;
+                                cfg_chip_erase_bursts <= cfg_erase_buf;
+                                cfg_sfdp_remaining <= rxd_data_buf;
+                                cfg_sfdp_reject <= 0;
+                                in_count <= 8'd9;
+                            end
+                            else begin
+                                // Declared SFDP payload exceeds 128-byte BSRAM:
+                                // drain the declared bytes without writing
+                                // config/SFDP, then reply 0x02 while keeping
+                                // profile_incomplete set.
+                                cfg_sfdp_remaining <= rxd_data_buf;
+                                cfg_sfdp_reject <= 1'b1;
+                                in_count <= 8'd9;
+                            end
                         end
-                        // SFDP data bytes: single-cycle BSRAM write pulse.
+                        // SFDP data bytes (in_count == 9): write or discard.
                         else begin
-                            sfdp_waddr <= sfdp_wr_pos;
-                            sfdp_wdata <= rxd_data_buf;
-                            sfdp_wren <= 1'b1;
-                            // Only received bytes are valid, even if an
-                            // incomplete CHIPCONFIG later times out.
-                            if (sfdp_valid_len < 8'd128)
+                            if (!cfg_sfdp_reject) begin
+                                sfdp_waddr <= sfdp_wr_pos;
+                                sfdp_wdata <= rxd_data_buf;
+                                sfdp_wren <= 1'b1;
                                 sfdp_valid_len <= sfdp_valid_len + 1'b1;
-                            sfdp_wr_pos <= sfdp_wr_pos + 1;
-                            cfg_sfdp_remaining <= cfg_sfdp_remaining - 1;
-                        end
-                        
-                        // Advance or finish
-                        if (in_count == 8'd8 && rxd_data_buf == 0) begin
-                            // No SFDP data, done immediately
-                            profile_incomplete <= 0;
-                            txd_strobe_buf <= 1;
-                            txd_data_buf <= 8'h01;
-                            in_count <= 0;
-                            cmd <= CMD_NOP;
-                        end
-                        else if (in_count > 8'd8 && cfg_sfdp_remaining == 8'd1) begin
-                            // Last SFDP byte received, done
-                            profile_incomplete <= 0;
-                            txd_strobe_buf <= 1;
-                            txd_data_buf <= 8'h01;
-                            in_count <= 0;
-                            cmd <= CMD_NOP;
-                        end
-                        else begin
-                            in_count <= in_count + 1;
+                                sfdp_wr_pos <= sfdp_wr_pos + 1'b1;
+                            end
+                            cfg_sfdp_remaining <= cfg_sfdp_remaining - 1'b1;
+                            if (cfg_sfdp_remaining == 8'd1) begin
+                                if (cfg_sfdp_reject) begin
+                                    txd_strobe_buf <= 1;
+                                    txd_data_buf <= 8'h02;
+                                end
+                                else begin
+                                    profile_incomplete <= 0;
+                                    txd_strobe_buf <= 1;
+                                    txd_data_buf <= 8'h01;
+                                end
+                                cfg_sfdp_reject <= 0;
+                                in_count <= 0;
+                                cmd <= CMD_NOP;
+                            end
                         end
                     end
                     else if (cmd == CMD_HOLDCTL) begin
@@ -1045,7 +1086,7 @@ module host_protocol(
                         //     0x03 DISARM: +index(1)
                         //     0x04 RESET:  +index(1)
                         //     0x05 RESET_ALL: (no extra bytes)
-                        // Response: 0x01 on completion
+                        // Response: 0x01 on completion, 0x02 on unknown sub-command
                         // -----------------------------------------------
                         if (in_count == 1) begin
                             toctou_sub_cmd <= rxd_data_buf;
@@ -1060,8 +1101,18 @@ module host_protocol(
                                 in_count <= 0;
                                 cmd <= CMD_NOP;
                             end
-                            else
+                            else if (rxd_data_buf == TOCTOU_SET ||
+                                     rxd_data_buf == TOCTOU_ARM ||
+                                     rxd_data_buf == TOCTOU_DISARM ||
+                                     rxd_data_buf == TOCTOU_RESET) begin
                                 in_count <= 2;
+                            end
+                            else begin
+                                txd_strobe_buf <= 1;
+                                txd_data_buf <= 8'h02;
+                                in_count <= 0;
+                                cmd <= CMD_NOP;
+                            end
                         end
                         else if (in_count == 2) begin
                             toctou_index <= rxd_data_buf[1:0];
@@ -1088,8 +1139,13 @@ module host_protocol(
                                 in_count <= 0;
                                 cmd <= CMD_NOP;
                             end
-                            else
+                            else if (toctou_sub_cmd == TOCTOU_SET) begin
                                 in_count <= 3;
+                            end
+                            else begin
+                                in_count <= 0;
+                                cmd <= CMD_NOP;
+                            end
                         end
                         // TOCTOU SET: receive start(3), mask(3), replace(3)
                         else if (in_count == 3)  begin toctou_start_buf[23:16] <= rxd_data_buf; in_count <= 4; end
@@ -1115,37 +1171,50 @@ module host_protocol(
                             cmd <= CMD_NOP;
                         end
                     end
-                    else begin
+                    else if (cmd == CMD_RAMREAD || cmd == CMD_RAMWRITE) begin
                         // RAMREAD / RAMWRITE handling (v3: 6-byte header)
                         // Header: cmd, addr[2], addr[1], addr[0], len_hi, len_lo
-                        if (in_count <= 3)
+                        if (in_count <= 8'd3) begin
                             addr <= {addr[14:0], rxd_data_buf};
-                        else if (in_count == 4)
+                            in_count <= in_count + 1'b1;
+                        end
+                        else if (in_count == 8'd4) begin
                             len[15:8] <= rxd_data_buf;
-                        else if (in_count == 5)
+                            in_count <= 8'd5;
+                        end
+                        else if (in_count == 8'd5) begin
                             len[7:0] <= rxd_data_buf;
-
-                        if (cmd == CMD_RAMREAD && in_count == 5) begin
-                            read_state <= 1;
-                        end
-                        if (cmd == CMD_RAMWRITE && in_count > 5) begin
-                            write_buffer[write_pos*8 +: 8] <= rxd_data_buf;
-                            
-                            if (write_pos == 7) begin
-                                write_strobe <= 1;
+                            if (len[15:8] == 8'd0 && rxd_data_buf == 8'd0) begin
+                                // Reject zero-length transfers before starting
+                                // SDRAM work. RAMREAD emits nothing into its
+                                // unframed data stream; RAMWRITE replies 0x02.
+                                if (cmd == CMD_RAMWRITE) begin
+                                    txd_strobe_buf <= 1;
+                                    txd_data_buf <= 8'h02;
+                                end
+                                in_count <= 0;
+                                cmd <= CMD_NOP;
                             end
-                            write_pos <= write_pos + 1;
+                            else begin
+                                in_count <= 8'd6;
+                                if (cmd == CMD_RAMREAD)
+                                    read_state <= 3'd1;
+                            end
                         end
-
-                        if (in_count <= 5)
-                            in_count <= in_count + 1;
+                        else if (cmd == CMD_RAMWRITE) begin
+                            write_buffer[write_pos*8 +: 8] <= rxd_data_buf;
+                            if (write_pos == 3'd7) begin
+                                write_buf_full <= 1'b1;
+                                write_pos <= 3'd0;
+                            end
+                            else begin
+                                write_pos <= write_pos + 1'b1;
+                            end
+                        end
                     end
 
                 end
                 else if (serial_gate) begin
-
-                    if (write_strobe && !sdram_busy)
-                        write_state <= 1;
 
                     if (read_state != 3'd0) begin
                         if ((read_state == 1) && !sdram_busy) begin
@@ -1183,7 +1252,6 @@ module host_protocol(
                         if ((write_state == 1) && !sdram_busy) begin
                             // Activate
                             host_access_cmd <= 2'b11;
-                            write_strobe <= 0;
                             write_state <= 2;
                         end
                         else if ((write_state == 2) && !sdram_busy) begin
@@ -1196,17 +1264,23 @@ module host_protocol(
                                 if (can_send) begin
                                     txd_strobe_buf <= 1;
                                     txd_data_buf <= 8'h01;
+                                    write_buf_full <= 0;
                                     write_state <= 0;
                                     in_count <= 0;
                                     cmd <= CMD_NOP;
                                 end
                             end
                             else begin
+                                write_buf_full <= 0;
                                 write_state <= 0;
                                 addr <= addr + 1;
                                 len <= len - 1;
                             end
                         end
+                    end
+                    else if (write_buf_full && !sdram_busy) begin
+                        host_write_data <= write_buffer;
+                        write_state <= 3'd1;
                     end
                 end
             end
