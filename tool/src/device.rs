@@ -272,6 +272,23 @@ impl FlashDevice {
         }
     }
 
+    /// Resume SPI emulation only when a mutating operation succeeds.
+    /// Failed or cancelled writes leave emulation stopped so the target
+    /// cannot read partial or unverified flash data.
+    pub(crate) async fn finish_stopped_on_success<T>(
+        &mut self,
+        was_running: bool,
+        operation: Result<T>,
+    ) -> Result<T> {
+        let value = operation?;
+        if was_running {
+            self.start_emulation()
+                .await
+                .context("operation completed, but emulation could not be resumed")?;
+        }
+        Ok(value)
+    }
+
     pub(crate) async fn read(&mut self, address: u32, length: u32) -> Result<Vec<u8>> {
         self.read_with_progress(address, length, |_| Ok(())).await
     }
@@ -501,7 +518,7 @@ impl FlashDevice {
         let operation = self
             .configure_raw(jedec_id, total_size, supports_4byte, sfdp_table)
             .await;
-        self.finish_stopped(was_running, operation).await
+        self.finish_stopped_on_success(was_running, operation).await
     }
 
     async fn configure_raw(
@@ -729,7 +746,7 @@ impl WriteSession<'_> {
             }
         });
         self.device
-            .finish_stopped(self.was_running, operation)
+            .finish_stopped_on_success(self.was_running, operation)
             .await
     }
 }
@@ -737,7 +754,9 @@ impl WriteSession<'_> {
 #[cfg(feature = "cli")]
 impl FlashDevice {
     /// Load is the one operation whose natural end state is running, even if
-    /// the emulator was stopped before the operation.
+    /// the emulator was stopped before the operation. If loading or
+    /// verification fails, emulation is intentionally left stopped so the
+    /// target does not boot from partial or unverified data.
     pub(crate) fn with_emulation_then_start<F, R>(&mut self, operation: F) -> Result<R>
     where
         F: FnOnce(&mut Self) -> Result<R>,
@@ -753,21 +772,11 @@ impl FlashDevice {
 
         eprintln!("Stopping SPI emulation...");
         self.stop_emulation()?;
-        let result = operation(self);
-        let restoration = self.start_emulation();
-        match (result, restoration) {
-            (Ok(value), Ok(())) => {
-                eprintln!("SPI emulation started; target can now read the loaded data.");
-                Ok(value)
-            }
-            (Ok(_), Err(error)) => {
-                Err(error.context("load completed, but SPI emulation could not be started"))
-            }
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(start_error)) => Err(error.context(format!(
-                "SPI emulation also could not be started: {start_error:#}"
-            ))),
-        }
+        let value = operation(self)?;
+        self.start_emulation()
+            .context("load completed, but SPI emulation could not be started")?;
+        eprintln!("SPI emulation started; target can now read the loaded data.");
+        Ok(value)
     }
 }
 
@@ -931,8 +940,8 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_write_session_still_restores_emulation() {
-        let (transport, writes) = MockTransport::new([1, 1, 1, 1]);
+    fn cancelled_write_session_leaves_emulation_stopped() {
+        let (transport, writes) = MockTransport::new([1, 1, 1]);
         let mut device =
             FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
 
@@ -944,7 +953,96 @@ mod tests {
             .to_string();
 
         assert!(error.contains("cancelled by test"));
-        assert_eq!(writes.borrow().last(), Some(&vec![CMD_START]));
+        let sent = writes.borrow();
+        assert_eq!(
+            sent.iter().map(|packet| packet[0]).collect::<Vec<_>>(),
+            [CMD_STATUS, CMD_STOP, CMD_WRITE]
+        );
+    }
+
+    #[test]
+    fn with_emulation_then_start_starts_only_on_success() {
+        let (transport, writes) = MockTransport::new([1, 1, 1]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+
+        device
+            .with_emulation_then_start(|dev| dev.write_raw_with_progress(0, &[0x55; 8], |_| Ok(())))
+            .unwrap();
+
+        let sent = writes.borrow();
+        assert_eq!(
+            sent.iter().map(|packet| packet[0]).collect::<Vec<_>>(),
+            [CMD_STOP, CMD_WRITE, CMD_START]
+        );
+    }
+
+    #[test]
+    fn with_emulation_then_start_leaves_stopped_on_write_or_verify_failure() {
+        // Write NAK -> must not send CMD_START.
+        let (transport, writes) = MockTransport::new([1, 2]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+        let error = format!(
+            "{:#}",
+            device
+                .with_emulation_then_start(|dev| {
+                    dev.write_raw_with_progress(0, &[0x55; 8], |_| Ok(()))
+                })
+                .unwrap_err()
+        );
+        assert!(error.contains("write"));
+        assert_eq!(
+            writes
+                .borrow()
+                .iter()
+                .map(|packet| packet[0])
+                .collect::<Vec<_>>(),
+            [CMD_STOP, CMD_WRITE]
+        );
+
+        // Write succeeds, verify fails -> must not send CMD_START.
+        let (transport, writes) = MockTransport::new([1, 1]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+        let error = device
+            .with_emulation_then_start(|dev| -> Result<()> {
+                dev.write_raw_with_progress(0, &[0x55; 8], |_| Ok(()))?;
+                bail!("Verification failed: 1 byte(s) differ")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Verification failed"));
+        assert_eq!(
+            writes
+                .borrow()
+                .iter()
+                .map(|packet| packet[0])
+                .collect::<Vec<_>>(),
+            [CMD_STOP, CMD_WRITE]
+        );
+    }
+
+    #[test]
+    fn with_emulation_then_start_reports_start_failure_after_load() {
+        let (transport, writes) = MockTransport::new([1, 1, 2]);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+
+        let error = device
+            .with_emulation_then_start(|dev| dev.write_raw_with_progress(0, &[0x55; 8], |_| Ok(())))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("load completed, but SPI emulation could not be started"));
+        assert_eq!(
+            writes
+                .borrow()
+                .iter()
+                .map(|packet| packet[0])
+                .collect::<Vec<_>>(),
+            [CMD_STOP, CMD_WRITE, CMD_START]
+        );
     }
     fn catalog_chip() -> crate::chip::FlashChip {
         crate::chip::find_chip_by_name(&crate::chip::ChipDatabase::new(), "W25Q128.V")
