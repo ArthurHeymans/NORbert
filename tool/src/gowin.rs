@@ -10,11 +10,14 @@
 //! GW5A JTAG-SPI bridge.
 
 use crate::gowin_validation::{
-    GowinBitstream, find_erase_opcode, flash_capacity, validate_flash_range,
+    FLASH_SECTOR_SIZE, GowinBitstream, combine_primary_and_cleanup_error, find_erase_opcode,
+    flash_capacity, plan_sector_erase, verify_unprotected_status,
 };
 use ftdi_nusb::constants::mpsse;
 use ftdi_nusb::mpsse::MpsseContext;
 use ftdi_nusb::{FtdiDevice, Interface};
+use futures_util::{future::Either, pin_mut};
+use gloo_timers::future::TimeoutFuture;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{UsbDevice, UsbDeviceFilter, UsbDeviceRequestOptions};
@@ -124,16 +127,21 @@ pub async fn program_sram_from_webusb(
 ) -> Result<ProgramReport, String> {
     let bitstream = GowinBitstream::parse(fs, true)?;
     let mut programmer = GowinProgrammer::open().await?;
-    let idcode = programmer.detect_idcode().await?;
-    validate_idcode(idcode, bitstream.idcode)?;
-    programmer.program_sram(&bitstream, &mut progress).await?;
-    Ok(ProgramReport {
-        idcode,
-        bitstream_idcode: bitstream.idcode,
-        checksum: bitstream.checksum,
-        bytes_programmed: bitstream.sram_data.len(),
-        flash_jedec_id: None,
-    })
+    let result = async {
+        let idcode = programmer.detect_idcode().await?;
+        validate_idcode(idcode, bitstream.idcode)?;
+        programmer.program_sram(&bitstream, &mut progress).await?;
+        Ok(ProgramReport {
+            idcode,
+            bitstream_idcode: bitstream.idcode,
+            checksum: bitstream.checksum,
+            bytes_programmed: bitstream.sram_data.len(),
+            flash_jedec_id: None,
+        })
+    }
+    .await;
+    let cleanup = programmer.shutdown().await;
+    combine_primary_and_cleanup_error(result, cleanup, "failed to release WebUSB JTAG interface")
 }
 
 /// Parses and programs a Gowin `.fs` bitstream into the external SPI flash.
@@ -144,18 +152,23 @@ pub async fn program_flash_from_webusb(
 ) -> Result<ProgramReport, String> {
     let bitstream = GowinBitstream::parse(fs, false)?;
     let mut programmer = GowinProgrammer::open().await?;
-    let idcode = programmer.detect_idcode().await?;
-    validate_idcode(idcode, bitstream.idcode)?;
-    let jedec = programmer
-        .program_external_flash(&bitstream, options, &mut progress)
-        .await?;
-    Ok(ProgramReport {
-        idcode,
-        bitstream_idcode: bitstream.idcode,
-        checksum: bitstream.checksum,
-        bytes_programmed: bitstream.flash_data.len(),
-        flash_jedec_id: Some(jedec),
-    })
+    let result = async {
+        let idcode = programmer.detect_idcode().await?;
+        validate_idcode(idcode, bitstream.idcode)?;
+        let jedec = programmer
+            .program_external_flash(&bitstream, options, &mut progress)
+            .await?;
+        Ok(ProgramReport {
+            idcode,
+            bitstream_idcode: bitstream.idcode,
+            checksum: bitstream.checksum,
+            bytes_programmed: bitstream.flash_data.len(),
+            flash_jedec_id: Some(jedec),
+        })
+    }
+    .await;
+    let cleanup = programmer.shutdown().await;
+    combine_primary_and_cleanup_error(result, cleanup, "failed to release WebUSB JTAG interface")
 }
 
 fn validate_idcode(jtag_idcode: u32, bitstream_idcode: u32) -> Result<(), String> {
@@ -202,6 +215,10 @@ impl GowinProgrammer {
         Ok(Self { jtag })
     }
 
+    async fn shutdown(&mut self) -> Result<(), String> {
+        self.jtag.shutdown().await
+    }
+
     async fn detect_idcode(&mut self) -> Result<u32, String> {
         self.jtag.go_test_logic_reset().await?;
         self.jtag.set_state(TapState::ShiftDr, 1).await?;
@@ -238,11 +255,11 @@ impl GowinProgrammer {
             .program_spi_flash(&bitstream.flash_data, options, progress)
             .await;
         let post_result = self.post_flash_access().await;
-        match (result, post_result) {
-            (Ok(jedec), Ok(())) => Ok(jedec),
-            (Err(err), _) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
-        }
+        combine_primary_and_cleanup_error(
+            result,
+            post_result,
+            "failed to exit JTAG-SPI flash bridge",
+        )
     }
 
     async fn send_command(&mut self, cmd: u8) -> Result<(), String> {
@@ -537,10 +554,17 @@ impl GowinProgrammer {
             return Err(format!("failed to read SPI flash JEDEC ID: {id:02x?}"));
         }
         let jedec = (u32::from(id[0]) << 16) | (u32::from(id[1]) << 8) | u32::from(id[2]);
-        // Establish physical capacity before changing protection or erasing flash.
-        // Fail closed rather than guessing a capacity for unknown/non-SFDP chips.
+        // Establish physical capacity and erase footprint before changing protection
+        // or erasing flash. Fail closed rather than guessing for non-SFDP chips.
         let (capacity, sector_erase_opcode) = self.spi_flash_geometry().await?;
-        let end_addr = validate_flash_range(options.offset, data.len(), capacity)?;
+        let footprint = plan_sector_erase(options.offset, data.len(), capacity)?;
+        let erase_opcode = if options.chip_erase {
+            None
+        } else {
+            Some(sector_erase_opcode.ok_or(
+                "flash SFDP does not advertise a 4 KiB erase command; use whole-chip erase",
+            )?)
+        };
 
         let status = self.spi_read_status().await?;
         if (status & FLASH_BP_MASK) != 0 {
@@ -550,25 +574,40 @@ impl GowinProgrammer {
                 ));
             }
             self.spi_write_status(status & !FLASH_BP_MASK).await?;
+            let after = self.spi_read_status().await?;
+            verify_unprotected_status(after, FLASH_BP_MASK)?;
         }
+
+        // Preserve any bytes outside [offset, offset + data.len()) that share an
+        // erased 4 KiB sector so partial-sector writes never destroy adjacent data.
+        let preserved_head = if !options.chip_erase && footprint.head_preserve_len > 0 {
+            self.spi_read_range(footprint.erase_start, footprint.head_preserve_len)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let preserved_tail = if !options.chip_erase && footprint.tail_preserve_len > 0 {
+            self.spi_read_range(footprint.tail_preserve_addr, footprint.tail_preserve_len)
+                .await?
+        } else {
+            Vec::new()
+        };
 
         if options.chip_erase {
             self.spi_write_enable().await?;
             self.spi_transfer(FLASH_CE, &[], 0).await?;
             self.spi_wait_mutation(2_000_000, "chip erase").await?;
         } else {
-            let erase_opcode = sector_erase_opcode.ok_or(
-                "flash SFDP does not advertise a 4 KiB erase command; use whole-chip erase",
-            )?;
-            let start = options.offset & !0xfff;
-            let end = (end_addr + 0xfff) & !0xfff;
-            let total = (end - start) as usize;
+            let erase_opcode = erase_opcode.expect("checked above");
+            let total = (footprint.erase_end - footprint.erase_start) as usize;
             let mut erased = 0usize;
-            for addr in (start..end).step_by(0x1000) {
+            for addr in
+                (footprint.erase_start..footprint.erase_end).step_by(FLASH_SECTOR_SIZE as usize)
+            {
                 self.spi_write_enable().await?;
                 self.spi_transfer(erase_opcode, &addr24(addr), 0).await?;
                 self.spi_wait_mutation(200_000, "sector erase").await?;
-                erased += 0x1000;
+                erased += FLASH_SECTOR_SIZE as usize;
                 progress(ProgramProgress {
                     stage: "Erasing flash",
                     done: erased.min(total),
@@ -578,52 +617,132 @@ impl GowinProgrammer {
             }
         }
 
-        let mut written = 0usize;
-        while written < data.len() {
-            let addr = options.offset + written as u32;
-            let page_remaining = 256 - (addr as usize & 0xff);
-            let chunk_len = page_remaining.min(data.len() - written);
-            let chunk = &data[written..written + chunk_len];
-            let mut payload = Vec::with_capacity(3 + chunk.len());
-            payload.extend_from_slice(&addr24(addr));
-            payload.extend_from_slice(chunk);
-            self.spi_write_enable().await?;
-            self.spi_transfer(FLASH_PP, &payload, 0).await?;
-            self.spi_wait_mutation(1000, "page program").await?;
-            written += chunk_len;
-            progress(ProgramProgress {
-                stage: "Writing flash",
-                done: written,
-                total: data.len(),
-            });
-            sleep_ms(0).await;
+        if !preserved_head.is_empty() {
+            self.spi_program_range(footprint.erase_start, &preserved_head, true, None, progress)
+                .await?;
+        }
+        self.spi_program_range(options.offset, data, false, Some("Writing flash"), progress)
+            .await?;
+        if !preserved_tail.is_empty() {
+            self.spi_program_range(
+                footprint.tail_preserve_addr,
+                &preserved_tail,
+                true,
+                None,
+                progress,
+            )
+            .await?;
         }
 
         if options.verify {
-            let mut verified = 0usize;
-            for (chunk_index, expected) in data.chunks(256).enumerate() {
-                let addr = options.offset + (chunk_index * 256) as u32;
-                let actual = self
-                    .spi_transfer(FLASH_READ, &addr24(addr), expected.len())
+            if !preserved_head.is_empty() {
+                self.spi_verify_range(footprint.erase_start, &preserved_head, None, progress)
                     .await?;
-                if actual != expected {
-                    return Err(format!(
-                        "flash verification failed at address 0x{addr:06x}: expected {:02x?}, got {:02x?}",
-                        &expected[..expected.len().min(16)],
-                        &actual[..actual.len().min(16)]
-                    ));
-                }
-                verified += expected.len();
-                progress(ProgramProgress {
-                    stage: "Verifying flash",
-                    done: verified,
-                    total: data.len(),
-                });
-                sleep_ms(0).await;
+            }
+            self.spi_verify_range(options.offset, data, Some("Verifying flash"), progress)
+                .await?;
+            if !preserved_tail.is_empty() {
+                self.spi_verify_range(
+                    footprint.tail_preserve_addr,
+                    &preserved_tail,
+                    None,
+                    progress,
+                )
+                .await?;
             }
         }
 
         Ok(jedec)
+    }
+
+    async fn spi_read_range(&mut self, start_addr: u32, len: usize) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(len);
+        let mut read = 0usize;
+        while read < len {
+            let chunk_len = 256.min(len - read);
+            let addr = start_addr + read as u32;
+            let chunk = self
+                .spi_transfer(FLASH_READ, &addr24(addr), chunk_len)
+                .await?;
+            if chunk.len() != chunk_len {
+                return Err(format!(
+                    "short SPI flash read at 0x{addr:06x}: expected {chunk_len} bytes, got {}",
+                    chunk.len()
+                ));
+            }
+            out.extend_from_slice(&chunk);
+            read += chunk_len;
+            sleep_ms(0).await;
+        }
+        Ok(out)
+    }
+
+    async fn spi_program_range(
+        &mut self,
+        start_addr: u32,
+        data: &[u8],
+        skip_erased: bool,
+        stage: Option<&'static str>,
+        progress: &mut impl FnMut(ProgramProgress),
+    ) -> Result<(), String> {
+        let mut written = 0usize;
+        while written < data.len() {
+            let addr = start_addr + written as u32;
+            let page_remaining = 256 - (addr as usize & 0xff);
+            let chunk_len = page_remaining.min(data.len() - written);
+            let chunk = &data[written..written + chunk_len];
+            if !(skip_erased && chunk.iter().all(|&byte| byte == 0xff)) {
+                let mut payload = Vec::with_capacity(3 + chunk.len());
+                payload.extend_from_slice(&addr24(addr));
+                payload.extend_from_slice(chunk);
+                self.spi_write_enable().await?;
+                self.spi_transfer(FLASH_PP, &payload, 0).await?;
+                self.spi_wait_mutation(1000, "page program").await?;
+            }
+            written += chunk_len;
+            if let Some(stage) = stage {
+                progress(ProgramProgress {
+                    stage,
+                    done: written,
+                    total: data.len(),
+                });
+            }
+            sleep_ms(0).await;
+        }
+        Ok(())
+    }
+
+    async fn spi_verify_range(
+        &mut self,
+        start_addr: u32,
+        data: &[u8],
+        stage: Option<&'static str>,
+        progress: &mut impl FnMut(ProgramProgress),
+    ) -> Result<(), String> {
+        let mut verified = 0usize;
+        for (chunk_index, expected) in data.chunks(256).enumerate() {
+            let addr = start_addr + (chunk_index * 256) as u32;
+            let actual = self
+                .spi_transfer(FLASH_READ, &addr24(addr), expected.len())
+                .await?;
+            if actual != expected {
+                return Err(format!(
+                    "flash verification failed at address 0x{addr:06x}: expected {:02x?}, got {:02x?}",
+                    &expected[..expected.len().min(16)],
+                    &actual[..actual.len().min(16)]
+                ));
+            }
+            verified += expected.len();
+            if let Some(stage) = stage {
+                progress(ProgramProgress {
+                    stage,
+                    done: verified,
+                    total: data.len(),
+                });
+            }
+            sleep_ms(0).await;
+        }
+        Ok(())
     }
 
     async fn read_sfdp(&mut self, address: u32, len: usize) -> Result<Vec<u8>, String> {
@@ -777,34 +896,64 @@ impl FtdiJtag {
                 )
             })?;
         if dev.chip_type().is_h_type() && dev.max_packet_size() == 0 {
-            return Err(format!(
-                "invalid FTDI device {FTDI_VID:04x}:{FT2232H_PID:04x}: zero max packet size"
-            ));
+            let cleanup = shutdown_ftdi(&mut dev).await;
+            return combine_primary_and_cleanup_error(
+                Err(format!(
+                    "invalid FTDI device {FTDI_VID:04x}:{FT2232H_PID:04x}: zero max packet size"
+                )),
+                cleanup,
+                "failed to release WebUSB JTAG interface",
+            );
         }
-        let ctx = MpsseContext::init(&mut dev, 2_500_000)
-            .await
-            .map_err(|e| format!("failed to initialize FTDI MPSSE: {e}"))?;
+        let ctx = match MpsseContext::init(&mut dev, 2_500_000).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                let cleanup = shutdown_ftdi(&mut dev).await;
+                return combine_primary_and_cleanup_error(
+                    Err(format!("failed to initialize FTDI MPSSE: {e}")),
+                    cleanup,
+                    "failed to release WebUSB JTAG interface",
+                );
+            }
+        };
         let mut this = Self {
             dev,
             ctx,
             state: TapState::TestLogicReset,
         };
-        this.sync_mpsse().await?;
-        // openFPGALoader's `ft2232` cable config for Tang Primer boards.
-        this.ctx
-            .session(&mut this.dev)
-            .map_err(|e| format!("failed to start MPSSE GPIO session: {e}"))?
-            .set_gpio_low(0x08, 0x0b)
-            .await
-            .map_err(|e| format!("failed to configure FTDI low GPIO: {e}"))?;
-        this.ctx
-            .session(&mut this.dev)
-            .map_err(|e| format!("failed to start MPSSE GPIO session: {e}"))?
-            .set_gpio_high(0x08, 0x0b)
-            .await
-            .map_err(|e| format!("failed to configure FTDI high GPIO: {e}"))?;
-        this.go_test_logic_reset().await?;
-        Ok(this)
+        let setup = async {
+            this.sync_mpsse().await?;
+            // openFPGALoader's `ft2232` cable config for Tang Primer boards.
+            this.ctx
+                .session(&mut this.dev)
+                .map_err(|e| format!("failed to start MPSSE GPIO session: {e}"))?
+                .set_gpio_low(0x08, 0x0b)
+                .await
+                .map_err(|e| format!("failed to configure FTDI low GPIO: {e}"))?;
+            this.ctx
+                .session(&mut this.dev)
+                .map_err(|e| format!("failed to start MPSSE GPIO session: {e}"))?
+                .set_gpio_high(0x08, 0x0b)
+                .await
+                .map_err(|e| format!("failed to configure FTDI high GPIO: {e}"))?;
+            this.go_test_logic_reset().await
+        }
+        .await;
+        match setup {
+            Ok(()) => Ok(this),
+            Err(err) => {
+                let cleanup = this.shutdown().await;
+                combine_primary_and_cleanup_error(
+                    Err(err),
+                    cleanup,
+                    "failed to release WebUSB JTAG interface",
+                )
+            }
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<(), String> {
+        shutdown_ftdi(&mut self.dev).await
     }
 
     async fn sync_mpsse(&mut self) -> Result<(), String> {
@@ -1228,6 +1377,19 @@ impl FtdiJtag {
             offset += n;
         }
         Ok(buf)
+    }
+}
+
+async fn shutdown_ftdi(dev: &mut FtdiDevice) -> Result<(), String> {
+    const SHUTDOWN_TIMEOUT_MS: u32 = 5_000;
+
+    let shutdown = dev.shutdown();
+    let timer = TimeoutFuture::new(SHUTDOWN_TIMEOUT_MS);
+    pin_mut!(shutdown);
+    pin_mut!(timer);
+    match futures_util::future::select(shutdown, timer).await {
+        Either::Left(((), _)) => Ok(()),
+        Either::Right(((), _)) => Err("closing WebUSB JTAG device timed out".to_string()),
     }
 }
 
