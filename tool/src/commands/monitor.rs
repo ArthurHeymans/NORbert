@@ -44,9 +44,10 @@ pub(super) fn cmd_monitor(cli: &Cli) -> Result<()> {
     // and protocol responses travel separately now (no mux), the stop
     // ACK is guaranteed to be the *only* reply to CMD_LOGCTL.
     eprintln!("\nStopping...");
-    device.log_stop()?;
-    let remaining = device.log_poll()?;
+    let remaining = device.log_stop_and_drain()?;
     if !remaining.is_empty() {
+        print!("{}", log.feed(&remaining));
+        std::io::stdout().flush()?;
         eprintln!("(drained {} residual log bytes)", remaining.len());
     }
 
