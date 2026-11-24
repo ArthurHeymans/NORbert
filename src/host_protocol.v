@@ -160,8 +160,9 @@ module host_protocol(
     wire serial_payload_timeout = (cmd == CMD_RAMWRITE && in_count > 8'd5) ||
                                   (cmd == CMD_CHIPCONFIG && in_count == 8'd9) ||
                                   (cmd == CMD_CHIPPROFILE && !profile_check_active);
-    wire serial_idle_expired = serial_payload_timeout ?
-                               serial_idle_count[22] : serial_idle_count[16];
+    wire serial_idle_expired_next = serial_payload_timeout ?
+                                    serial_idle_count[22] : serial_idle_count[16];
+    reg serial_idle_expired_q;
 
     reg [22:0] addr;       // 23-bit burst address
     reg [15:0] len;        // 16-bit burst count (v3: 2 header bytes)
@@ -174,14 +175,17 @@ module host_protocol(
 
     // CMD_LOGPOLL state machine.
     //   log_poll_state 0 = idle
-    //                  1 = drain FIFO (send/escape log bytes while available)
-    //                  2 = terminator (send 0xA0 and return to idle)
-    //                  3 = escaped byte payload
-    reg [1:0] log_poll_state;
+    //                  1 = fetch next byte from logger FIFO into log_poll_byte
+    //                  2 = emit/escape log_poll_byte via reply slot
+    //                  3 = emit escaped byte payload via reply slot
+    //                  4 = emit 0xA0 terminator via reply slot and return to idle
+    reg [2:0] log_poll_state;
     reg [7:0] log_poll_remain;       // raw log bytes still allowed before terminator
+    reg [7:0] log_poll_byte;         // staged raw byte from logger FIFO
     reg [7:0] log_poll_escape_code;  // second byte after LOG_POLL_ESCAPE
 
     reg txd_strobe_buf;
+    reg txd_port_buf;
     reg [7:0] txd_data_buf;
     
     reg rxd_strobe_buf;
@@ -191,7 +195,6 @@ module host_protocol(
     
     reg [63:0] write_buffer;
     reg write_buf_full;  // One complete RAMWRITE burst owned until SDRAM retirement
-    
     
     reg [1:0] spi_csel_buf;
 
@@ -226,12 +229,22 @@ module host_protocol(
     // Latched when a command byte arrives while idle.
     reg active_port;
 
+    // Retained single-byte replies: {port, byte} stay latched until the
+    // destination transport accepts them, decoupled from command side effects.
+    // Deferred boot START has its own slot so another port can still issue
+    // status/version queries while page-buffer initialization finishes.
+    reg reply_pending;
+    reg reply_port;
+    reg [7:0] reply_data;
     reg stop_ack_pending;
-    wire cmd_idle = !stop_ack_pending && !profile_check_active &&
+    reg stop_ack_port;
+    reg start_ack_pending;
+    reg start_ack_port;
+
+    wire cmd_idle = !reply_pending && !stop_ack_pending && !profile_check_active &&
                     (cmd == CMD_NOP) && (in_count == 0) &&
                     (read_state == 3'd0) && (write_state == 3'd0) &&
                     !write_buf_full && (log_poll_state == 0);
-    wire mux_txd_ready = active_port ? ft_txd_ready : txd_ready;
 
     // SDRAM/configuration commands wait while SPI or accepted program work
     // owns RAM. With SPI stopped the gate reduces to !spi_writing; STOP may
@@ -270,19 +283,20 @@ module host_protocol(
     // Pull arbitration. Between commands either port may start one; during
     // a command only its port is read, and nothing is read while LOGPOLL
     // drains, a RAMREAD response streams, a RAMWRITE burst is owned by
-    // SDRAM, or CHIPPROFILE validates/replies. A byte is popped only if it
-    // will be processed: the next one opens or continues an ungated
-    // command, or the SDRAM gate is open. Both FIFOs pop with registered
-    // strobes, so rx_hold spaces pops two cycles apart (well within the
-    // FT245's ~22-cycle byte delivery).
+    // SDRAM, CHIPPROFILE validates, or a reply byte waits for TX. A byte is
+    // popped only if it will be processed: the next one opens or continues
+    // an ungated command, or the SDRAM gate is open. Both FIFOs pop with
+    // registered strobes, so rx_hold spaces pops two cycles apart (well
+    // within the FT245's ~22-cycle byte delivery).
     reg rx_hold;
     wire cmd_ungated = cmd == CMD_HOLDCTL || cmd == CMD_LOGCTL || cmd == CMD_TOCTOU;
-    wire rx_expecting_data = (in_count != 0) &&
-                             (read_state == 3'd0) &&
-                             (write_state == 3'd0) &&
-                             !write_buf_full &&
-                             !profile_check_active &&
-                             (log_poll_state == 2'd0);
+    wire rx_waiting_for_byte = (in_count != 0) &&
+                               (read_state == 3'd0) &&
+                               (write_state == 3'd0) &&
+                               !write_buf_full &&
+                               !profile_check_active &&
+                               (log_poll_state == 3'd0);
+    wire rx_expecting_data = rx_waiting_for_byte && !serial_idle_expired_q;
     wire rx_parser_ready = !rx_hold && (cmd_idle || rx_expecting_data);
     wire ft_rx_take = rx_parser_ready && ft_rx_data_available &&
                       (cmd_idle || active_port) &&
@@ -291,18 +305,26 @@ module host_protocol(
                         (cmd_idle || !active_port) &&
                         (serial_gate || (cmd_idle ? ungated_opcode(uart_rx_data) : cmd_ungated));
 
-    // Pipeline-aware TX flow control.
+    // Pipeline-aware per-port TX flow control.
     // After txd_strobe_buf fires, it takes 2 cycles for ft245 to latch
     // tx_pending and for ft_txd_ready to go low.  During those 2 cycles
-    // mux_txd_ready is stale (still high), so glue would over-send.
-    // tx_wait counts down to block sends until back-pressure propagates.
-    // The !txd_strobe_buf term blocks the cycle immediately after the
-    // send (when txd_strobe_buf is visible but tx_wait hasn't loaded yet).
-    // UART is unaffected: its 256-byte FIFO keeps txd_ready high, so the
-    // only overhead is a 2-cycle gap between bytes (~17ns, negligible at
-    // 2 Mbaud = ~5µs/byte).
-    reg [1:0] tx_wait;
-    wire can_send = mux_txd_ready && (tx_wait == 0) && !txd_strobe_buf;
+    // ft_txd_ready is stale (still high), so glue would over-send.
+    // Per-port cooldowns prevent back-pressure on one port from masking
+    // readiness on the other. The !txd_strobe_buf term serializes the
+    // shared output staging register.
+    reg [1:0] uart_tx_wait;
+    reg [1:0] ft_tx_wait;
+    wire uart_can_send = txd_ready && (uart_tx_wait == 2'd0) && !txd_strobe_buf;
+    wire ft_can_send   = ft_txd_ready && (ft_tx_wait == 2'd0) && !txd_strobe_buf;
+    wire reply_can_send = reply_port     ? ft_can_send : uart_can_send;
+    wire stop_can_send  = stop_ack_port  ? ft_can_send : uart_can_send;
+    wire start_can_send = start_ack_port ? ft_can_send : uart_can_send;
+
+    wire reply_tx_fire = reply_pending && reply_can_send;
+    wire stop_tx_fire  = !reply_tx_fire && stop_ack_pending &&
+                         spi_reset && !spi_writing && pp_init_done && stop_can_send;
+    wire start_tx_fire = !reply_tx_fire && !stop_tx_fire && start_ack_pending &&
+                         (pp_init_done || pp_init_finishing) && start_can_send;
 
     // Heartbeat counter
     reg [25:0] heartbeat;
@@ -436,10 +458,11 @@ module host_protocol(
         end
     endfunction
     
-    // TOCTOU trap table (4 entries)
-    reg [23:0] trap_start [0:3];     // Byte address match value, pre-masked at SET
-    reg [23:0] trap_mask  [0:3];     // Byte address mask (1 = must match)
-    reg [23:0] trap_replace [0:3];   // Byte address replacement base
+    // TOCTOU trap table (4 entries). Keep in flip-flops so Gowin does not
+    // infer SSRAMs with deep reset/mux paths for a 4x24-bit table.
+    (* syn_ramstyle = "registers" *) reg [23:0] trap_start [0:3];   // Byte address match value, pre-masked at SET
+    (* syn_ramstyle = "registers" *) reg [23:0] trap_mask  [0:3];   // Byte address mask (1 = must match)
+    (* syn_ramstyle = "registers" *) reg [23:0] trap_replace [0:3]; // Byte address replacement base
     reg [3:0]  trap_armed;           // Trap is active
 
     // Separate address comparison from the priority/redirect mux. This
@@ -452,6 +475,7 @@ module host_protocol(
     reg [1:0]  toctou_index;
     reg [23:0] toctou_start_buf;
     reg [23:0] toctou_mask_buf;
+    reg [15:0] toctou_replace_buf;
     
     // TOCTOU address check: detect rising edge of log_addr_valid_sync
     reg log_addr_valid_prev;
@@ -480,6 +504,7 @@ module host_protocol(
             cmd <= CMD_NOP;
             in_count <= 0;
             serial_idle_count <= 0;
+            serial_idle_expired_q <= 0;
             addr <= 0;
             len <= 0;
 
@@ -491,6 +516,7 @@ module host_protocol(
 
             log_poll_state <= 0;
             log_poll_remain <= 0;
+            log_poll_byte <= 0;
             log_poll_escape_code <= 0;
             log_fifo_read_strobe <= 0;
 
@@ -500,12 +526,18 @@ module host_protocol(
             write_buf_full <= 0;
 
             txd_strobe_buf <= 0;
+            txd_port_buf <= 0;
             txd_data_buf <= 0;
+            txd_strobe <= 0;
+            txd_data <= 0;
             
             rxd_strobe_buf <= 0;
             rxd_data_buf <= 0;
             
             active_port <= 0;
+            reply_pending <= 0;
+            reply_port <= 0;
+            reply_data <= 0;
             ft_rx_pop <= 0;
             uart_rx_pop <= 0;
             rx_hold <= 0;
@@ -531,6 +563,9 @@ module host_protocol(
             trap_triggered <= 0;
             toctou_sub_cmd <= 0;
             toctou_index <= 0;
+            toctou_start_buf <= 0;
+            toctou_mask_buf <= 0;
+            toctou_replace_buf <= 0;
             
             log_addr_valid_prev <= 0;
             trap_match_pending <= 0;
@@ -556,6 +591,9 @@ module host_protocol(
             // tool sends START explicitly after loading firmware.
             spi_run_requested <= 0;
             stop_ack_pending <= 0;
+            stop_ack_port <= 0;
+            start_ack_pending <= 0;
+            start_ack_port <= 0;
 
             for (i = 0; i < 4; i = i + 1) begin
                 trap_start[i] <= 0;
@@ -563,7 +601,8 @@ module host_protocol(
                 trap_replace[i] <= 0;
             end
             
-            tx_wait <= 0;
+            uart_tx_wait <= 0;
+            ft_tx_wait <= 0;
 
             sfdp_waddr <= 0;
             sfdp_wdata <= 8'hFF;
@@ -576,21 +615,30 @@ module host_protocol(
             sfdp_wren <= 0;
             profile_start <= 0; profile_byte_valid <= 0;
 
-            // TX pipeline cooldown
-            if (txd_strobe_buf)
-                tx_wait <= 2'd2;
-            else if (tx_wait != 0)
-                tx_wait <= tx_wait - 1;
+            // Per-port TX pipeline cooldowns
+            if (txd_strobe_buf && !txd_port_buf)
+                uart_tx_wait <= 2'd2;
+            else if (uart_tx_wait != 2'd0)
+                uart_tx_wait <= uart_tx_wait - 2'd1;
 
-            // Route TX to the active port
-            if (active_port) begin
-                ft_txd_strobe <= txd_strobe_buf;
+            if (txd_strobe_buf && txd_port_buf)
+                ft_tx_wait <= 2'd2;
+            else if (ft_tx_wait != 2'd0)
+                ft_tx_wait <= ft_tx_wait - 2'd1;
+
+            // Route TX using the byte's latched destination port so a
+            // subsequent command on the other port cannot hijack it.
+            if (txd_strobe_buf && txd_port_buf) begin
+                ft_txd_strobe <= 1'b1;
                 ft_txd_data   <= txd_data_buf;
-                txd_strobe    <= 0;
-            end else begin
-                txd_strobe    <= txd_strobe_buf;
+                txd_strobe    <= 1'b0;
+            end else if (txd_strobe_buf && !txd_port_buf) begin
+                txd_strobe    <= 1'b1;
                 txd_data      <= txd_data_buf;
-                ft_txd_strobe <= 0;
+                ft_txd_strobe <= 1'b0;
+            end else begin
+                txd_strobe    <= 1'b0;
+                ft_txd_strobe <= 1'b0;
             end
 
             // Pull-based RX mux (see ft_rx_take/uart_rx_take): FT245 first
@@ -607,20 +655,29 @@ module host_protocol(
                 if (cmd_idle) active_port <= 0;
             end
 
-            // STOP is a drain barrier, not merely a pin-disable ACK. Do not
-            // let the host load RAM while accepted SPI work still owns it.
-            if (stop_ack_pending && spi_reset && !spi_writing && pp_init_done && can_send) begin
-                stop_ack_pending <= 0; txd_strobe_buf <= 1; txd_data_buf <= 8'h01;
-            end
-
-            // Boot-time START is acknowledged at the final committed scrub.
-            if (!pp_init_done && pp_init_finishing && spi_run_requested) begin
-                txd_strobe_buf <= 1;
-                txd_data_buf <= 8'h01;
+            // Single-byte reply arbiter: emit retained command replies, STOP
+            // drain ACKs, and deferred boot START ACKs only when their
+            // destination port is ready.
+            if (reply_tx_fire) begin
+                reply_pending  <= 1'b0;
+                txd_strobe_buf <= 1'b1;
+                txd_port_buf   <= reply_port;
+                txd_data_buf   <= reply_data;
+            end else if (stop_tx_fire) begin
+                stop_ack_pending <= 1'b0;
+                txd_strobe_buf   <= 1'b1;
+                txd_port_buf     <= stop_ack_port;
+                txd_data_buf     <= 8'h01;
+            end else if (start_tx_fire) begin
+                start_ack_pending <= 1'b0;
+                txd_strobe_buf    <= 1'b1;
+                txd_port_buf      <= start_ack_port;
+                txd_data_buf      <= 8'h01;
             end
 
             // The streaming compiler waits for the final RAM write before
-            // completing. Publish only after geometry and header validation.
+            // completing. Publish only after geometry and header validation,
+            // then retain the reply until the destination transport accepts it.
             if (!profile_check_active) profile_check_index <= 0;
             else if (profile_done) begin
                 if (profile_check_index < 4) begin
@@ -634,12 +691,13 @@ module host_protocol(
                     profile_header_good <= profile_header_good &&
                         profile_descriptor_valid(profile_descriptor_q,cfg_profile[319:256],profile_previous_mask_q);
                     profile_check_index <= profile_check_index + 1'b1;
-                end else if (can_send) begin
+                end else begin
                     cfg_profile_valid <= !profile_bad && profile_header_good;
                     profile_incomplete <= profile_bad || !profile_header_good;
                     if (!profile_bad && profile_header_good) cfg_profile_epoch <= cfg_profile_epoch + 1'b1;
-                    txd_strobe_buf <= 1;
-                    txd_data_buf <= (profile_bad || !profile_header_good) ? 8'h02 : 8'h01;
+                    reply_pending <= 1'b1;
+                    reply_port <= active_port;
+                    reply_data <= (profile_bad || !profile_header_good) ? 8'h02 : 8'h01;
                     profile_check_active <= 0; cmd <= CMD_NOP; in_count <= 0;
                 end
             end
@@ -734,12 +792,17 @@ module host_protocol(
             // Serial protocol idle timeout: reset parser if stuck waiting
             // for host input bytes (~546us in headers, ~35ms in incoming
             // payloads). Only runs while expecting input bytes, never while
-            // draining SDRAM, validating CHIPPROFILE, or waiting for TX,
-            // and never on a cycle a new byte is already being popped.
-            if (rx_expecting_data && !rxd_strobe_buf && !rx_hold &&
-                !ft_rx_take && !uart_rx_take) begin
+            // draining SDRAM, validating CHIPPROFILE, or waiting for TX.
+            // rx_expecting_data masks new pops once serial_idle_expired_q
+            // asserts, and any byte popped the cycle prior sets
+            // rxd_strobe_buf/rx_hold, so the counter never needs
+            // ft_rx_take/uart_rx_take on its reset.
+            if (rx_waiting_for_byte && !rxd_strobe_buf && !rx_hold) begin
                 serial_idle_count <= serial_idle_count + 1;
-                if (serial_idle_expired) begin
+                serial_idle_expired_q <= serial_idle_expired_next;
+                if (serial_idle_expired_q) begin
+                    serial_idle_count <= 0;
+                    serial_idle_expired_q <= 0;
                     in_count <= 0;
                     cmd <= CMD_NOP;
                     write_pos <= 0;
@@ -753,6 +816,7 @@ module host_protocol(
             end
             else begin
                 serial_idle_count <= 0;
+                serial_idle_expired_q <= 0;
             end
             
             // -----------------------------------------------------------
@@ -770,8 +834,9 @@ module host_protocol(
             if (rxd_strobe_buf && cmd_idle) begin
                 case (rxd_data_buf)
                 CMD_VERSION: begin
-                    txd_strobe_buf <= 1;
-                    txd_data_buf <= VERSION;
+                    reply_pending <= 1'b1;
+                    reply_port <= active_port;
+                    reply_data <= VERSION;
                 end
                 CMD_START: begin
                     spi_run_requested <= !profile_incomplete;
@@ -779,31 +844,40 @@ module host_protocol(
                     // Include this edge's final write to avoid losing an
                     // ACK when START coincides with initialization completion.
                     if (profile_incomplete || pp_init_done || pp_init_finishing) begin
-                        txd_strobe_buf <= 1;
-                        txd_data_buf <= profile_incomplete ? 8'h02 : 8'h01;
+                        start_ack_pending <= 1'b0;
+                        reply_pending <= 1'b1;
+                        reply_port <= active_port;
+                        reply_data <= profile_incomplete ? 8'h02 : 8'h01;
+                    end else begin
+                        start_ack_pending <= 1'b1;
+                        start_ack_port <= active_port;
                     end
                 end
                 CMD_STOP: begin
                     spi_run_requested <= 0;
-                    stop_ack_pending <= 1;
+                    start_ack_pending <= 1'b0;
+                    stop_ack_pending <= 1'b1;
+                    stop_ack_port <= active_port;
                 end
                 CMD_STATUS: begin
-                    txd_strobe_buf <= 1;
+                    reply_pending <= 1'b1;
+                    reply_port <= active_port;
                     // 0x01 = running, 0x02 = stopped.  Using two non-zero
                     // codes (rather than 0x00 for stopped) lets the host
                     // tool's transparent 0x00 skipping still work around
                     // the FT2232H's occasional leaked modem-status bytes.
-                    txd_data_buf <= spi_running ? 8'h01 : 8'h02;
+                    reply_data <= spi_running ? 8'h01 : 8'h02;
                 end
                 CMD_PREFETCH: begin
                     // Reports and clears the latched flags, so a host can
                     // tell whether the fast read path ever came up short
                     // while the target was reading. Safe to issue at any
                     // time: it touches neither SDRAM nor spi_trx.
-                    txd_strobe_buf <= 1;
+                    reply_pending <= 1'b1;
+                    reply_port <= active_port;
                     // read_ack skips 0x00 and 0xFF as transport noise;
                     // include a marker even when neither fault is set.
-                    txd_data_buf <= PREFETCH_VALID | {6'd0, prefetch_faults_now};
+                    reply_data <= PREFETCH_VALID | {6'd0, prefetch_faults_now};
                     prefetch_faults <= 2'b00;
                 end
                 CMD_LOGPOLL: begin
@@ -814,7 +888,7 @@ module host_protocol(
                     // dispatcher so polls complete even while a flash
                     // read is in progress on the SPI pins.
                     cmd             <= CMD_LOGPOLL;
-                    log_poll_state  <= 2'd1;
+                    log_poll_state  <= 3'd1;
                     log_poll_remain <= LOG_POLL_MAX;
                 end
                 default: ;  // fall through to gated dispatcher below
@@ -829,46 +903,54 @@ module host_protocol(
             // actively hammering the bus.  Running ungated also means
             // monitor tools can poll while logging real-time traffic.
             //
-            //   State 1: pop one raw byte per TX slot while FIFO has data
-            //            and the per-poll cap has not been exhausted.  If
-            //            the raw byte collides with framing, send ESCAPE
-            //            now and state 3 sends the escape code next.
-            //   State 2: emit 0xA0 terminator and return to idle.
+            //   State 1: pop one raw byte from the logger FIFO into the
+            //            local log_poll_byte register (keeps logger FIFO
+            //            status off the shared host TX mux).
+            //   State 2: emit/escape log_poll_byte through reply_pending.
             //   State 3: emit second byte of an escaped raw log byte.
+            //   State 4: emit 0xA0 terminator and return to idle.
             // -----------------------------------------------------------
-            if (log_poll_state == 2'd1 && can_send) begin
+            if (log_poll_state == 3'd1) begin
                 if (log_fifo_data_available && log_poll_remain != 0) begin
-                    txd_strobe_buf       <= 1;
-                    log_fifo_read_strobe <= 1;
-                    log_poll_remain      <= log_poll_remain - 1;
-                    if (log_fifo_read_data == LOG_POLL_TERMINATOR) begin
-                        txd_data_buf         <= LOG_POLL_ESCAPE;
-                        log_poll_escape_code <= 8'h00;
-                        log_poll_state       <= 2'd3;
-                    end
-                    else if (log_fifo_read_data == LOG_POLL_ESCAPE) begin
-                        txd_data_buf         <= LOG_POLL_ESCAPE;
-                        log_poll_escape_code <= 8'h05;
-                        log_poll_state       <= 2'd3;
-                    end
-                    else begin
-                        txd_data_buf <= log_fifo_read_data;
-                    end
+                    log_fifo_read_strobe <= 1'b1;
+                    log_poll_remain      <= log_poll_remain - 8'd1;
+                    log_poll_byte        <= log_fifo_read_data;
+                    log_poll_state       <= 3'd2;
                 end
                 else begin
-                    log_poll_state <= 2'd2;
+                    log_poll_state <= 3'd4;
                 end
             end
-            else if (log_poll_state == 2'd2 && can_send) begin
-                txd_strobe_buf <= 1;
-                txd_data_buf   <= LOG_POLL_TERMINATOR;
-                log_poll_state <= 2'd0;
-                cmd            <= CMD_NOP;
+            else if (log_poll_state == 3'd2 && !reply_pending) begin
+                reply_pending <= 1'b1;
+                reply_port    <= active_port;
+                if (log_poll_byte == LOG_POLL_TERMINATOR) begin
+                    reply_data           <= LOG_POLL_ESCAPE;
+                    log_poll_escape_code <= 8'h00;
+                    log_poll_state       <= 3'd3;
+                end
+                else if (log_poll_byte == LOG_POLL_ESCAPE) begin
+                    reply_data           <= LOG_POLL_ESCAPE;
+                    log_poll_escape_code <= 8'h05;
+                    log_poll_state       <= 3'd3;
+                end
+                else begin
+                    reply_data     <= log_poll_byte;
+                    log_poll_state <= 3'd1;
+                end
             end
-            else if (log_poll_state == 2'd3 && can_send) begin
-                txd_strobe_buf <= 1;
-                txd_data_buf   <= log_poll_escape_code;
-                log_poll_state <= 2'd1;
+            else if (log_poll_state == 3'd3 && !reply_pending) begin
+                reply_pending  <= 1'b1;
+                reply_port     <= active_port;
+                reply_data     <= log_poll_escape_code;
+                log_poll_state <= 3'd1;
+            end
+            else if (log_poll_state == 3'd4 && !reply_pending) begin
+                reply_pending  <= 1'b1;
+                reply_port     <= active_port;
+                reply_data     <= LOG_POLL_TERMINATOR;
+                log_poll_state <= 3'd0;
+                cmd            <= CMD_NOP;
             end
 
             // -----------------------------------------------------------
@@ -885,6 +967,7 @@ module host_protocol(
             begin
                 if (rxd_strobe_buf) begin
                     serial_idle_count <= 0;
+                    serial_idle_expired_q <= 0;
 
                     if (in_count == 0) begin
                         // The always-safe opcodes are handled above.
@@ -999,8 +1082,9 @@ module host_protocol(
                                 cfg_sfdp_remaining <= 0;
                                 cfg_sfdp_reject <= 0;
                                 profile_incomplete <= 0;
-                                txd_strobe_buf <= 1;
-                                txd_data_buf <= 8'h01;
+                                reply_pending <= 1'b1;
+                                reply_port <= active_port;
+                                reply_data <= 8'h01;
                                 in_count <= 0;
                                 cmd <= CMD_NOP;
                             end
@@ -1033,14 +1117,14 @@ module host_protocol(
                             end
                             cfg_sfdp_remaining <= cfg_sfdp_remaining - 1'b1;
                             if (cfg_sfdp_remaining == 8'd1) begin
+                                reply_pending <= 1'b1;
+                                reply_port <= active_port;
                                 if (cfg_sfdp_reject) begin
-                                    txd_strobe_buf <= 1;
-                                    txd_data_buf <= 8'h02;
+                                    reply_data <= 8'h02;
                                 end
                                 else begin
                                     profile_incomplete <= 0;
-                                    txd_strobe_buf <= 1;
-                                    txd_data_buf <= 8'h01;
+                                    reply_data <= 8'h01;
                                 end
                                 cfg_sfdp_reject <= 0;
                                 in_count <= 0;
@@ -1060,8 +1144,9 @@ module host_protocol(
                         // the target flash in hold state.
                         // -----------------------------------------------
                         hold_out <= rxd_data_buf[0];
-                        txd_strobe_buf <= 1;
-                        txd_data_buf <= 8'h01;
+                        reply_pending <= 1'b1;
+                        reply_port <= active_port;
+                        reply_data <= 8'h01;
                         in_count <= 0;
                         cmd <= CMD_NOP;
                     end
@@ -1072,8 +1157,9 @@ module host_protocol(
                         // Response: 0x01
                         // -----------------------------------------------
                         log_active <= rxd_data_buf[0];
-                        txd_strobe_buf <= 1;
-                        txd_data_buf <= 8'h01;
+                        reply_pending <= 1'b1;
+                        reply_port <= active_port;
+                        reply_data <= 8'h01;
                         in_count <= 0;
                         cmd <= CMD_NOP;
                     end
@@ -1096,8 +1182,9 @@ module host_protocol(
                                 trap_armed <= 0;
                                 trap_triggered <= 0;
                                 redirect_active <= 0;
-                                txd_strobe_buf <= 1;
-                                txd_data_buf <= 8'h01;
+                                reply_pending <= 1'b1;
+                                reply_port <= active_port;
+                                reply_data <= 8'h01;
                                 in_count <= 0;
                                 cmd <= CMD_NOP;
                             end
@@ -1108,8 +1195,9 @@ module host_protocol(
                                 in_count <= 2;
                             end
                             else begin
-                                txd_strobe_buf <= 1;
-                                txd_data_buf <= 8'h02;
+                                reply_pending <= 1'b1;
+                                reply_port <= active_port;
+                                reply_data <= 8'h02;
                                 in_count <= 0;
                                 cmd <= CMD_NOP;
                             end
@@ -1118,24 +1206,27 @@ module host_protocol(
                             toctou_index <= rxd_data_buf[1:0];
                             if (toctou_sub_cmd == TOCTOU_ARM) begin
                                 trap_armed[rxd_data_buf[1:0]] <= 1;
-                                txd_strobe_buf <= 1;
-                                txd_data_buf <= 8'h01;
+                                reply_pending <= 1'b1;
+                                reply_port <= active_port;
+                                reply_data <= 8'h01;
                                 in_count <= 0;
                                 cmd <= CMD_NOP;
                             end
                             else if (toctou_sub_cmd == TOCTOU_DISARM) begin
                                 trap_match_pending[rxd_data_buf[1:0]] <= 0;
                                 trap_armed[rxd_data_buf[1:0]] <= 0;
-                                txd_strobe_buf <= 1;
-                                txd_data_buf <= 8'h01;
+                                reply_pending <= 1'b1;
+                                reply_port <= active_port;
+                                reply_data <= 8'h01;
                                 in_count <= 0;
                                 cmd <= CMD_NOP;
                             end
                             else if (toctou_sub_cmd == TOCTOU_RESET) begin
                                 trap_match_pending[rxd_data_buf[1:0]] <= 0;
                                 trap_triggered[rxd_data_buf[1:0]] <= 0;
-                                txd_strobe_buf <= 1;
-                                txd_data_buf <= 8'h01;
+                                reply_pending <= 1'b1;
+                                reply_port <= active_port;
+                                reply_data <= 8'h01;
                                 in_count <= 0;
                                 cmd <= CMD_NOP;
                             end
@@ -1147,26 +1238,25 @@ module host_protocol(
                                 cmd <= CMD_NOP;
                             end
                         end
-                        // TOCTOU SET: receive start(3), mask(3), replace(3)
+                        // TOCTOU SET: stage start(3), mask(3), replace(3) and
+                        // publish the entire entry atomically on the final byte.
                         else if (in_count == 3)  begin toctou_start_buf[23:16] <= rxd_data_buf; in_count <= 4; end
                         else if (in_count == 4)  begin toctou_start_buf[15:8]  <= rxd_data_buf; in_count <= 5; end
                         else if (in_count == 5)  begin toctou_start_buf[7:0]   <= rxd_data_buf; in_count <= 6; end
                         else if (in_count == 6)  begin toctou_mask_buf[23:16]  <= rxd_data_buf; in_count <= 7; end
                         else if (in_count == 7)  begin toctou_mask_buf[15:8]   <= rxd_data_buf; in_count <= 8; end
                         else if (in_count == 8)  begin toctou_mask_buf[7:0]    <= rxd_data_buf; in_count <= 9; end
-                        else if (in_count == 9)  begin
+                        else if (in_count == 9)  begin toctou_replace_buf[15:8] <= rxd_data_buf; in_count <= 10; end
+                        else if (in_count == 10) begin toctou_replace_buf[7:0]  <= rxd_data_buf; in_count <= 11; end
+                        else if (in_count == 11) begin
                             trap_start[toctou_index] <= toctou_start_buf & toctou_mask_buf;
                             trap_mask[toctou_index]  <= toctou_mask_buf;
-                            trap_replace[toctou_index][23:16] <= rxd_data_buf;
-                            in_count <= 10;
-                        end
-                        else if (in_count == 10) begin trap_replace[toctou_index][15:8] <= rxd_data_buf; in_count <= 11; end
-                        else if (in_count == 11) begin
-                            trap_replace[toctou_index][7:0] <= rxd_data_buf;
+                            trap_replace[toctou_index] <= {toctou_replace_buf, rxd_data_buf};
                             trap_match_pending[toctou_index] <= 0;
                             trap_triggered[toctou_index] <= 0;
-                            txd_strobe_buf <= 1;
-                            txd_data_buf <= 8'h01;
+                            reply_pending <= 1'b1;
+                            reply_port <= active_port;
+                            reply_data <= 8'h01;
                             in_count <= 0;
                             cmd <= CMD_NOP;
                         end
@@ -1189,8 +1279,9 @@ module host_protocol(
                                 // SDRAM work. RAMREAD emits nothing into its
                                 // unframed data stream; RAMWRITE replies 0x02.
                                 if (cmd == CMD_RAMWRITE) begin
-                                    txd_strobe_buf <= 1;
-                                    txd_data_buf <= 8'h02;
+                                    reply_pending <= 1'b1;
+                                    reply_port <= active_port;
+                                    reply_data <= 8'h02;
                                 end
                                 in_count <= 0;
                                 cmd <= CMD_NOP;
@@ -1227,9 +1318,10 @@ module host_protocol(
                             host_access_cmd <= 2'b01;
                             read_state <= 3;
                         end
-                        else if ((read_state == 3) && !sdram_busy && can_send) begin
-                            txd_strobe_buf <= 1;
-                            txd_data_buf <= sdram_read_buffer[read_pos*8 +: 8];
+                        else if ((read_state == 3) && !sdram_busy && !reply_pending) begin
+                            reply_pending <= 1'b1;
+                            reply_port <= active_port;
+                            reply_data <= sdram_read_buffer[read_pos*8 +: 8];
 
                             if (read_pos == 7) begin
                                 if (len == 1) begin
@@ -1261,14 +1353,13 @@ module host_protocol(
                         end
                         else if ((write_state == 3) && !sdram_busy) begin
                             if (len == 1) begin
-                                if (can_send) begin
-                                    txd_strobe_buf <= 1;
-                                    txd_data_buf <= 8'h01;
-                                    write_buf_full <= 0;
-                                    write_state <= 0;
-                                    in_count <= 0;
-                                    cmd <= CMD_NOP;
-                                end
+                                reply_pending <= 1'b1;
+                                reply_port <= active_port;
+                                reply_data <= 8'h01;
+                                write_buf_full <= 0;
+                                write_state <= 0;
+                                in_count <= 0;
+                                cmd <= CMD_NOP;
                             end
                             else begin
                                 write_buf_full <= 0;

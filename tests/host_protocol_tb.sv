@@ -17,11 +17,16 @@ module host_protocol_tb;
     reg uart_tx_ready = 1, ft_tx_ready = 1;
     reg [7:0] uart_data = 0;
     reg [6:0] sfdp_raddr = 0;
+    reg log_addr_valid = 0, spi_active = 0;
+    reg [23:0] log_addr = 0;
+    reg prefetch_underrun_in = 0, prefetch_thin_in = 0;
     wire uart_tx_strobe, ft_tx_strobe, ft_pop, hold, log_active, running;
     wire [7:0] uart_tx_data, ft_tx_data, sfdp_rdata;
     wire [23:0] cfg_jedec_id;
     wire cfg_4byte, cfg_profile_valid;
     wire [22:0] cfg_chip_erase_bursts;
+    wire log_fifo_pop, redirect_active;
+    wire [22:0] redirect_base;
     wire [1:0] access;
     wire [24:0] access_addr;
     wire [63:0] write_buffer;
@@ -35,6 +40,11 @@ module host_protocol_tb;
     reg [7:0] ft_queue [0:FT_Q_SIZE-1];
     integer ft_head = 0, ft_tail = 0;
     wire ft_available = ft_head != ft_tail;
+
+    localparam integer LOG_Q_SIZE = 1024;
+    reg [7:0] log_queue [0:LOG_Q_SIZE-1];
+    integer log_head = 0, log_tail = 0;
+    wire log_available = log_head != log_tail;
 
     glue dut(.clk(clk), .reset(reset), .rxd_strobe(uart_strobe), .rxd_data(uart_data),
         .txd_ready(uart_tx_ready), .txd_strobe(uart_tx_strobe), .txd_data(uart_tx_data),
@@ -54,9 +64,13 @@ module host_protocol_tb;
         .cfg_profile_valid(cfg_profile_valid),
         .spi_clk(clk), .sfdp_raddr(sfdp_raddr), .sfdp_rdata(sfdp_rdata),
         .spi_running(running), .hold_out(hold), .log_active(log_active),
-        .log_fifo_data_available(1'b0), .log_fifo_read_data(8'b0),
-        .log_addr_valid_sync(1'b0), .log_addr_sync(24'b0), .spi_active_sync(1'b0),
-        .prefetch_underrun(1'b0), .prefetch_thin(1'b0));
+        .log_fifo_data_available(log_available),
+        .log_fifo_read_data(log_queue[log_head % LOG_Q_SIZE]),
+        .log_fifo_read_strobe(log_fifo_pop),
+        .log_addr_valid_sync(log_addr_valid), .log_addr_sync(log_addr),
+        .spi_active_sync(spi_active),
+        .prefetch_underrun(prefetch_underrun_in), .prefetch_thin(prefetch_thin_in),
+        .redirect_active(redirect_active), .redirect_base(redirect_base));
 
     // SDRAM model: 256 bursts of row 0, bank 0; everything else is ignored.
     always @(posedge clk) begin
@@ -74,7 +88,10 @@ module host_protocol_tb;
         end
     end
 
-    always @(posedge clk) if (ft_pop) ft_head <= ft_head + 1;
+    always @(posedge clk) begin
+        if (ft_pop) ft_head <= ft_head + 1;
+        if (log_fifo_pop) log_head <= log_head + 1;
+    end
 
     // Replies per port, in order.
     reg [7:0] uart_replies [$];
@@ -359,7 +376,235 @@ module host_protocol_tb;
             expect_reply(ft_replies, 8'h09, "pipelined VERSION after CHIPPROFILE");
         end
 
-        $display("PASS HOST_PROTOCOL: admission, framing, RAMWRITE burst ownership, CHIPCONFIG/CHIPPROFILE validation, and timeouts");
+        // 12. Immediate replies and PREFETCH read-and-clear are retained while
+        //     TX is stalled on both UART and FT245, without losing replies or
+        //     double-reporting faults.
+        begin
+            // Trigger prefetch underrun edge.
+            prefetch_underrun_in = 1; tick(4); prefetch_underrun_in = 0; tick(4);
+            uart_tx_ready = 0;
+            uart_byte(8'h3b); // PREFETCH on UART while TX stalled
+            tick(40);
+            expect_quiet(uart_replies, "UART PREFETCH reply while TX stalled");
+            uart_tx_ready = 1;
+            expect_reply(uart_replies, 8'h81, "UART PREFETCH retained fault reply");
+            // Second PREFETCH must report clean (fault cleared once).
+            uart_byte(8'h3b);
+            expect_reply(uart_replies, 8'h80, "UART PREFETCH cleared after first read");
+
+            // Same on FT245 with queued VERSION + STATUS behind stalled TX.
+            prefetch_thin_in = 1; tick(4); prefetch_thin_in = 0; tick(4);
+            ft_tx_ready = 0;
+            ft_push_now(8'h3b); // PREFETCH
+            ft_push_now(8'h30); // VERSION
+            ft_push_now(8'h36); // STATUS
+            tick(40);
+            expect_quiet(ft_replies, "FT245 replies while TX stalled");
+            ft_tx_ready = 1;
+            expect_reply(ft_replies, 8'h82, "FT245 PREFETCH retained thin reply");
+            expect_reply(ft_replies, 8'h09, "FT245 VERSION after TX stall");
+            expect_reply(ft_replies, 8'h02, "FT245 STATUS after TX stall");
+            expect_quiet(uart_replies, "no UART leak from FT245 stalled replies");
+        end
+
+        // 13. Cross-port deferred boot START and STOP drain retention.
+        begin
+            // 13a. UART sends early START before pp_init_done, with UART TX
+            // stalled; FT245 runs VERSION/STATUS while START is deferred and
+            // after pp_init_done completes. UART must still get its 0x01 ACK
+            // once unstalled, and FT245 must never receive it.
+            reset = 1; tick(4); reset = 0;
+            uart_tx_ready = 0;
+            @(negedge clk); uart_data = 8'h34; uart_strobe = 1;
+            @(negedge clk); uart_strobe = 0;
+            tick(12);
+            if (running) $fatal(1, "early UART START enabled SPI before pp_init_done");
+            ft_byte(8'h30); ft_byte(8'h36);
+            expect_reply(ft_replies, 8'h09, "FT245 VERSION while UART START deferred");
+            expect_reply(ft_replies, 8'h02, "FT245 STATUS=stopped while UART START deferred");
+            while (!running) tick(1);
+            tick(20);
+            expect_quiet(uart_replies, "deferred UART START while UART TX stalled");
+            ft_byte(8'h36);
+            expect_reply(ft_replies, 8'h01, "FT245 STATUS=running after pp_init_done");
+            expect_quiet(ft_replies, "FT245 must not receive UART deferred START ACK");
+            uart_tx_ready = 1;
+            expect_reply(uart_replies, 8'h01, "UART deferred START ACK after unstall");
+
+            // 13b. Reverse direction: FT245 sends early START while FT245 TX
+            // is stalled; UART runs VERSION before and after pp_init_done.
+            reset = 1; tick(4); reset = 0;
+            ft_tx_ready = 0;
+            ft_byte(8'h34);
+            tick(12);
+            if (running) $fatal(1, "early FT245 START enabled SPI before pp_init_done");
+            @(negedge clk); uart_data = 8'h30; uart_strobe = 1;
+            @(negedge clk); uart_strobe = 0;
+            expect_reply(uart_replies, 8'h09, "UART VERSION while FT245 START deferred");
+            while (!running) tick(1);
+            tick(20);
+            expect_quiet(ft_replies, "deferred FT245 START while FT245 TX stalled");
+            uart_byte(8'h30);
+            expect_reply(uart_replies, 8'h09, "UART VERSION after pp_init_done");
+            expect_quiet(uart_replies, "UART must not receive FT245 deferred START ACK");
+            ft_tx_ready = 1;
+            expect_reply(ft_replies, 8'h01, "FT245 deferred START ACK after unstall");
+
+            // 13c. STOP drain ACK retained on FT245 while TX is stalled.
+            ft_tx_ready = 0;
+            ft_byte(8'h35);
+            tick(40);
+            expect_quiet(ft_replies, "FT245 STOP ACK while TX stalled");
+            ft_tx_ready = 1;
+            expect_reply(ft_replies, 8'h01, "FT245 STOP ACK after unstall");
+        end
+
+        // 14. Directed CMD_LOGPOLL: empty terminator, 0xA0/0xA5 escaping,
+        //     LOG_POLL_MAX=255 cap, TX backpressure, and pipelined VERSION.
+        begin
+            reg [7:0] raw_log [0:259];
+            reg [7:0] want_poll1 [$];
+            reg [7:0] want_poll2 [$];
+            integer idx, expected_len, stall_guard;
+
+            // Empty poll under UART TX stall -> single 0xA0 terminator.
+            uart_tx_ready = 0;
+            uart_byte(8'h3a);
+            tick(30);
+            expect_quiet(uart_replies, "empty LOGPOLL while UART TX stalled");
+            uart_tx_ready = 1;
+            expect_reply(uart_replies, 8'ha0, "empty UART LOGPOLL terminator");
+
+            // Prefill 260 raw bytes including 0xA0 and 0xA5 at start, cap
+            // boundary (254, 255), and tail (259).
+            for (idx = 0; idx < 260; idx++) begin
+                if (idx == 0 || idx == 254 || idx == 259) raw_log[idx] = 8'ha0;
+                else if (idx == 1 || idx == 127 || idx == 255) raw_log[idx] = 8'ha5;
+                else raw_log[idx] = 8'(idx & 8'h7f);
+                log_queue[log_tail % LOG_Q_SIZE] = raw_log[idx];
+                log_tail = log_tail + 1;
+            end
+
+            for (idx = 0; idx < 255; idx++) begin
+                if (raw_log[idx] == 8'ha0) begin
+                    want_poll1.push_back(8'ha5);
+                    want_poll1.push_back(8'h00);
+                end else if (raw_log[idx] == 8'ha5) begin
+                    want_poll1.push_back(8'ha5);
+                    want_poll1.push_back(8'h05);
+                end else begin
+                    want_poll1.push_back(raw_log[idx]);
+                end
+            end
+            want_poll1.push_back(8'ha0);
+
+            for (idx = 255; idx < 260; idx++) begin
+                if (raw_log[idx] == 8'ha0) begin
+                    want_poll2.push_back(8'ha5);
+                    want_poll2.push_back(8'h00);
+                end else if (raw_log[idx] == 8'ha5) begin
+                    want_poll2.push_back(8'ha5);
+                    want_poll2.push_back(8'h05);
+                end else begin
+                    want_poll2.push_back(raw_log[idx]);
+                end
+            end
+            want_poll2.push_back(8'ha0);
+
+            // Queue LOGPOLL + pipelined VERSION on FT245 with periodic TX stalls.
+            ft_push_now(8'h3a);
+            ft_push_now(8'h30);
+            expected_len = want_poll1.size() + 1;
+            stall_guard = 0;
+            while (ft_replies.size() < expected_len && stall_guard < 50000) begin
+                ft_tx_ready = (stall_guard % 7) == 0;
+                tick(1);
+                stall_guard++;
+            end
+            ft_tx_ready = 1;
+            if (ft_replies.size() != expected_len)
+                $fatal(1, "LOGPOLL1+VERSION got %0d bytes, expected %0d", ft_replies.size(), expected_len);
+            for (idx = 0; idx < want_poll1.size(); idx++)
+                expect_reply(ft_replies, want_poll1[idx], "LOGPOLL1 byte");
+            expect_reply(ft_replies, 8'h09, "pipelined VERSION after LOGPOLL1");
+            if ((log_tail - log_head) != 5)
+                $fatal(1, "LOGPOLL1 left %0d bytes in FIFO, expected 5", log_tail - log_head);
+
+            // Second LOGPOLL on UART drains remaining 5 bytes under UART TX stalls.
+            uart_byte(8'h3a);
+            expected_len = want_poll2.size();
+            stall_guard = 0;
+            while (uart_replies.size() < expected_len && stall_guard < 20000) begin
+                uart_tx_ready = (stall_guard % 5) == 0;
+                tick(1);
+                stall_guard++;
+            end
+            uart_tx_ready = 1;
+            for (idx = 0; idx < want_poll2.size(); idx++)
+                expect_reply(uart_replies, want_poll2[idx], "LOGPOLL2 byte");
+            if (log_head != log_tail)
+                $fatal(1, "LOGPOLL2 did not drain logger FIFO");
+        end
+
+        // 15. Atomic TOCTOU_SET: partial SET timeout leaves existing trap intact,
+        //     and a match on the commit cycle does not pair with the new entry.
+        begin
+            reg [7:0] set_init [0:11];
+            reg [7:0] set_new [0:11];
+            set_init = '{8'h39, 8'h01, 8'h00, 8'h01, 8'h00, 8'h00,
+                         8'hff, 8'hf0, 8'h00, 8'h02, 8'h00, 8'h00};
+            set_new  = '{8'h39, 8'h01, 8'h00, 8'h03, 8'h00, 8'h00,
+                         8'hff, 8'hf0, 8'h00, 8'h04, 8'h00, 8'h00};
+
+            foreach (set_init[i]) ft_push_now(set_init[i]);
+            expect_reply(ft_replies, 8'h01, "initial TOCTOU SET");
+            // Arm trap 0.
+            ft_push_now(8'h39); ft_push_now(8'h02); ft_push_now(8'h00);
+            expect_reply(ft_replies, 8'h01, "TOCTOU ARM trap 0");
+
+            // Send partial TOCTOU_SET (11 of 12 bytes, stopping after byte 10)
+            // and let header idle timeout fire.
+            for (integer i = 0; i < 11; i++) ft_push_now(set_new[i]);
+            tick(70000);
+            expect_quiet(ft_replies, "partial TOCTOU SET must not reply");
+            if (dut.host_i.trap_start[0] !== 24'h010000 ||
+                dut.host_i.trap_mask[0]  !== 24'hfff000 ||
+                dut.host_i.trap_replace[0] !== 24'h020000)
+                $fatal(1, "partial TOCTOU SET mutated trap 0: start=%h mask=%h replace=%h",
+                       dut.host_i.trap_start[0], dut.host_i.trap_mask[0], dut.host_i.trap_replace[0]);
+
+            // Trigger trap 0 once so a second old match would redirect if not cancelled.
+            spi_active = 1;
+            log_addr = 24'h010000;
+            @(negedge clk); log_addr_valid = 1;
+            @(negedge clk); log_addr_valid = 0;
+            tick(4);
+            if (!dut.host_i.trap_triggered[0]) $fatal(1, "trap 0 did not arm-trigger");
+            spi_active = 0; tick(2);
+
+            // Commit new TOCTOU_SET while raising an old-address log_addr_valid
+            // edge on the exact byte-11 commit cycle.
+            for (integer i = 0; i < 11; i++) ft_push_now(set_new[i]);
+            tick(40);
+            spi_active = 1;
+            log_addr = 24'h010000;
+            ft_byte(set_new[11]); // popped on next cycle, processed 1 cycle later
+            @(negedge clk); log_addr_valid = 1; // aligns with rxd_strobe_buf for byte 11
+            @(negedge clk); log_addr_valid = 0;
+            expect_reply(ft_replies, 8'h01, "atomic TOCTOU SET commit");
+            tick(4);
+            if (redirect_active)
+                $fatal(1, "stale TOCTOU match redirected across atomic SET commit (base=%h)", redirect_base);
+            if (dut.host_i.trap_triggered[0])
+                $fatal(1, "trap_triggered stayed set after atomic TOCTOU SET");
+            if (dut.host_i.trap_start[0] !== 24'h030000 ||
+                dut.host_i.trap_mask[0]  !== 24'hfff000 ||
+                dut.host_i.trap_replace[0] !== 24'h040000)
+                $fatal(1, "atomic TOCTOU SET did not commit new entry");
+            spi_active = 0;
+        end
+
+        $display("PASS HOST_PROTOCOL: admission, framing, reply retention, cross-port START/STOP, LOGPOLL, and atomic TOCTOU");
         $finish;
     end
 

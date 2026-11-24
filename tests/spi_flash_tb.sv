@@ -597,9 +597,9 @@ module spi_flash_tb;
         while (!last_reply && waited < 32) begin @(negedge clk); waited++; end
         if (!last_reply || last_reply_byte !== (bad_fourth ? 8'h02 : 8'h01))
             $fatal(1, "wrong CHIPPROFILE reply: invalid=%b stalled=%b byte=%h", bad_fourth, stall_tx, last_reply_byte);
-        // Match the original reply latency both from the final RX byte
-        // and from TX-ready after a stall (including the UART router).
-        if (waited != (stall_tx ? 3 : 16))
+        // Match the reply latency both from the final RX byte (including the
+        // 1-cycle shared reply_pending stage) and from TX-ready after a stall.
+        if (waited != (stall_tx ? 3 : 17))
             $fatal(1, "CHIPPROFILE ACK latency changed: stalled=%b cycles=%0d", stall_tx, waited);
         host_byte(8'h34);
         if (running == bad_fourth || last_reply_byte !== (bad_fourth ? 8'h02 : 8'h01))
