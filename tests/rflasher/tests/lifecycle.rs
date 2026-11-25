@@ -903,7 +903,10 @@ fn partial_profile_times_out_and_start_refuses_until_reconfigured() {
     let mut device = configured("W25Q128.V");
     assert_eq!(device.master().host(&[0x35]), [1]);
     assert!(device.master().host(&[0x3c, 2, 0]).is_empty());
-    device.master().request("D 1000");
+    // CHIPPROFILE uses the 2^22-cycle (~35ms) payload timeout; bridge.delay caps at 200k ticks/call.
+    for _ in 0..22 {
+        device.master().request("D 2000");
+    }
     assert_eq!(device.master().host(&[0x34]), [2]);
     let p = profile(&device.context().chip);
     let mut bytes = vec![0x3c];

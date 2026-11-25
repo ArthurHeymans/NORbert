@@ -14,26 +14,32 @@ module host_protocol_tb;
     reg clk = 0;
     always #4.167 clk = ~clk;
     reg reset = 1, uart_strobe = 0, cs = 1, program_command = 0;
+    reg uart_tx_ready = 1, ft_tx_ready = 1;
     reg [7:0] uart_data = 0;
+    reg [6:0] sfdp_raddr = 0;
     wire uart_tx_strobe, ft_tx_strobe, ft_pop, hold, log_active, running;
-    wire [7:0] uart_tx_data, ft_tx_data;
+    wire [7:0] uart_tx_data, ft_tx_data, sfdp_rdata;
+    wire [23:0] cfg_jedec_id;
+    wire cfg_4byte, cfg_profile_valid;
+    wire [22:0] cfg_chip_erase_bursts;
     wire [1:0] access;
     wire [24:0] access_addr;
     wire [63:0] write_buffer;
     wire write_done;
     reg [63:0] read_buffer = 0;
-    reg busy = 0, accept = 0;
+    reg busy = 0, accept = 0, stall_sdram = 0;
     integer busy_cycles = 0;
     reg [63:0] memory [0:255];
 
-    reg [7:0] ft_queue [0:255];
+    localparam integer FT_Q_SIZE = 1024;
+    reg [7:0] ft_queue [0:FT_Q_SIZE-1];
     integer ft_head = 0, ft_tail = 0;
     wire ft_available = ft_head != ft_tail;
 
     glue dut(.clk(clk), .reset(reset), .rxd_strobe(uart_strobe), .rxd_data(uart_data),
-        .txd_ready(1'b1), .txd_strobe(uart_tx_strobe), .txd_data(uart_tx_data),
-        .ft_rx_data_available(ft_available), .ft_rx_data(ft_queue[ft_head % 256]),
-        .ft_rx_pop(ft_pop), .ft_txd_ready(1'b1), .ft_txd_strobe(ft_tx_strobe),
+        .txd_ready(uart_tx_ready), .txd_strobe(uart_tx_strobe), .txd_data(uart_tx_data),
+        .ft_rx_data_available(ft_available), .ft_rx_data(ft_queue[ft_head % FT_Q_SIZE]),
+        .ft_rx_pop(ft_pop), .ft_txd_ready(ft_tx_ready), .ft_txd_strobe(ft_tx_strobe),
         .ft_txd_data(ft_tx_data),
         .sdram_access_cmd(access), .sdram_access_addr(access_addr), .sdram_cmd_busy(busy),
         .sdram_access_accept(accept), .sdram_read_busy(1'b0),
@@ -42,8 +48,12 @@ module host_protocol_tb;
         .spi_write_type(2'd1), .spi_write_addr(23'h4000), .spi_write_len(23'd400),
         .spi_write_partial(1'b0),
         .spi_write_done(write_done), .spi_write_buf_strobe(1'b0),
-        .spi_write_buf_offset(8'b0), .spi_write_buf_val(8'b0), .spi_clk(clk),
-        .sfdp_raddr(7'b0), .spi_running(running), .hold_out(hold), .log_active(log_active),
+        .spi_write_buf_offset(8'b0), .spi_write_buf_val(8'b0),
+        .cfg_jedec_id(cfg_jedec_id), .cfg_4byte(cfg_4byte),
+        .cfg_chip_erase_bursts(cfg_chip_erase_bursts),
+        .cfg_profile_valid(cfg_profile_valid),
+        .spi_clk(clk), .sfdp_raddr(sfdp_raddr), .sfdp_rdata(sfdp_rdata),
+        .spi_running(running), .hold_out(hold), .log_active(log_active),
         .log_fifo_data_available(1'b0), .log_fifo_read_data(8'b0),
         .log_addr_valid_sync(1'b0), .log_addr_sync(24'b0), .spi_active_sync(1'b0),
         .prefetch_underrun(1'b0), .prefetch_thin(1'b0));
@@ -55,7 +65,7 @@ module host_protocol_tb;
             busy_cycles <= busy_cycles - 1;
             if (busy_cycles == 1) busy <= 0;
         end
-        if (access != 0 && !busy && !accept) begin
+        if (access != 0 && !busy && !accept && !stall_sdram) begin
             accept <= 1; busy <= 1; busy_cycles <= access == 3 ? 3 : 10;
             if (access_addr[24:10] == 0) begin
                 if (access == 1) read_buffer <= memory[access_addr[9:2]];
@@ -84,7 +94,11 @@ module host_protocol_tb;
     endtask
 
     task ft_byte(input [7:0] b);
-        @(negedge clk); ft_queue[ft_tail % 256] = b; ft_tail = ft_tail + 1;
+        @(negedge clk); ft_queue[ft_tail % FT_Q_SIZE] = b; ft_tail = ft_tail + 1;
+    endtask
+
+    task ft_push_now(input [7:0] b);
+        ft_queue[ft_tail % FT_Q_SIZE] = b; ft_tail = ft_tail + 1;
     endtask
 
     task automatic expect_reply(ref reg [7:0] q [$], input [7:0] want, input string what);
@@ -195,9 +209,159 @@ module host_protocol_tb;
         for (integer i = 0; i < 8; i++)
             expect_reply(ft_replies, 8'(8'h80 + i), "RAMREAD queued behind STOP/program");
 
-        $display("PASS HOST_PROTOCOL: ungated commands with CS low/program, no dropped UART bytes, port isolation, payload stall");
+        // 7. Prefilled multi-burst RAMWRITE with stalled SDRAM and stalled
+        //    final TX ACK, immediately followed by a pipelined VERSION.
+        //    None of the bursts may overwrite each other and VERSION must
+        //    not be swallowed as payload.
+        begin
+            stall_sdram = 1;
+            ft_tx_ready = 0;
+            ft_push_now(8'h32); ft_push_now(0); ft_push_now(0); ft_push_now(8'h10);
+            ft_push_now(0); ft_push_now(3);
+            for (integer i = 0; i < 24; i++)
+                ft_push_now(8'(8'h10 + i));
+            ft_push_now(8'h30); // pipelined VERSION
+            tick(120);
+            stall_sdram = 0;
+            tick(200);
+            // Final burst retired, waiting on ft_tx_ready: VERSION must still wait.
+            expect_quiet(ft_replies, "RAMWRITE final ACK while TX stalled");
+            ft_tx_ready = 1;
+            expect_reply(ft_replies, 8'h01, "prefilled stalled RAMWRITE ACK");
+            expect_reply(ft_replies, 8'h09, "pipelined VERSION after RAMWRITE");
+            if (memory[16] !== 64'h1716151413121110 ||
+                memory[17] !== 64'h1f1e1d1c1b1a1918 ||
+                memory[18] !== 64'h2726252423222120)
+                $fatal(1, "prefilled RAMWRITE corrupted: %h %h %h",
+                       memory[16], memory[17], memory[18]);
+        end
+
+        // 8. Zero-length RAMREAD and RAMWRITE rejected cleanly without
+        //    wrapping to 65536 bursts or consuming a following VERSION.
+        begin
+            reg [63:0] mem5_before;
+            mem5_before = memory[5];
+            ft_push_now(8'h31); ft_push_now(0); ft_push_now(0); ft_push_now(8'h05);
+            ft_push_now(0); ft_push_now(0);
+            ft_push_now(8'h30); // pipelined VERSION
+            expect_reply(ft_replies, 8'h09, "zero-length RAMREAD emits no data before VERSION");
+
+            ft_push_now(8'h32); ft_push_now(0); ft_push_now(0); ft_push_now(8'h05);
+            ft_push_now(0); ft_push_now(0);
+            ft_push_now(8'h30); // pipelined VERSION
+            expect_reply(ft_replies, 8'h02, "zero-length RAMWRITE rejected");
+            expect_reply(ft_replies, 8'h09, "pipelined VERSION after zero-length RAMWRITE");
+            if (memory[5] !== mem5_before) $fatal(1, "zero-length RAMWRITE modified SDRAM");
+        end
+
+        // 9. Unknown TOCTOU subcommand is rejected with 0x02 and does not
+        //    fall through into TOCTOU_SET or clobber trap registers.
+        begin
+            reg [23:0] start2_before, mask2_before, repl2_before;
+            start2_before = dut.host_i.trap_start[2];
+            mask2_before  = dut.host_i.trap_mask[2];
+            repl2_before  = dut.host_i.trap_replace[2];
+            ft_push_now(8'h39); ft_push_now(8'h99);
+            ft_push_now(8'h30); // pipelined VERSION
+            expect_reply(ft_replies, 8'h02, "unknown TOCTOU subcommand rejected");
+            expect_reply(ft_replies, 8'h09, "pipelined VERSION after unknown TOCTOU");
+            if (dut.host_i.trap_start[2] !== start2_before ||
+                dut.host_i.trap_mask[2]  !== mask2_before ||
+                dut.host_i.trap_replace[2] !== repl2_before)
+                $fatal(1, "unknown TOCTOU subcommand modified trap registers");
+        end
+
+        // 10. CHIPCONFIG SFDP length boundary & malformed framing recovery:
+        //     - 128-byte SFDP with 1 ms mid-payload stall succeeds and stores
+        //       all 128 bytes cleanly.
+        //     - Lengths 129, 247, 248, 255 drain without wrapping in_count,
+        //       do not execute payload opcodes or overwrite cfg_jedec_id,
+        //       reply 0x02, leave START blocked, and preserve following VERSION.
+        begin
+            reg hold_before;
+            integer bad_lens [0:3];
+            bad_lens = '{129, 247, 248, 255};
+
+            // Valid 128-byte SFDP with a 1 ms mid-payload stall.
+            ft_byte(8'h33);
+            ft_byte(8'hef); ft_byte(8'h40); ft_byte(8'h17); // JEDEC EF 40 17
+            ft_byte(8'h00); // flags (3-byte)
+            ft_byte(8'h0f); ft_byte(8'hff); ft_byte(8'hff); // 8 MiB erase bursts
+            ft_byte(8'd128);
+            for (integer i = 0; i < 128; i++) begin
+                ft_byte(8'(i ^ 8'h5a));
+                if (i == 63) tick(120000);
+            end
+            ft_push_now(8'h30);
+            expect_reply(ft_replies, 8'h01, "CHIPCONFIG 128-byte SFDP with stall");
+            expect_reply(ft_replies, 8'h09, "VERSION after 128-byte CHIPCONFIG");
+            if (cfg_jedec_id !== 24'h1740ef)
+                $fatal(1, "valid CHIPCONFIG JEDEC %h", cfg_jedec_id);
+            sfdp_raddr = 7'd0; tick(2);
+            if (sfdp_rdata !== 8'h5a) $fatal(1, "SFDP[0] = %h", sfdp_rdata);
+            sfdp_raddr = 7'd127; tick(2);
+            if (sfdp_rdata !== 8'(8'd127 ^ 8'h5a)) $fatal(1, "SFDP[127] = %h", sfdp_rdata);
+
+            // Malformed lengths 129, 247, 248, 255 with opcode bytes inside payload.
+            hold_before = hold;
+            foreach (bad_lens[k]) begin
+                ft_push_now(8'h33);
+                ft_push_now(8'h11); ft_push_now(8'h22); ft_push_now(8'h33);
+                ft_push_now(8'h01);
+                ft_push_now(8'h00); ft_push_now(8'h00); ft_push_now(8'h01);
+                ft_push_now(8'(bad_lens[k]));
+                for (integer i = 0; i < bad_lens[k]; i++)
+                    ft_push_now(i[0] ? 8'h30 : 8'h37);
+                ft_push_now(8'h30); // pipelined VERSION after frame
+                expect_reply(ft_replies, 8'h02, "malformed CHIPCONFIG rejected");
+                expect_reply(ft_replies, 8'h09, "VERSION after malformed CHIPCONFIG");
+                if (cfg_jedec_id !== 24'h1740ef)
+                    $fatal(1, "malformed CHIPCONFIG (%0d) overwrote JEDEC to %h",
+                           bad_lens[k], cfg_jedec_id);
+                if (hold !== hold_before)
+                    $fatal(1, "malformed CHIPCONFIG (%0d) executed payload as HOLDCTL", bad_lens[k]);
+                // START must stay blocked after rejected CHIPCONFIG.
+                ft_push_now(8'h34);
+                expect_reply(ft_replies, 8'h02, "START blocked after rejected CHIPCONFIG");
+            end
+        end
+
+        // 11. CHIPPROFILE: 1 ms mid-payload stall survives; after byte 128,
+        //     TX stall > 1 ms must neither time out validation nor swallow
+        //     a pipelined VERSION sitting in the RX FIFO.
+        begin
+            reg [7:0] prof [0:127];
+            for (integer i = 0; i < 128; i++) prof[i] = 8'h00;
+            prof[0]  = 8'h02; // format version 2
+            prof[1]  = 8'h00; // generic status model
+            prof[24] = 8'h03; // 3-byte addressing
+            prof[28] = 8'h08; // page shift 8 (256B)
+            // Descriptor 0: opcode 0x20, 1 region: 4 KiB (shift 12) * 2048 = 8 MiB
+            prof[32] = 8'h20;
+            prof[34] = 8'h01;
+            prof[36] = 8'd12;
+            prof[37] = 8'h00; prof[38] = 8'h08; prof[39] = 8'h00;
+
+            ft_byte(8'h3c);
+            for (integer i = 0; i < 127; i++) begin
+                ft_byte(prof[i]);
+                if (i == 63) tick(120000); // 1 ms mid-payload stall
+            end
+            // Stall TX before final byte and pipeline VERSION right behind byte 128.
+            ft_tx_ready = 0;
+            ft_push_now(prof[127]);
+            ft_push_now(8'h30); // pipelined VERSION
+            tick(120000); // > 546 us header timeout while validating / waiting for TX
+            expect_quiet(ft_replies, "CHIPPROFILE ACK while TX stalled");
+            ft_tx_ready = 1;
+            expect_reply(ft_replies, 8'h01, "CHIPPROFILE accepted after TX stall");
+            if (!cfg_profile_valid) $fatal(1, "CHIPPROFILE did not publish valid profile");
+            expect_reply(ft_replies, 8'h09, "pipelined VERSION after CHIPPROFILE");
+        end
+
+        $display("PASS HOST_PROTOCOL: admission, framing, RAMWRITE burst ownership, CHIPCONFIG/CHIPPROFILE validation, and timeouts");
         $finish;
     end
 
-    initial begin #60000000; $fatal(1, "host protocol test timeout"); end
+    initial begin #200000000; $fatal(1, "host protocol test timeout"); end
 endmodule

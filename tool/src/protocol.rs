@@ -12,11 +12,11 @@ use zerocopy::{Immutable, IntoBytes};
 pub const PROTOCOL_VERSION: u8 = 9;
 
 /// Upper bound on how long the FPGA parser can stay inside an abandoned
-/// command before its idle timeout returns it to idle: about 35 ms inside a
-/// RAMWRITE payload (546 us in command headers), see `serial_idle_count` in
-/// `src/host_protocol.v`. A new session waits at least this long before its
-/// first command, so stray bytes or an interrupted earlier session cannot
-/// swallow it.
+/// command before its idle timeout returns it to idle: about 35 ms inside
+/// RAMWRITE, CHIPCONFIG SFDP, or CHIPPROFILE payloads (546 us in command
+/// headers), see `serial_idle_count` in `src/host_protocol.v`. A new session
+/// waits at least this long before its first command, so stray bytes or an
+/// interrupted earlier session cannot swallow it.
 pub const PARSER_IDLE_RESET_MS: u32 = 50;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 3;
 
@@ -121,6 +121,11 @@ impl BeU24 {
     }
 }
 
+/// Number of 8-byte bursts in the 64 MiB SDRAM backing store (`2^23`).
+pub const SDRAM_BURSTS: u32 = 0x0080_0000;
+/// Maximum SFDP table length accepted by `CMD_CHIPCONFIG`.
+pub const MAX_SFDP_LENGTH: u8 = 128;
+
 #[derive(Clone, Copy, Debug, Eq, Immutable, IntoBytes, PartialEq)]
 #[repr(C)]
 pub struct RamHeader {
@@ -139,7 +144,11 @@ impl RamHeader {
     }
 
     fn new(command: u8, address_bursts: u32, length_bursts: u16) -> Option<Self> {
-        (address_bursts <= BeU24::MAX).then(|| Self {
+        if length_bursts == 0 {
+            return None;
+        }
+        let end = address_bursts.checked_add(u32::from(length_bursts))?;
+        (end <= SDRAM_BURSTS).then(|| Self {
             command,
             address_bursts: BeU24::new(address_bursts),
             length_bursts: BeU16::new(length_bursts),
@@ -159,9 +168,8 @@ pub struct ChipConfigHeader {
 
 impl ChipConfigHeader {
     pub fn new(jedec_id: [u8; 3], flags: u8, erase_bursts: u32, sfdp_length: u8) -> Option<Self> {
-        // The FPGA stores this field in 23 bits; bit 23 is not part of the
-        // count even though the wire representation occupies three bytes.
-        (erase_bursts <= 0x007f_ffff).then(|| Self {
+        // The FPGA stores erase_bursts in 23 bits and SFDP in a 128-byte BSRAM.
+        (erase_bursts < SDRAM_BURSTS && sfdp_length <= MAX_SFDP_LENGTH).then(|| Self {
             command: CMD_CHIPCONFIG,
             jedec_id,
             flags,
@@ -310,6 +318,15 @@ mod tests {
             RamHeader::write(0x00_00ff, 0xffff).unwrap().as_bytes(),
             &[CMD_WRITE, 0x00, 0x00, 0xff, 0xff, 0xff]
         );
+        // Last valid burst and maximal range ending at the 64 MiB boundary.
+        assert!(RamHeader::read(SDRAM_BURSTS - 1, 1).is_some());
+        assert!(RamHeader::write(SDRAM_BURSTS - u32::from(u16::MAX), u16::MAX).is_some());
+        // Zero length, out-of-range start, and end wrapping past 23-bit burst space.
+        assert!(RamHeader::read(0, 0).is_none());
+        assert!(RamHeader::write(0, 0).is_none());
+        assert!(RamHeader::read(SDRAM_BURSTS, 1).is_none());
+        assert!(RamHeader::write(SDRAM_BURSTS - 1, 2).is_none());
+        assert!(RamHeader::read(SDRAM_BURSTS - u32::from(u16::MAX) + 1, u16::MAX).is_none());
         assert!(RamHeader::read(0x0100_0000, 1).is_none());
     }
 
@@ -320,7 +337,9 @@ mod tests {
             header.as_bytes(),
             &[CMD_CHIPCONFIG, 0xef, 0x40, 0x18, 1, 0x12, 0x34, 0x56, 128]
         );
-        assert!(ChipConfigHeader::new([0; 3], 0, 0x0080_0000, 0).is_none());
+        assert!(ChipConfigHeader::new([0; 3], 0, SDRAM_BURSTS - 1, MAX_SFDP_LENGTH).is_some());
+        assert!(ChipConfigHeader::new([0; 3], 0, SDRAM_BURSTS, 0).is_none());
+        assert!(ChipConfigHeader::new([0; 3], 0, 0, MAX_SFDP_LENGTH + 1).is_none());
     }
 
     #[test]

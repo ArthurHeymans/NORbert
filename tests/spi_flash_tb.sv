@@ -633,13 +633,13 @@ module spi_flash_tb;
         host_byte(8'h35); configure_sfdp(0, 0); host_byte(8'h34);
         read_sfdp(0, 130, 0, 0);
         host_byte(8'h35); configure_sfdp(128, 8'h84, 2);
-        repeat (70000) @(negedge clk); // Incomplete host command times out
+        repeat (4200000) @(negedge clk); // Incomplete payload command times out (2^22 cycles)
         host_byte(8'h34);
         if (running || last_reply_byte !== 8'h02) $fatal(1, "START accepted partial CHIPCONFIG");
         configure_sfdp(2, 8'h84); host_byte(8'h34);
         read_sfdp(0, 130, 2, 8'h84);
         host_byte(8'h35); host_byte(8'h3c); host_byte(1);
-        repeat (70000) @(negedge clk);
+        repeat (4200000) @(negedge clk);
         host_byte(8'h34);
         if (running || last_reply_byte !== 8'h02) $fatal(1, "START accepted partial CHIPPROFILE");
         check_profile_reply(1'b1, 1'b0);
@@ -741,7 +741,7 @@ module spi_flash_tb;
     end
 
     initial begin
-        #50000000;
+        #120000000;
         $fatal(1, "SPI test timeout");
     end
 endmodule
