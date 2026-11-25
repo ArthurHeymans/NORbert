@@ -246,6 +246,17 @@ pub(crate) fn find_erase_opcode(descriptors: &[u8], erase_size: u64) -> Result<O
         }))
 }
 
+pub(crate) const FLASH_SECTOR_SIZE: u32 = 0x1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashEraseFootprint {
+    pub(crate) erase_start: u32,
+    pub(crate) erase_end: u32,
+    pub(crate) head_preserve_len: usize,
+    pub(crate) tail_preserve_addr: u32,
+    pub(crate) tail_preserve_len: usize,
+}
+
 pub(crate) fn validate_flash_range(offset: u32, len: usize, capacity: u64) -> Result<u32, String> {
     // This programmer only sends three-byte addresses and erases 4 KiB sectors.
     let limit = capacity.min(0x0100_0000);
@@ -259,6 +270,49 @@ pub(crate) fn validate_flash_range(offset: u32, len: usize, capacity: u64) -> Re
         ));
     }
     Ok(end as u32)
+}
+
+pub(crate) fn plan_sector_erase(
+    offset: u32,
+    len: usize,
+    capacity: u64,
+) -> Result<FlashEraseFootprint, String> {
+    let end_addr = validate_flash_range(offset, len, capacity)?;
+    let mask = FLASH_SECTOR_SIZE - 1;
+    let erase_start = offset & !mask;
+    let erase_end = (u64::from(end_addr) + u64::from(mask)) & !u64::from(mask);
+    let erase_end = u32::try_from(erase_end).map_err(|_| "flash erase range overflow")?;
+    Ok(FlashEraseFootprint {
+        erase_start,
+        erase_end,
+        head_preserve_len: (offset - erase_start) as usize,
+        tail_preserve_addr: end_addr,
+        tail_preserve_len: (erase_end - end_addr) as usize,
+    })
+}
+
+pub(crate) fn verify_unprotected_status(status: u8, bp_mask: u8) -> Result<(), String> {
+    if (status & bp_mask) != 0 {
+        return Err(format!(
+            "SPI flash block protection bits remained set after unprotect (status=0x{status:02x}); flash may be hardware write-protected"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn combine_primary_and_cleanup_error<T>(
+    primary: Result<T, String>,
+    cleanup: Result<(), String>,
+    cleanup_context: &str,
+) -> Result<T, String> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup_err)) => Err(format!("{cleanup_context}: {cleanup_err}")),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(cleanup_err)) => Err(format!(
+            "{err}; {cleanup_context} also failed: {cleanup_err}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -332,5 +386,89 @@ mod tests {
         assert!(validate_flash_range(0x1000000, 1, 32 * 1024 * 1024).is_err());
         assert!(validate_flash_range(0, 1, 1024).is_err());
         assert!(validate_flash_range(u32::MAX, usize::MAX, capacity).is_err());
+    }
+
+    #[test]
+    fn plans_sector_erase_and_boundary_preservation() {
+        let capacity = 8 * 1024 * 1024;
+
+        // Exact sector alignment needs no preservation.
+        assert_eq!(
+            plan_sector_erase(0x2000, 0x2000, capacity).unwrap(),
+            FlashEraseFootprint {
+                erase_start: 0x2000,
+                erase_end: 0x4000,
+                head_preserve_len: 0,
+                tail_preserve_addr: 0x4000,
+                tail_preserve_len: 0,
+            }
+        );
+
+        // Unaligned offset and length preserve both head and tail inside the same sector.
+        assert_eq!(
+            plan_sector_erase(0x1234, 0x100, capacity).unwrap(),
+            FlashEraseFootprint {
+                erase_start: 0x1000,
+                erase_end: 0x2000,
+                head_preserve_len: 0x234,
+                tail_preserve_addr: 0x1334,
+                tail_preserve_len: 0xccc,
+            }
+        );
+
+        // End of 16 MiB 3-byte addressable window stays representable.
+        assert_eq!(
+            plan_sector_erase(0x00ff_ff00, 256, 32 * 1024 * 1024).unwrap(),
+            FlashEraseFootprint {
+                erase_start: 0x00ff_f000,
+                erase_end: 0x0100_0000,
+                head_preserve_len: 0xf00,
+                tail_preserve_addr: 0x0100_0000,
+                tail_preserve_len: 0,
+            }
+        );
+
+        assert!(plan_sector_erase(0x7ff_f00, 257, capacity).is_err());
+    }
+
+    #[test]
+    fn verify_unprotected_status_fails_closed_when_bp_bits_remain() {
+        assert!(verify_unprotected_status(0x00, 0x7c).is_ok());
+        assert!(verify_unprotected_status(0x80, 0x7c).is_ok());
+        let err = verify_unprotected_status(0x9c, 0x7c).unwrap_err();
+        assert!(err.contains("remained set"));
+        assert!(err.contains("0x9c"));
+    }
+
+    #[test]
+    fn combine_primary_and_cleanup_error_preserves_both_failures() {
+        assert_eq!(
+            combine_primary_and_cleanup_error(Ok(42u32), Ok(()), "cleanup"),
+            Ok(42)
+        );
+        assert_eq!(
+            combine_primary_and_cleanup_error::<u32>(
+                Ok(42),
+                Err("usb busy".to_string()),
+                "release JTAG"
+            ),
+            Err("release JTAG: usb busy".to_string())
+        );
+        assert_eq!(
+            combine_primary_and_cleanup_error::<u32>(
+                Err("verify failed".to_string()),
+                Ok(()),
+                "release JTAG"
+            ),
+            Err("verify failed".to_string())
+        );
+        assert_eq!(
+            combine_primary_and_cleanup_error::<u32>(
+                Err("verify failed".to_string()),
+                Err("usb busy".to_string()),
+                "release JTAG"
+            ),
+            Err("verify failed; release JTAG also failed: usb busy".to_string())
+        );
     }
 }
