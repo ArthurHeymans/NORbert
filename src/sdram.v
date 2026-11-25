@@ -217,7 +217,7 @@ module sdram(
     // Hard refresh may interrupt a stopped address phase, but give an
     // actively clocked phase a chance to reach its READ first. The separate
     // age limit below also bounds deferral when SCK never stops.
-    wire spi_address_quiet = &spi_quiet_cycles;
+    reg spi_address_quiet;
     reg refresh_force_replay;
     reg [1:0] spi_inhibit_refresh_buf;
     reg [2:0] spi_cmd_activate_buf;
@@ -484,6 +484,7 @@ module sdram(
             spi_active_buf <= 0;
             spi_activity_sync <= 0;
             spi_quiet_cycles <= 0;
+            spi_address_quiet <= 0;
             refresh_force_replay <= 0;
             spi_inhibit_refresh_buf <= 0;
             spi_cmd_activate_buf <= 0;
@@ -539,10 +540,15 @@ module sdram(
             // refresh inhibition or command requests asserted indefinitely.
             spi_active_buf <= {spi_active_buf[1:0], spi_active};
             spi_activity_sync <= {spi_activity_sync[1:0], spi_activity_toggle};
-            if (!spi_active_buf[1] || spi_activity_sync[1] != spi_activity_sync[2])
+            if (!spi_active_buf[1] || spi_activity_sync[1] != spi_activity_sync[2]) begin
                 spi_quiet_cycles <= 0;
-            else if (!spi_address_quiet)
+                spi_address_quiet <= 1'b0;
+            end
+            else if (!spi_address_quiet) begin
                 spi_quiet_cycles <= spi_quiet_cycles + 1'b1;
+                if (spi_quiet_cycles == 7'd126)
+                    spi_address_quiet <= 1'b1;
+            end
             // Leave 64 clocks of counter headroom for row closure and
             // refresh dispatch, even if SCK keeps moving.
             refresh_force_replay <= refreshcount >= {REFRESH_BITS{1'b1}} - 64;
