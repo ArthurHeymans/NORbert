@@ -128,7 +128,7 @@ impl LogDecoder {
                     3,
                 ),
                 // Known packet type but incomplete: wait for more data.
-                0xA1..=0xAF => break,
+                LOG_CMD | LOG_ADDR | LOG_END | LOG_TRAP | LOG_LOST => break,
                 // Unknown byte: resynchronize on the next one.
                 _ => (None, 1),
             };
@@ -146,7 +146,7 @@ pub struct ActivityLog {
     decoder: LogDecoder,
     txn_count: u32,
     opcode: u8,
-    address: u32,
+    address: Option<u32>,
     line_open: bool,
     reads: HashMap<(u32, u8), u32>,
     double_reads: Vec<(u32, u8)>,
@@ -183,6 +183,7 @@ impl ActivityLog {
             LogEvent::Command(opcode) => {
                 self.close_line(out);
                 self.opcode = opcode;
+                self.address = None;
                 self.txn_count += 1;
                 let _ = write!(
                     out,
@@ -194,7 +195,7 @@ impl ActivityLog {
                 self.line_open = true;
             }
             LogEvent::Address(address) => {
-                self.address = address;
+                self.address = Some(address);
                 let _ = write!(out, " {}", format_address(address));
                 if is_read_opcode(self.opcode) {
                     let key = (address, self.opcode);
@@ -218,18 +219,23 @@ impl ActivityLog {
                 // Addressless commands get no LOG_ADDR packet, so terminate
                 // their row when the transaction ends.
                 self.close_line(out);
+                let address = self.address.take();
                 if bytes > 1 && self.opcode != 0 {
-                    let _ = writeln!(
-                        out,
-                        "       end: {bytes} bytes from {}",
-                        format_address(self.address)
-                    );
+                    if let Some(address) = address {
+                        let _ = writeln!(
+                            out,
+                            "       end: {bytes} bytes from {}",
+                            format_address(address)
+                        );
+                    } else {
+                        let _ = writeln!(out, "       end: {bytes} bytes");
+                    }
                 }
             }
             LogEvent::Lost { events } => {
                 self.close_line(out);
                 self.opcode = 0;
-                self.address = 0;
+                self.address = None;
                 let _ = writeln!(out, "  !! LOG GAP: {events} events dropped");
             }
             LogEvent::Trap { index, address } => {
@@ -279,6 +285,20 @@ mod tests {
     }
 
     #[test]
+    fn decoder_skips_unknown_markers_in_a1_af_range() {
+        let mut decoder = LogDecoder::default();
+        assert_eq!(
+            decoder.feed(&[0xA5, 0xA7, 0xA8, 0xAF, LOG_CMD, 0x9F]),
+            [LogEvent::Command(0x9F)]
+        );
+        assert_eq!(decoder.feed(&[0xA5, 0xAA, LOG_CMD]), []);
+        assert_eq!(
+            decoder.feed(&[0x03, 0xAC, LOG_END, 0x00, 0x00, 0x04]),
+            [LogEvent::Command(0x03), LogEvent::End { bytes: 4 }]
+        );
+    }
+
+    #[test]
     fn log_loss_packet_is_split_safe_and_breaks_transaction_association() {
         let mut decoder = LogDecoder::default();
         assert_eq!(decoder.feed(&[LOG_LOST, 0x12]), []);
@@ -298,9 +318,10 @@ mod tests {
             LOG_CMD, 0xBB, LOG_ADDR, 0, 0, 0x10, 0x00, LOG_END, 0, 0x10, 0x01,
         ];
         let mut log = ActivityLog::default();
-        assert_eq!(log.feed(&[LOG_CMD, 0x9F, LOG_END, 0, 0, 3]), {
-            "1      0x9F READ_JEDEC_ID\n       end: 3 bytes from 0x000000\n"
-        });
+        assert_eq!(
+            log.feed(&[LOG_CMD, 0x9F, LOG_END, 0, 0, 3]),
+            "1      0x9F READ_JEDEC_ID\n       end: 3 bytes\n"
+        );
         assert_eq!(
             log.feed(&read),
             "2      0xBB DUAL_IO_READ  0x001000\n       end: 4097 bytes from 0x001000\n"
@@ -308,5 +329,17 @@ mod tests {
         assert!(log.feed(&read).contains("DOUBLE READ"));
         assert!(log.feed(&read).contains("READ #3"));
         assert_eq!(log.double_reads().collect::<Vec<_>>(), [(0x1000, 0xBB, 3)]);
+    }
+
+    #[test]
+    fn activity_log_clears_address_before_addressless_command() {
+        let mut log = ActivityLog::default();
+        assert_eq!(
+            log.feed(&[
+                LOG_CMD, 0x03, LOG_ADDR, 0, 0x12, 0x34, 0x56, LOG_END, 0, 0, 16, LOG_CMD, 0x9F,
+                LOG_END, 0, 0, 3,
+            ]),
+            "1      0x03 READ          0x123456\n       end: 16 bytes from 0x123456\n2      0x9F READ_JEDEC_ID\n       end: 3 bytes\n"
+        );
     }
 }

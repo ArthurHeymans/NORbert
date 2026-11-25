@@ -613,6 +613,23 @@ impl FlashDevice {
         }
     }
 
+    /// Stop activity logging and drain all buffered log bytes in bounded
+    /// `CMD_LOGPOLL` chunks (each poll returns at most 255 bytes).
+    pub(crate) async fn log_stop_and_drain(&mut self) -> Result<Vec<u8>> {
+        const MAX_DRAIN_POLLS: usize = 16;
+
+        self.log_stop().await?;
+        let mut drained = Vec::new();
+        for _ in 0..MAX_DRAIN_POLLS {
+            let chunk = self.log_poll().await?;
+            if chunk.is_empty() {
+                break;
+            }
+            drained.extend_from_slice(&chunk);
+        }
+        Ok(drained)
+    }
+
     pub(crate) async fn toctou_set(
         &mut self,
         index: u8,
@@ -1260,5 +1277,42 @@ mod tests {
                 .is_err()
         );
         assert_eq!(writes.borrow().last().unwrap()[0], CMD_CHIPPROFILE);
+    }
+
+    #[test]
+    fn log_stop_and_drain_collects_multiple_polls_until_empty() {
+        let mut expected_chunk1 = vec![0x42u8; 253];
+        expected_chunk1.push(LOG_POLL_TERMINATOR);
+        expected_chunk1.push(LOG_POLL_ESCAPE);
+        let expected_chunk2 = vec![LOG_CMD, 0x03, LOG_ADDR, 0, 0, 0x10, 0x00];
+
+        let mut reads = vec![1u8]; // ACK for CMD_LOGCTL(stop)
+        // Poll 1: 255 raw bytes (with 0xA0 and 0xA5 escaped on wire) + terminator
+        reads.extend_from_slice(&[0x42u8; 253]);
+        reads.extend_from_slice(&[LOG_POLL_ESCAPE, 0x00, LOG_POLL_ESCAPE, 0x05]);
+        reads.push(LOG_POLL_TERMINATOR);
+        // Poll 2: remaining 7 bytes + terminator
+        reads.extend_from_slice(&expected_chunk2);
+        reads.push(LOG_POLL_TERMINATOR);
+        // Poll 3: empty terminator
+        reads.push(LOG_POLL_TERMINATOR);
+
+        let (transport, writes) = MockTransport::new(reads);
+        let mut device =
+            FlashDevice::new(transport, ConnectionKind::Ft245, Some(PROTOCOL_VERSION)).unwrap();
+
+        let drained = device.log_stop_and_drain().unwrap();
+        let mut expected = expected_chunk1;
+        expected.extend_from_slice(&expected_chunk2);
+        assert_eq!(drained, expected);
+        assert_eq!(
+            &*writes.borrow(),
+            &[
+                ControlRequest::log(false).as_bytes().to_vec(),
+                vec![CMD_LOGPOLL],
+                vec![CMD_LOGPOLL],
+                vec![CMD_LOGPOLL],
+            ]
+        );
     }
 }

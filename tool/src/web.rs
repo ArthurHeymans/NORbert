@@ -710,6 +710,10 @@ impl WebFlashDevice {
         self.inner.log_poll().await.map_err(js_error)
     }
 
+    pub async fn log_stop_and_drain(&mut self) -> Result<Vec<u8>, JsValue> {
+        self.inner.log_stop_and_drain().await.map_err(js_error)
+    }
+
     pub async fn toctou_set(
         &mut self,
         index: u8,

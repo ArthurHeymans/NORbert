@@ -778,11 +778,14 @@ impl NorbertWebApp {
             state.borrow_mut().status = "SPI activity capture running".to_owned();
 
             while state.borrow().monitoring {
+                let mut idle = false;
                 match device.log_poll().await {
                     Ok(data) if !data.is_empty() => {
                         decode_log_packets(&mut state.borrow_mut(), &data)
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        idle = true;
+                    }
                     Err(error) => {
                         let mut shared = state.borrow_mut();
                         set_error(
@@ -793,23 +796,39 @@ impl NorbertWebApp {
                     }
                 }
                 repaint.request_repaint();
-                TimeoutFuture::new(10).await;
+                if idle && state.borrow().monitoring {
+                    TimeoutFuture::new(10).await;
+                }
             }
 
-            let stop_result = device.log_stop().await;
+            let stop_result = if device.is_connected() {
+                Some(device.log_stop_and_drain().await)
+            } else {
+                None
+            };
             let mut shared = state.borrow_mut();
+            if let Some(Ok(remaining)) = &stop_result
+                && !remaining.is_empty()
+            {
+                decode_log_packets(&mut shared, remaining);
+            }
             restore_device(&mut shared, Some(device));
             shared.busy = false;
             shared.monitoring = false;
             match stop_result {
-                Ok(()) if !shared.status_error => {
+                Some(Ok(_)) if !shared.status_error => {
                     shared.status = "SPI activity capture stopped".to_owned();
                 }
-                Ok(()) => {}
-                Err(error) => set_error(
+                Some(Ok(_)) | None => {}
+                Some(Err(error)) if !shared.status_error => set_error(
                     &mut shared,
                     format!("Failed to stop activity capture: {}", js_error(error)),
                 ),
+                Some(Err(error)) => {
+                    shared
+                        .status
+                        .push_str(&format!(" (stop/drain also failed: {})", js_error(error)));
+                }
             }
             repaint.request_repaint();
         });
@@ -1398,7 +1417,9 @@ impl NorbertWebApp {
                 self.stop_monitor();
             }
             if ui.button("Clear").clicked() {
-                self.state.borrow_mut().log_output.clear();
+                let mut state = self.state.borrow_mut();
+                state.log_output.clear();
+                state.activity = ActivityLog::default();
             }
         });
         egui::ScrollArea::vertical()
