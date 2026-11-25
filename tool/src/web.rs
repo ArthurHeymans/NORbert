@@ -1,5 +1,6 @@
 use crate::device::{
     ConnectionKind, FT2232H_PID, FTDI_VID, FlashDevice, Transport, UART_BAUD_RATE,
+    validate_sdram_range,
 };
 use crate::protocol::{
     CMD_VERSION, PARSER_IDLE_RESET_MS, PrefetchFaults, is_supported_protocol_version,
@@ -28,6 +29,20 @@ fn file_length(file: &File) -> Result<usize> {
         bail!("file size must be between 1 byte and 4 GiB");
     }
     Ok(size as usize)
+}
+
+async fn read_file_slice(file: &File, offset: usize, end: usize) -> Result<Vec<u8>> {
+    let blob = file
+        .slice_with_f64_and_f64(offset as f64, end as f64)
+        .map_err(|error| anyhow!(js_value_text(&error)))?;
+    let buffer = JsFuture::from(blob.array_buffer())
+        .await
+        .map_err(|error| anyhow!(js_value_text(&error)))?;
+    let data = Uint8Array::new(&buffer).to_vec();
+    if data.len() != end - offset {
+        bail!("browser returned a truncated file chunk");
+    }
+    Ok(data)
 }
 
 fn js_error(error: impl std::fmt::Display) -> JsValue {
@@ -596,43 +611,37 @@ impl WebFlashDevice {
         file: File,
         on_progress: Function,
     ) -> Result<(), JsValue> {
-        let length = file_length(&file).map_err(js_error)?;
-        let mut session = self
-            .inner
-            .begin_write(address, length)
+        self.write_and_verify_file(address, file, false, on_progress)
             .await
-            .map_err(js_error)?;
+    }
+
+    /// Write a browser File and optionally verify it before resuming SPI
+    /// emulation. If either the write or verification fails, emulation stays
+    /// stopped so the target cannot read partial or unverified data.
+    pub async fn write_and_verify_file(
+        &mut self,
+        address: u32,
+        file: File,
+        verify: bool,
+        on_progress: Function,
+    ) -> Result<(), JsValue> {
+        let length = file_length(&file).map_err(js_error)?;
+        validate_sdram_range(address, length, "write").map_err(js_error)?;
+        let was_running = self.inner.prepare_stopped().await.map_err(js_error)?;
         let operation = async {
-            let mut offset = 0usize;
-            let mut completed = 0usize;
-            while offset < length {
-                let end = (offset + FILE_CHUNK_SIZE).min(length);
-                let blob = file
-                    .slice_with_f64_and_f64(offset as f64, end as f64)
-                    .map_err(|error| anyhow!(js_value_text(&error)))?;
-                let buffer = JsFuture::from(blob.array_buffer())
-                    .await
-                    .map_err(|error| anyhow!(js_value_text(&error)))?;
-                let data = Uint8Array::new(&buffer).to_vec();
-                session
-                    .write_chunk(&data, |written| {
-                        completed += written;
-                        let result = on_progress
-                            .call2(
-                                &JsValue::UNDEFINED,
-                                &JsValue::from_f64(completed as f64),
-                                &JsValue::from_f64(length as f64),
-                            )
-                            .map_err(|error| anyhow!(js_value_text(&error)))?;
-                        callback_result(result)
-                    })
+            self.write_file_raw(address, &file, length, &on_progress)
+                .await?;
+            if verify {
+                self.verify_file_raw(address, &file, length, &on_progress)
                     .await?;
-                offset = end;
             }
             Ok(())
         }
         .await;
-        session.finish(operation).await.map_err(js_error)
+        self.inner
+            .finish_stopped_on_success(was_running, operation)
+            .await
+            .map_err(js_error)
     }
 
     /// Verify a browser File against SDRAM without retaining either the full
@@ -644,57 +653,11 @@ impl WebFlashDevice {
         on_progress: Function,
     ) -> Result<(), JsValue> {
         let length = file_length(&file).map_err(js_error)?;
+        validate_sdram_range(address, length, "read").map_err(js_error)?;
         let was_running = self.inner.prepare_stopped().await.map_err(js_error)?;
-        let operation = async {
-            let mut offset = 0usize;
-            let mut completed = 0usize;
-            while offset < length {
-                let end = (offset + FILE_CHUNK_SIZE).min(length);
-                let blob = file
-                    .slice_with_f64_and_f64(offset as f64, end as f64)
-                    .map_err(|error| anyhow!(js_value_text(&error)))?;
-                let buffer = JsFuture::from(blob.array_buffer())
-                    .await
-                    .map_err(|error| anyhow!(js_value_text(&error)))?;
-                let expected = Uint8Array::new(&buffer).to_vec();
-                if expected.len() != end - offset {
-                    bail!("browser returned a truncated file chunk");
-                }
-
-                let chunk_address = address
-                    .checked_add(offset as u32)
-                    .ok_or_else(|| anyhow!("verification address overflow"))?;
-                self.inner
-                    .read_raw_chunks(chunk_address, expected.len() as u32, |actual_address, actual| {
-                        let expected_offset = (actual_address - chunk_address) as usize;
-                        let expected_chunk = &expected[expected_offset..expected_offset + actual.len()];
-                        if let Some((index, (&wanted, &found))) = expected_chunk
-                            .iter()
-                            .zip(actual)
-                            .enumerate()
-                            .find(|(_, (wanted, found))| wanted != found)
-                        {
-                            bail!(
-                                "verification failed at 0x{:08x}: expected 0x{wanted:02x}, got 0x{found:02x}",
-                                actual_address + index as u32
-                            );
-                        }
-                        completed += actual.len();
-                        let result = on_progress
-                            .call2(
-                                &JsValue::UNDEFINED,
-                                &JsValue::from_f64(completed as f64),
-                                &JsValue::from_f64(length as f64),
-                            )
-                            .map_err(|error| anyhow!(js_value_text(&error)))?;
-                        callback_result(result)
-                    })
-                    .await?;
-                offset = end;
-            }
-            Ok(())
-        }
-        .await;
+        let operation = self
+            .verify_file_raw(address, &file, length, &on_progress)
+            .await;
         self.inner
             .finish_stopped(was_running, operation)
             .await
@@ -808,5 +771,89 @@ impl WebFlashDevice {
     /// Read and clear the sticky SDRAM prefetch fault flags.
     pub async fn prefetch_faults(&mut self) -> Result<PrefetchFaults, JsValue> {
         self.inner.prefetch_faults().await.map_err(js_error)
+    }
+
+    async fn write_file_raw(
+        &mut self,
+        address: u32,
+        file: &File,
+        length: usize,
+        on_progress: &Function,
+    ) -> Result<()> {
+        let mut offset = 0usize;
+        let mut completed = 0usize;
+        while offset < length {
+            let end = (offset + FILE_CHUNK_SIZE).min(length);
+            let data = read_file_slice(file, offset, end).await?;
+            let chunk_address = address
+                .checked_add(offset as u32)
+                .ok_or_else(|| anyhow!("write address overflow"))?;
+            self.inner
+                .write_raw_with_progress(chunk_address, &data, |written| {
+                    completed += written;
+                    let result = on_progress
+                        .call2(
+                            &JsValue::UNDEFINED,
+                            &JsValue::from_f64(completed as f64),
+                            &JsValue::from_f64(length as f64),
+                        )
+                        .map_err(|error| anyhow!(js_value_text(&error)))?;
+                    callback_result(result)
+                })
+                .await?;
+            offset = end;
+        }
+        Ok(())
+    }
+
+    async fn verify_file_raw(
+        &mut self,
+        address: u32,
+        file: &File,
+        length: usize,
+        on_progress: &Function,
+    ) -> Result<()> {
+        let mut offset = 0usize;
+        let mut completed = 0usize;
+        while offset < length {
+            let end = (offset + FILE_CHUNK_SIZE).min(length);
+            let expected = read_file_slice(file, offset, end).await?;
+            let chunk_address = address
+                .checked_add(offset as u32)
+                .ok_or_else(|| anyhow!("verification address overflow"))?;
+            self.inner
+                .read_raw_chunks(
+                    chunk_address,
+                    expected.len() as u32,
+                    |actual_address, actual| {
+                        let expected_offset = (actual_address - chunk_address) as usize;
+                        let expected_chunk =
+                            &expected[expected_offset..expected_offset + actual.len()];
+                        if let Some((index, (&wanted, &found))) = expected_chunk
+                            .iter()
+                            .zip(actual)
+                            .enumerate()
+                            .find(|(_, (wanted, found))| wanted != found)
+                        {
+                            bail!(
+                                "verification failed at 0x{:08x}: expected 0x{wanted:02x}, got 0x{found:02x}",
+                                actual_address + index as u32
+                            );
+                        }
+                        completed += actual.len();
+                        let result = on_progress
+                            .call2(
+                                &JsValue::UNDEFINED,
+                                &JsValue::from_f64(completed as f64),
+                                &JsValue::from_f64(length as f64),
+                            )
+                            .map_err(|error| anyhow!(js_value_text(&error)))?;
+                        callback_result(result)
+                    },
+                )
+                .await?;
+            offset = end;
+        }
+        Ok(())
     }
 }

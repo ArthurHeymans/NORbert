@@ -262,15 +262,7 @@ impl NorbertWebApp {
             };
             let mut shared = state.borrow_mut();
             shared.busy = false;
-            shared.version = None;
-            shared.running = None;
-            shared.emulation_control = false;
-            shared.activity_log = false;
-            shared.prefetch_diagnostics = false;
-            shared.hold_enabled = None;
-            shared.prefetch_faults = None;
-            shared.configured_chip = None;
-            shared.connection = ConnectionState::Disconnected;
+            clear_connection_state(&mut shared);
             match result {
                 Ok(()) => {
                     shared.status = "Disconnected".to_owned();
@@ -306,11 +298,13 @@ impl NorbertWebApp {
                 None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
             };
             let mut shared = state.borrow_mut();
-            shared.device = device;
+            restore_device(&mut shared, device);
             shared.busy = false;
             match result {
                 Ok(()) => {
-                    shared.running = Some(running);
+                    if shared.device.is_some() {
+                        shared.running = Some(running);
+                    }
                     shared.status = if running {
                         "Emulation started"
                     } else {
@@ -339,11 +333,13 @@ impl NorbertWebApp {
                 None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
             };
             let mut shared = state.borrow_mut();
-            shared.device = device;
+            restore_device(&mut shared, device);
             shared.busy = false;
             match result {
                 Ok(running) => {
-                    shared.running = Some(running);
+                    if shared.device.is_some() {
+                        shared.running = Some(running);
+                    }
                     shared.status = "Status refreshed".to_owned();
                     shared.status_error = false;
                 }
@@ -376,16 +372,20 @@ impl NorbertWebApp {
                 None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
             };
             let running = match device.as_mut() {
-                Some(device) => device.status().await.ok(),
-                None => None,
+                Some(device) if device.is_connected() => device.status().await.ok(),
+                _ => None,
             };
             let mut shared = state.borrow_mut();
-            shared.device = device;
+            restore_device(&mut shared, device);
             shared.busy = false;
-            shared.running = running;
+            if shared.device.is_some() {
+                shared.running = running;
+            }
             match result {
                 Ok(()) => {
-                    shared.configured_chip = Some(chip.clone());
+                    if shared.device.is_some() {
+                        shared.configured_chip = Some(chip.clone());
+                    }
                     shared.status = format!(
                         "Configured {} {} ({} MiB, JEDEC {:02X} {:04X})",
                         chip.vendor,
@@ -551,24 +551,37 @@ impl NorbertWebApp {
     fn write_memory(&self, address: u32, file: File, verify: bool, ctx: &egui::Context) {
         let state = self.state.clone();
         let repaint = ctx.clone();
-        state.borrow_mut().busy = true;
+        let emulation_control = {
+            let mut shared = state.borrow_mut();
+            shared.busy = true;
+            shared.emulation_control
+        };
         spawn_local(async move {
             let progress = Closure::<dyn FnMut(f64, f64) -> bool>::new(|_, _| true);
             let progress_fn: Function = progress.as_ref().unchecked_ref::<Function>().clone();
             let mut device = state.borrow_mut().device.take();
             let result = match device.as_mut() {
-                Some(device) => match device
-                    .write_file(address, file.clone(), progress_fn.clone())
-                    .await
-                {
-                    Ok(()) if verify => device.verify_file(address, file, progress_fn).await,
-                    result => result,
-                },
+                Some(device) => {
+                    device
+                        .write_and_verify_file(address, file, verify, progress_fn)
+                        .await
+                }
                 None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
             };
+            let running = if emulation_control {
+                match device.as_mut() {
+                    Some(device) if device.is_connected() => device.status().await.ok(),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let mut shared = state.borrow_mut();
-            shared.device = device;
+            restore_device(&mut shared, device);
             shared.busy = false;
+            if shared.device.is_some() && emulation_control {
+                shared.running = running;
+            }
             match result {
                 Ok(()) => {
                     shared.status = "Upload complete".to_owned();
@@ -591,7 +604,7 @@ impl NorbertWebApp {
                 None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
             };
             let mut shared = state.borrow_mut();
-            shared.device = device;
+            restore_device(&mut shared, device);
             shared.busy = false;
             match result {
                 Ok(data) => {
@@ -618,11 +631,13 @@ impl NorbertWebApp {
                 None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
             };
             let mut shared = state.borrow_mut();
-            shared.device = device;
+            restore_device(&mut shared, device);
             shared.busy = false;
             match result {
                 Ok(()) => {
-                    shared.hold_enabled = Some(enabled);
+                    if shared.device.is_some() {
+                        shared.hold_enabled = Some(enabled);
+                    }
                     shared.status = if enabled {
                         "Target flash #HOLD asserted"
                     } else {
@@ -663,7 +678,7 @@ impl NorbertWebApp {
                 (None, _) => Err(wasm_bindgen::JsValue::from_str("No device connected")),
             };
             let mut shared = state.borrow_mut();
-            shared.device = device;
+            restore_device(&mut shared, device);
             shared.busy = false;
             match result {
                 Ok(()) => {
@@ -698,7 +713,7 @@ impl NorbertWebApp {
                 None => Err(wasm_bindgen::JsValue::from_str("No device connected")),
             };
             let mut shared = state.borrow_mut();
-            shared.device = device;
+            restore_device(&mut shared, device);
             shared.busy = false;
             match result {
                 Ok(faults) => {
@@ -713,7 +728,9 @@ impl NorbertWebApp {
                     }
                     .to_owned();
                     shared.status_error = faults.underrun;
-                    shared.prefetch_faults = Some(faults);
+                    if shared.device.is_some() {
+                        shared.prefetch_faults = Some(faults);
+                    }
                 }
                 Err(error) => set_error(
                     &mut shared,
@@ -748,7 +765,7 @@ impl NorbertWebApp {
             };
             if let Err(error) = device.log_start().await {
                 let mut shared = state.borrow_mut();
-                shared.device = Some(device);
+                restore_device(&mut shared, Some(device));
                 shared.busy = false;
                 shared.monitoring = false;
                 set_error(
@@ -781,7 +798,7 @@ impl NorbertWebApp {
 
             let stop_result = device.log_stop().await;
             let mut shared = state.borrow_mut();
-            shared.device = Some(device);
+            restore_device(&mut shared, Some(device));
             shared.busy = false;
             shared.monitoring = false;
             match stop_result {
@@ -940,7 +957,7 @@ impl NorbertWebApp {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    !connected && !connecting,
+                    !connected && !connecting && !busy,
                     egui::Button::new("Connect FT245 (WebUSB)"),
                 )
                 .clicked()
@@ -949,7 +966,7 @@ impl NorbertWebApp {
             }
             if ui
                 .add_enabled(
-                    !connected && !connecting,
+                    !connected && !connecting && !busy,
                     egui::Button::new("Connect UART (Web Serial)"),
                 )
                 .clicked()
@@ -1507,6 +1524,30 @@ fn decode_log_packets(state: &mut SharedState, data: &[u8]) {
             .find('\n')
             .map_or(excess, |offset| excess + offset + 1);
         state.log_output.drain(..boundary);
+    }
+}
+
+fn clear_connection_state(state: &mut SharedState) {
+    state.device = None;
+    state.version = None;
+    state.running = None;
+    state.emulation_control = false;
+    state.activity_log = false;
+    state.prefetch_diagnostics = false;
+    state.hold_enabled = None;
+    state.prefetch_faults = None;
+    state.configured_chip = None;
+    state.connection = ConnectionState::Disconnected;
+}
+
+fn restore_device(state: &mut SharedState, device: Option<WebFlashDevice>) {
+    match device {
+        Some(device) if device.is_connected() => {
+            state.device = Some(device);
+        }
+        _ => {
+            clear_connection_state(state);
+        }
     }
 }
 
