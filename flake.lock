@@ -77,11 +77,11 @@
     "nextpnr-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1795076287,
-        "narHash": "sha256-D0eRWK+YoyR4gWnr9m0uwsnoGDnSqfsYYrGI0bWj9v8=",
+        "lastModified": 1795797679,
+        "narHash": "sha256-Vn42SfYtFd/qkd0HXCDj550C8YGb0Smahy8F1PblJVk=",
         "ref": "norbert-experimental",
-        "rev": "c583d902b5c4d28e6622aa3331d52fb47119fc1e",
-        "revCount": 5304,
+        "rev": "41087245cb16c8aac6df29caadccb6669f337b8c",
+        "revCount": 5354,
         "submodules": true,
         "type": "git",
         "url": "https://github.com/ArthurHeymans/nextpnr"
@@ -173,11 +173,11 @@
     "yosys-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1793055265,
-        "narHash": "sha256-IEz9oTPHpFcmmNhGmmObsQjAI9fUPxsbkGrjWoTKtoY=",
+        "lastModified": 1795797381,
+        "narHash": "sha256-WJoiO/m0vtzmyow1nc5iPqG8XaB/bONMfNoJt3vCsNk=",
         "ref": "norbert-experimental",
-        "rev": "d020823315242b59dc00fb617f64297546e54e6e",
-        "revCount": 18351,
+        "rev": "3bf1480564fd26d86ee05350d8caf71225f60276",
+        "revCount": 18649,
         "submodules": true,
         "type": "git",
         "url": "https://github.com/ArthurHeymans/yosys"
